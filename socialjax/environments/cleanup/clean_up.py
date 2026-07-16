@@ -61,6 +61,7 @@ class Actions(IntEnum):
     stay = 6
     zap_forward = 7
     zap_clean = 8
+    pay = 9  # transfer pay_amount of reward to nearest agent in range (only if pay_mode != "off")
 
 
 class Items(IntEnum):
@@ -87,6 +88,7 @@ ROTATIONS = jnp.array(
         [0, 0, 0],  # stay
         [0, 0, 0],  # zap
         [0, 0, 0],  # zap_clean
+        [0, 0, 0],  # pay
     ],
     dtype=jnp.int8,
 )
@@ -103,17 +105,69 @@ STEP = jnp.array(
 
 STEP_MOVE = jnp.array(
     [
-        [0, 0, 0],
-        [0, 0, 0],
-        [0, 1, 0],  
-        [0, -1, 0],  
-        [1, 0, 0],  
-        [-1, 0, 0],  
-        [0, 0, 0],
-        [0, 0, 0],
+        [0, 0, 0],  # turn_left
+        [0, 0, 0],  # turn_right
+        [0, 1, 0],  # left
+        [0, -1, 0],  # right
+        [1, 0, 0],  # up
+        [-1, 0, 0],  # down
+        [0, 0, 0],  # stay
+        [0, 0, 0],  # zap_forward
+        [0, 0, 0],  # zap_clean (previously relied on JAX index-clamping)
+        [0, 0, 0],  # pay
     ],
     dtype=jnp.int8,
 )
+
+def compute_pay_transfers(
+    agent_locs: jnp.ndarray,
+    actions: jnp.ndarray,
+    pay_radius: int,
+    pay_amount: float,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Resolve the `pay` action into a zero-sum per-agent reward delta.
+
+    An agent that takes Actions.pay sends `pay_amount` of this step's reward to the
+    nearest *other* agent within Chebyshev distance `pay_radius` of it (ties broken
+    by lowest agent index). If no other agent is in range, the action is a no-op.
+    Multiple senders may target the same receiver in one step; their payments sum.
+
+    Kept at module level (rather than inside Clean_up.__init__'s closure) so the
+    accounting can be unit-tested in isolation. Pure jnp ops only: jit/vmap-safe.
+
+    Args:
+        agent_locs: (N, 3) int array of [row, col, orientation] per agent.
+        actions: (N,) int array of this step's actions.
+        pay_radius: max Chebyshev distance at which a target is payable.
+        pay_amount: reward units moved per executed pay action.
+
+    Returns:
+        (delta, attempted, executed):
+            delta: (N,) float32 zero-sum reward adjustment (sender -, receiver +).
+            attempted: (N,) bool, agent chose Actions.pay.
+            executed: (N,) bool, pay attempt had a valid in-range target.
+    """
+    n = agent_locs.shape[0]
+    pos = agent_locs[:, :2].astype(jnp.int32)
+
+    # Pairwise Chebyshev distances; self excluded via the diagonal mask.
+    cheb = jnp.max(jnp.abs(pos[:, None, :] - pos[None, :, :]), axis=-1)
+    in_range = (cheb <= pay_radius) & ~jnp.eye(n, dtype=bool)
+
+    # Nearest in-range other agent; argmin on a masked matrix breaks ties by lowest index.
+    masked = jnp.where(in_range, cheb, jnp.iinfo(jnp.int32).max)
+    target = jnp.argmin(masked, axis=1)
+    has_target = in_range[jnp.arange(n), target]
+
+    attempted = actions == Actions.pay
+    executed = attempted & has_target
+
+    sent = jnp.where(executed, jnp.float32(pay_amount), 0.0)
+    delta = jnp.zeros((n,), dtype=jnp.float32)
+    delta = delta.at[jnp.arange(n)].add(-sent)  # senders pay...
+    delta = delta.at[target].add(sent)          # ...their nearest neighbour receives
+    return delta, attempted, executed
+
 
 char_to_int = {
     'W': 1,
@@ -208,7 +262,16 @@ class Clean_up(MultiAgentEnv):
         dirtSpawnProbability=0.5,
         delayStartOfDirtSpawning=50, # 50
         jit=True,
-        
+
+        # Monetary system: agents may wire reward to the nearest agent in view.
+        #   "off"  -> 9 actions, no pay (original baseline)
+        #   "noop" -> 10 actions, pay selectable but transfers nothing (placebo
+        #             control: isolates action-space-size effects from the money itself)
+        #   "on"   -> 10 actions, pay moves pay_amount reward sender -> receiver
+        pay_mode="off",
+        pay_amount=1.0,
+        pay_radius=None,  # default: obs_size // 2 (approximates the agent's view range)
+
         obs_size=11,
         cnn=True,
 
@@ -265,6 +328,15 @@ class Clean_up(MultiAgentEnv):
         self.num_outer_steps = num_outer_steps
         self.cf = cf
         self.cf_alpha = cf_alpha
+
+        if pay_mode not in ("off", "noop", "on"):
+            raise ValueError(f"pay_mode must be 'off', 'noop', or 'on', got {pay_mode!r}")
+        self.pay_mode = pay_mode
+        self.pay_amount = pay_amount
+        self.pay_radius = (obs_size // 2) if pay_radius is None else pay_radius
+        # "off" keeps the original 9-action space so old baselines stay comparable;
+        # "noop"/"on" expose Actions.pay as a 10th action.
+        self._num_actions = len(Actions) if pay_mode != "off" else len(Actions) - 1
         self.agents = list(range(num_agents))#, dtype=jnp.int16)
         self._agents = jnp.array(self.agents, dtype=jnp.int16) + len(Items)
 
@@ -1458,7 +1530,25 @@ class Clean_up(MultiAgentEnv):
                     "original_rewards": rewards.squeeze(),
                     "shaped_rewards": rewards.squeeze(),
                 }
-            
+
+            # Monetary system: resolve pay actions into a zero-sum reward transfer.
+            # self.pay_mode is a static Python str, so these branches specialize at
+            # trace time (jit-safe; "off" compiles to the original reward graph).
+            if self.pay_mode != "off":
+                pay_delta, pay_attempted, pay_executed = compute_pay_transfers(
+                    state.agent_locs, actions, self.pay_radius, self.pay_amount
+                )
+                if self.pay_mode == "on":
+                    rewards = rewards + pay_delta[:, None]
+                # "noop" (placebo): action exists and is logged, but moves no reward.
+                info["pay_attempts"] = jnp.float32(pay_attempted).squeeze()
+                info["pay_executed"] = jnp.float32(pay_executed).squeeze()
+                if self.pay_mode == "on":
+                    pay_volume = jnp.sum(jnp.float32(pay_executed)) * self.pay_amount
+                else:
+                    pay_volume = jnp.float32(0.0)
+                info["pay_volume"] = jnp.broadcast_to(pay_volume, (self.num_agents,)).squeeze()
+
             info["clean_action_info"] = jnp.where(actions == Actions.zap_clean, 1, 0).squeeze()
             info["cleaned_water"] = jnp.array([len(state.potential_dirt_and_dirt_label) - dirtCount] * self.num_agents).squeeze()
             info["waste_cleared"] = jnp.array([len(state.potential_dirt_and_dirt_label) - dirtCount] * self.num_agents).squeeze() 
@@ -1627,13 +1717,13 @@ class Clean_up(MultiAgentEnv):
     @property
     def num_actions(self) -> int:
         """Number of actions possible in environment."""
-        return len(Actions)
+        return self._num_actions
 
     def action_space(
         self, agent_id: Union[int, None] = None
     ) -> spaces.Discrete:
-        """Action space of the environment."""
-        return spaces.Discrete(len(Actions))
+        """Action space of the environment (9, or 10 when the pay action is exposed)."""
+        return spaces.Discrete(self._num_actions)
 
     def observation_space(self) -> spaces.Dict:
         """Observation space of the environment."""

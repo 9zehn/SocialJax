@@ -22,3 +22,6 @@ test_lbf_simple.py
 
 # Editor / IDE configs
 .vscode/
+
+# macOS
+.DS_Store
