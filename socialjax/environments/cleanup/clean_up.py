@@ -1806,7 +1806,6 @@ class Clean_up(MultiAgentEnv):
 
         elif obj == Items.clean_beam:
             fill_coords(img, point_in_rect(0, 1, 0, 1), (170, 220, 255))
-            print(Items.clean_beam)
 
         elif obj == 99:
             fill_coords(img, point_in_rect(0, 1, 0, 1), (44.0, 160.0, 44.0))
