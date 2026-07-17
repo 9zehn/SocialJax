@@ -24,6 +24,7 @@ from algorithms.utils import (
     unbatchify,
     save_params,
     load_params,
+    checkpoint_filename,
     evaluate_ippo as evaluate,
     Transition,
 )
@@ -364,9 +365,7 @@ def make_train(config):
                 every = config.get("CHECKPOINT_EVERY", 20)
                 if every <= 0 or update_step % every != 0:
                     return
-                reward = config.get("REWARD")
-                suffix = f"_reward_{reward}" if reward else ""
-                filename = f'{config["ENV_NAME"]}_seed{config["SEED"]}{suffix}_latest'
+                filename = checkpoint_filename(config, latest=True)
                 if config["PARAMETER_SHARING"]:
                     # NB: mirrors the 'indvidual' typo in the final-save path in _runner.py,
                     # so periodic and final checkpoints land in the same directory.

@@ -18,18 +18,18 @@ from omegaconf import OmegaConf
 import wandb
 
 import socialjax
-from algorithms.utils import save_params, load_params, evaluate_ippo as evaluate
+from algorithms.utils import save_params, load_params, checkpoint_filename, evaluate_ippo as evaluate
 
 
 def single_run(config, make_train, *, wandb_name):
     """One training run, saving + evaluating at the end."""
     config = OmegaConf.to_container(config)
 
-    # Reward suffix lets common/individual runs of the same env coexist on disk
-    # and in wandb. Hidden behind .get() so the runner still works for any
-    # legacy yaml that doesn't define REWARD.
-    reward = config.get("REWARD")
-    suffix = f"_reward_{reward}" if reward else ""
+    # checkpoint_filename encodes SEED/REWARD/pay_mode/num_agents so two runs that
+    # differ in any of those (e.g. your 3 pay_mode conditions at the same SEED)
+    # can't silently collide onto the same checkpoint path -- also used for the
+    # WandB run name so those don't collide/get confused in the dashboard either.
+    filename = checkpoint_filename(config)
 
     wandb.init(
         entity=config["ENTITY"],
@@ -37,7 +37,7 @@ def single_run(config, make_train, *, wandb_name):
         tags=["IPPO", "FF"],
         config=config,
         mode=config["WANDB_MODE"],
-        name=f"{wandb_name}{suffix}",
+        name=f"{wandb_name}_{filename}",
     )
 
     rng = jax.random.PRNGKey(config["SEED"])
@@ -46,7 +46,6 @@ def single_run(config, make_train, *, wandb_name):
     out = jax.vmap(train_jit)(rngs)
 
     print("** Saving Results **")
-    filename = f'{config["ENV_NAME"]}_seed{config["SEED"]}{suffix}'
     train_state = jax.tree.map(lambda x: x[0], out["runner_state"][0])
     save_path = f"./checkpoints/individual/{filename}.pkl"
     if config["PARAMETER_SHARING"]:

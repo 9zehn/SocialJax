@@ -23,7 +23,8 @@ from algorithms.utils.vdn_networks import (
 
 from algorithms.utils.io_utils import (
     save_params,
-    load_params
+    load_params,
+    checkpoint_filename
 )
 
 from algorithms.utils.eval_utils import (
@@ -60,6 +61,7 @@ __all__ = [
     # IO utilities
     "save_params",
     "load_params",
+    "checkpoint_filename",
     # Evaluation utilities
     "evaluate_ippo",
     "evaluate_mappo_style",

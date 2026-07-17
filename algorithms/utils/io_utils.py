@@ -16,6 +16,40 @@ import numpy as np
 from flax.training.train_state import TrainState
 
 
+def checkpoint_filename(config: Dict[str, Any], latest: bool = False) -> str:
+    """Deterministic checkpoint filename stem (no extension, no per-agent suffix).
+
+    Shared by the final save (_runner.py) and the periodic rolling save
+    (ippo_cnn_<env>.py's checkpoint_callback) so the two can't drift apart.
+
+    Encodes every config value that would otherwise let two different runs
+    silently collide onto the same path: originally this only included
+    ENV_NAME/SEED/REWARD, so e.g. three pay_mode conditions (off/noop/on) run
+    with the same SEED and reward=individual -- exactly the setup a controlled
+    comparison needs -- would all resolve to one identical filename, with each
+    run silently overwriting the last one's checkpoint with no error at all.
+
+    Args:
+        config: the run's Hydra config dict.
+        latest: True for the periodic rolling checkpoint (adds a "_latest"
+            marker so it's visually distinct from, and never confused with,
+            the final end-of-training checkpoint at the same base name).
+    """
+    reward = config.get("REWARD")
+    suffix = f"_reward_{reward}" if reward else ""
+
+    env_kwargs = config.get("ENV_KWARGS", {})
+    pay_mode = env_kwargs.get("pay_mode")
+    if pay_mode and pay_mode != "off":  # "off" is clean_up's own default; keep it unmarked
+        suffix += f"_pay_{pay_mode}"
+    num_agents = env_kwargs.get("num_agents")
+    if num_agents:
+        suffix += f"_agents{num_agents}"
+
+    name = f'{config["ENV_NAME"]}_seed{config["SEED"]}{suffix}'
+    return f"{name}_latest" if latest else name
+
+
 def save_params(train_state: TrainState, save_path: str) -> None:
     """
     Save model parameters to disk.
