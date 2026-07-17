@@ -142,10 +142,13 @@ def compute_pay_transfers(
         pay_amount: reward units moved per executed pay action.
 
     Returns:
-        (delta, attempted, executed):
+        (delta, attempted, executed, target):
             delta: (N,) float32 zero-sum reward adjustment (sender -, receiver +).
             attempted: (N,) bool, agent chose Actions.pay.
             executed: (N,) bool, pay attempt had a valid in-range target.
+            target: (N,) int, nearest other agent's index for each agent, regardless
+                of whether it paid this step -- only meaningful where executed=True
+                (used to draw who-paid-whom in the viewer).
     """
     n = agent_locs.shape[0]
     pos = agent_locs[:, :2].astype(jnp.int32)
@@ -166,7 +169,7 @@ def compute_pay_transfers(
     delta = jnp.zeros((n,), dtype=jnp.float32)
     delta = delta.at[jnp.arange(n)].add(-sent)  # senders pay...
     delta = delta.at[target].add(sent)          # ...their nearest neighbour receives
-    return delta, attempted, executed
+    return delta, attempted, executed, target
 
 
 char_to_int = {
@@ -1535,7 +1538,7 @@ class Clean_up(MultiAgentEnv):
             # self.pay_mode is a static Python str, so these branches specialize at
             # trace time (jit-safe; "off" compiles to the original reward graph).
             if self.pay_mode != "off":
-                pay_delta, pay_attempted, pay_executed = compute_pay_transfers(
+                pay_delta, pay_attempted, pay_executed, pay_target = compute_pay_transfers(
                     state.agent_locs, actions, self.pay_radius, self.pay_amount
                 )
                 if self.pay_mode == "on":
@@ -1543,6 +1546,9 @@ class Clean_up(MultiAgentEnv):
                 # "noop" (placebo): action exists and is logged, but moves no reward.
                 info["pay_attempts"] = jnp.float32(pay_attempted).squeeze()
                 info["pay_executed"] = jnp.float32(pay_executed).squeeze()
+                # Sender -> nearest-agent index, valid only where pay_executed=True
+                # (used by the viewer to draw a "who paid whom" arrow).
+                info["pay_target"] = jnp.int32(pay_target).squeeze()
                 if self.pay_mode == "on":
                     pay_volume = jnp.sum(jnp.float32(pay_executed)) * self.pay_amount
                 else:

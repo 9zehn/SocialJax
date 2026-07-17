@@ -51,24 +51,26 @@ def test_action_indexed_arrays_cover_all_actions():
 def test_pays_nearest_in_range():
     agent_locs = locs((0, 0), (0, 3), (0, 10))
     actions = jnp.array([PAY, STAY, STAY])
-    delta, attempted, executed = compute_pay_transfers(agent_locs, actions, 5, 1.0)
+    delta, attempted, executed, target = compute_pay_transfers(agent_locs, actions, 5, 1.0)
     assert np.allclose(np.array(delta), [-1.0, 1.0, 0.0])
     assert np.array_equal(np.array(attempted), [True, False, False])
     assert np.array_equal(np.array(executed), [True, False, False])
+    assert int(target[0]) == 1, "agent 0's nearest in-range agent is agent 1"
 
 
 def test_tie_broken_by_lowest_index():
     # agents 1 and 2 both at Chebyshev distance 2 from agent 0
     agent_locs = locs((5, 5), (5, 7), (5, 3))
     actions = jnp.array([PAY, STAY, STAY])
-    delta, _, _ = compute_pay_transfers(agent_locs, actions, 5, 1.0)
+    delta, _, _, target = compute_pay_transfers(agent_locs, actions, 5, 1.0)
     assert np.allclose(np.array(delta), [-1.0, 1.0, 0.0]), "tie must go to lowest agent index"
+    assert int(target[0]) == 1
 
 
 def test_no_target_in_range_is_noop():
     agent_locs = locs((0, 0), (0, 20))
     actions = jnp.array([PAY, STAY])
-    delta, attempted, executed = compute_pay_transfers(agent_locs, actions, 5, 1.0)
+    delta, attempted, executed, _ = compute_pay_transfers(agent_locs, actions, 5, 1.0)
     assert np.allclose(np.array(delta), [0.0, 0.0])
     assert np.array_equal(np.array(attempted), [True, False])
     assert np.array_equal(np.array(executed), [False, False])
@@ -77,7 +79,7 @@ def test_no_target_in_range_is_noop():
 def test_cannot_pay_self():
     agent_locs = locs((4, 4))
     actions = jnp.array([PAY])
-    delta, _, executed = compute_pay_transfers(agent_locs, actions, 5, 1.0)
+    delta, _, executed, _ = compute_pay_transfers(agent_locs, actions, 5, 1.0)
     assert np.allclose(np.array(delta), [0.0])
     assert not bool(executed[0])
 
@@ -86,18 +88,20 @@ def test_multiple_senders_same_receiver_accumulate():
     # agents 0 and 2 flank agent 1; both pay -> agent 1 receives 2
     agent_locs = locs((0, 0), (0, 2), (0, 4))
     actions = jnp.array([PAY, STAY, PAY])
-    delta, _, executed = compute_pay_transfers(agent_locs, actions, 5, 1.0)
+    delta, _, executed, target = compute_pay_transfers(agent_locs, actions, 5, 1.0)
     assert np.allclose(np.array(delta), [-1.0, 2.0, -1.0])
     assert np.array_equal(np.array(executed), [True, False, True])
+    assert int(target[0]) == 1 and int(target[2]) == 1, "both senders should target agent 1"
 
 
 def test_mutual_payment_nets_out():
     # both agents pay each other simultaneously -> net zero each, both executed
     agent_locs = locs((0, 0), (0, 1))
     actions = jnp.array([PAY, PAY])
-    delta, _, executed = compute_pay_transfers(agent_locs, actions, 5, 1.0)
+    delta, _, executed, target = compute_pay_transfers(agent_locs, actions, 5, 1.0)
     assert np.allclose(np.array(delta), [0.0, 0.0])
     assert np.array_equal(np.array(executed), [True, True])
+    assert int(target[0]) == 1 and int(target[1]) == 0
 
 
 def test_zero_sum_under_random_configurations():
@@ -109,16 +113,16 @@ def test_zero_sum_under_random_configurations():
             dtype=jnp.int16,
         )
         actions = jnp.array(rng.integers(0, len(Actions), n))
-        delta, _, _ = compute_pay_transfers(agent_locs, actions, 5, 1.0)
+        delta, _, _, _ = compute_pay_transfers(agent_locs, actions, 5, 1.0)
         assert abs(float(jnp.sum(delta))) < 1e-6, "transfers must be exactly zero-sum"
 
 
 def test_custom_amount_and_radius():
     agent_locs = locs((0, 0), (0, 3))
     actions = jnp.array([PAY, STAY])
-    delta, _, _ = compute_pay_transfers(agent_locs, actions, 3, 2.5)
+    delta, _, _, _ = compute_pay_transfers(agent_locs, actions, 3, 2.5)
     assert np.allclose(np.array(delta), [-2.5, 2.5])
-    delta, _, executed = compute_pay_transfers(agent_locs, actions, 2, 2.5)
+    delta, _, executed, _ = compute_pay_transfers(agent_locs, actions, 2, 2.5)
     assert np.allclose(np.array(delta), [0.0, 0.0]), "radius 2 puts target out of range"
     assert not bool(executed[0])
 
@@ -127,11 +131,12 @@ def test_transfer_function_jits():
     jitted = jax.jit(compute_pay_transfers)
     agent_locs = locs((0, 0), (0, 2), (9, 9))
     actions = jnp.array([PAY, PAY, STAY])
-    delta, attempted, executed = jitted(agent_locs, actions, 5, 1.0)
+    delta, attempted, executed, target = jitted(agent_locs, actions, 5, 1.0)
     ref = compute_pay_transfers(agent_locs, actions, 5, 1.0)
     assert np.allclose(np.array(delta), np.array(ref[0]))
     assert np.array_equal(np.array(attempted), np.array(ref[1]))
     assert np.array_equal(np.array(executed), np.array(ref[2]))
+    assert np.array_equal(np.array(target), np.array(ref[3]))
 
 
 # ---------------------------------------------------------------- env integration
@@ -175,7 +180,7 @@ def test_env_step_on_vs_noop_zero_sum():
         float(jnp.sum(rewards_on)), float(jnp.sum(rewards_noop))
     ), "pay must be zero-sum at the env level"
 
-    expected_delta, _, _ = compute_pay_transfers(
+    expected_delta, _, _, _ = compute_pay_transfers(
         state_on.agent_locs, jnp.array([PAY] * 4), 11 // 2, 1.0
     )
     assert np.allclose(
@@ -206,12 +211,21 @@ def test_shaped_rewards_metric_reflects_pay_transfer():
 
 def test_env_metrics_present_and_absent():
     _, _, info_on = _step_env("on", lambda s: jnp.array([PAY] * 4))
-    for k in ("pay_attempts", "pay_executed", "pay_volume"):
+    for k in ("pay_attempts", "pay_executed", "pay_volume", "pay_target"):
         assert k in info_on, f"missing metric {k} in pay_mode=on"
 
     _, _, info_off = _step_env("off", lambda s: jnp.array([STAY] * 4))
-    for k in ("pay_attempts", "pay_executed", "pay_volume"):
+    for k in ("pay_attempts", "pay_executed", "pay_volume", "pay_target"):
         assert k not in info_off, f"metric {k} must not exist in pay_mode=off (baseline unchanged)"
+
+
+def test_env_info_pay_target_matches_direct_computation():
+    """info["pay_target"] (what the viewer draws arrows from) must match
+    compute_pay_transfers' own target output for the same state/actions."""
+    state, _, info_on = _step_env("on", lambda s: jnp.array([PAY] * 4))
+    _, _, executed, target = compute_pay_transfers(state.agent_locs, jnp.array([PAY] * 4), 11 // 2, 1.0)
+    assert np.array_equal(np.array(info_on["pay_target"]), np.array(target))
+    assert np.array_equal(np.array(info_on["pay_executed"]), np.array(executed, dtype=np.float32))
 
 
 def test_env_step_off_matches_original_baseline():

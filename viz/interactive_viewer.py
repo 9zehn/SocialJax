@@ -24,6 +24,7 @@ Examples:
         --checkpoint 'checkpoints/individual/clean_up_seed0_reward_individual_*.pkl'
 """
 import argparse
+import math
 import os
 import time
 from pathlib import Path
@@ -31,22 +32,47 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 import socialjax
 from algorithms.utils.io_utils import load_params
+
+
+def _extract_pay_events(info, prev_state):
+    """(sender, receiver, sender_loc, receiver_loc) for this step's executed payments.
+
+    Positions are taken from prev_state (before the step), matching what
+    compute_pay_transfers itself used to decide who's in range -- the receiver may
+    have since moved by the time a later frame displays this event, but the arrow
+    is a fixed annotation of where the payment happened, not a tracker.
+    Returns [] for envs/modes with no pay mechanism (info won't have these keys).
+    """
+    if "pay_executed" not in info or "pay_target" not in info:
+        return []
+    executed = np.atleast_1d(np.array(info["pay_executed"])).astype(bool)
+    target = np.atleast_1d(np.array(info["pay_target"]))
+    locs = np.array(prev_state.agent_locs)
+    events = []
+    for sender in np.nonzero(executed)[0]:
+        receiver = int(target[sender])
+        events.append((int(sender), receiver, tuple(locs[sender, :2]), tuple(locs[receiver, :2])))
+    return events
 
 
 def rollout(env, params, num_steps, seed):
     """Step the env and collect raw states (fast, sequential — each step depends on the last).
 
     Rendering is deferred to render_states() so it can be parallelized separately.
+    Also returns pay_events, aligned with states: pay_events[i] is the list of
+    (sender, receiver, sender_loc, receiver_loc) payments that produced states[i]
+    (pay_events[0] is always empty -- states[0] is the initial reset).
     """
     rng = jax.random.PRNGKey(seed)
     rng, rng_reset = jax.random.split(rng)
     obs, state = env.reset(rng_reset)
 
     states = [state]
+    pay_events = [[]]
 
     network = None
     if params is not None:
@@ -79,13 +105,15 @@ def rollout(env, params, num_steps, seed):
             sampled = pi.sample(seed=rng_act)
             actions = [int(sampled[i]) for i in range(env.num_agents)]
 
+        prev_state = state
         obs, state, reward, done, info = env.step(rng_step, state, actions)
         states.append(state)
+        pay_events.append(_extract_pay_events(info, prev_state))
 
         if bool(done["__all__"]):
             break
 
-    return states
+    return states, pay_events
 
 
 def _agent_snapshot(state):
@@ -125,6 +153,67 @@ def render_states(env, env_name, env_kwargs, states, workers=None):
         max_workers=workers, initializer=_init_render_worker, initargs=(env_name, env_kwargs)
     ) as ex:
         return list(ex.map(_render_worker, states))
+
+
+def _agent_pixel_center(env, row, col, frame_height):
+    """Map an unpadded (row, col) grid position to a pixel (x, y) center in the
+    image env.render() produces.
+
+    Specific to clean_up.py's render() pipeline: it pads the grid by env.PADDING,
+    draws tile_size=32px tiles, then crops (PADDING-1)*tile_size off each edge and
+    rotates 180 degrees. Working through that transform: a cell at unpadded row r
+    ends up centered at pixel row tile_size*(GRID_SIZE_ROW - r + 0.5) (symmetric
+    for columns) -- derived once here rather than re-deriving per call. Returns
+    None for envs without GRID_SIZE_ROW/COL (i.e. this is a no-op there).
+    """
+    grid_rows = getattr(env, "GRID_SIZE_ROW", None)
+    grid_cols = getattr(env, "GRID_SIZE_COL", None)
+    if grid_rows is None or grid_cols is None:
+        return None
+    tile_size = frame_height / (grid_rows + 2)
+    cy = tile_size * (grid_rows - row + 0.5)
+    cx = tile_size * (grid_cols - col + 0.5)
+    return cx, cy
+
+
+def _draw_arrow(draw, p1, p2, color=(255, 215, 0), width=3, head_len=12):
+    draw.line([p1, p2], fill=color, width=width)
+    angle = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
+    for offset in (math.radians(150), math.radians(-150)):
+        hx = p2[0] + head_len * math.cos(angle + offset)
+        hy = p2[1] + head_len * math.sin(angle + offset)
+        draw.line([p2, (hx, hy)], fill=color, width=width)
+
+
+def draw_pay_arrows(frames, pay_events, env, persist_frames=3, color=(255, 215, 0)):
+    """Overlay a payer -> payee arrow for `persist_frames` frames starting at the
+    frame each payment occurred on. No-op (returns frames unchanged) if there are
+    no events at all, or if the env doesn't expose GRID_SIZE_ROW/COL.
+    """
+    if not any(pay_events) or _agent_pixel_center(env, 0, 0, frames[0].shape[0]) is None:
+        return frames
+
+    n = len(frames)
+    active = [[] for _ in range(n)]
+    for i, events in enumerate(pay_events):
+        for event in events:
+            for j in range(i, min(i + persist_frames, n)):
+                active[j].append(event)
+
+    out = []
+    for i, frame in enumerate(frames):
+        if not active[i]:
+            out.append(frame)
+            continue
+        img = Image.fromarray(frame).convert("RGB")
+        draw = ImageDraw.Draw(img)
+        h = frame.shape[0]
+        for _sender, _receiver, sender_loc, receiver_loc in active[i]:
+            p1 = _agent_pixel_center(env, sender_loc[0], sender_loc[1], h)
+            p2 = _agent_pixel_center(env, receiver_loc[0], receiver_loc[1], h)
+            _draw_arrow(draw, p1, p2, color=color)
+        out.append(np.array(img))
+    return out
 
 
 def save_gif(frames, path, duration=200):
@@ -331,6 +420,8 @@ def main():
     parser.add_argument("--env-kwarg", action="append", default=[], metavar="KEY=VALUE",
                         help="extra env kwarg, repeatable (e.g. --env-kwarg pay_mode=on); "
                              "values parsed as int/float/bool when possible")
+    parser.add_argument("--pay-arrow-frames", type=int, default=3,
+                        help="how many frames a payer->payee arrow stays visible for (0 disables)")
     args = parser.parse_args()
 
     env_kwargs = {}
@@ -349,12 +440,18 @@ def main():
 
     params = _load_checkpoint(args.checkpoint) if args.checkpoint else None
 
-    states = rollout(env, params, args.steps, args.seed)
+    states, pay_events = rollout(env, params, args.steps, args.seed)
     print(f"Rolled out {len(states) - 1} steps ({'trained checkpoint' if params else 'random policy'}).")
 
     traces = [_agent_snapshot(s) for s in states]
     frames = render_states(env, args.env, env_kwargs, states, workers=args.render_workers)
     print(f"Rendered {len(frames)} frames.")
+
+    if args.pay_arrow_frames > 0:
+        n_events = sum(len(e) for e in pay_events)
+        if n_events:
+            frames = draw_pay_arrows(frames, pay_events, env, persist_frames=args.pay_arrow_frames)
+            print(f"Drew {n_events} payment arrow(s).")
 
     if args.gif:
         save_gif(frames, args.gif)
