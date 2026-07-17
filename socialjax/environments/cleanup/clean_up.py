@@ -1548,6 +1548,13 @@ class Clean_up(MultiAgentEnv):
                 else:
                     pay_volume = jnp.float32(0.0)
                 info["pay_volume"] = jnp.broadcast_to(pay_volume, (self.num_agents,)).squeeze()
+                # "shaped_rewards" was captured before this block ran (same pattern the
+                # SVO/inequity_aversion/interest branches above use: original = raw apple
+                # pickups, shaped = final transformed reward) -- keep that pairing correct
+                # by refreshing it now that pay has been applied. original_rewards is left
+                # untouched on purpose, so the two together show how much of an agent's
+                # final reward came from payments vs. its own pickups.
+                info["shaped_rewards"] = rewards.squeeze()
 
             info["clean_action_info"] = jnp.where(actions == Actions.zap_clean, 1, 0).squeeze()
             info["cleaned_water"] = jnp.array([len(state.potential_dirt_and_dirt_label) - dirtCount] * self.num_agents).squeeze()

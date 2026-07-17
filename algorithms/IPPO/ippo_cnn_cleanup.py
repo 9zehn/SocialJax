@@ -1,6 +1,8 @@
 """ 
 Based on PureJaxRL & jaxmarl Implementation of PPO
 """
+import time
+
 import jax
 import jax.numpy as jnp
 import optax
@@ -63,6 +65,11 @@ def make_train(config):
         return config["LR"] * frac
 
     def train(rng):
+        # Wall-clock progress tracking (Python-side state captured by a host
+        # callback below; NOT part of the jax.lax.scan carry). Scoped to this
+        # train() call so repeated invocations (e.g. a hyperparameter sweep
+        # calling make_train/train many times) don't share stale timings.
+        progress_state = {"times": {}}
 
         # INIT NETWORK
         if config["PARAMETER_SHARING"]:
@@ -369,6 +376,40 @@ def make_train(config):
                         save_params(train_state[i], f"./checkpoints/individual/{filename}_{i}.pkl")
                 print(f"[checkpoint] saved rolling checkpoint at update {update_step}")
 
+            def progress_callback(update_step, mean_reward):
+                # Wall-clock ETA. The scan itself has no notion of time, so this is
+                # purely a host-side callback using progress_state captured above.
+                update_step = int(update_step)
+                now = time.time()
+                progress_state["times"][update_step] = now
+
+                every = config.get("PROGRESS_EVERY", 1)
+                if every <= 0 or update_step % every != 0:
+                    return
+
+                total_updates = config["NUM_UPDATES"]
+                if update_step <= 1:
+                    print(f"[progress] update {update_step}/{total_updates} (JIT compiling -- "
+                          f"first update is slow, timing starts after this)", flush=True)
+                    return
+
+                t1 = progress_state["times"].get(1)
+                if t1 is None:
+                    print(f"[progress] update {update_step}/{total_updates}", flush=True)
+                    return
+
+                # Rate from update 1 -> now, so the one-off compile cost at update 1
+                # doesn't pollute the ETA the way total_elapsed/total_updates would.
+                rate = (now - t1) / (update_step - 1)
+                eta_min = rate * (total_updates - update_step) / 60
+                pct = 100 * update_step / total_updates
+                print(
+                    f"[progress] update {update_step}/{total_updates} ({pct:.1f}%) "
+                    f"~{rate:.1f}s/update, ETA ~{eta_min:.1f} min, "
+                    f"mean_shaped_reward={float(mean_reward):.3f}",
+                    flush=True,
+                )
+
             update_step = update_step + 1
             jax.debug.callback(checkpoint_callback, train_state, update_step)
 
@@ -388,6 +429,7 @@ def make_train(config):
             metric["clean_action_info"] = metric["clean_action_info"] * config["ENV_KWARGS"]["num_inner_steps"]
 
             jax.debug.callback(callback, metric)
+            jax.debug.callback(progress_callback, update_step, metric["shaped_rewards"])
 
             runner_state = (train_state, env_state, last_obs, update_step, rng)
             return runner_state, metric

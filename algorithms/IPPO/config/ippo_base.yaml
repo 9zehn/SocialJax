@@ -45,6 +45,10 @@
 # the final save), so a mid-run disconnect (e.g. Colab) doesn't lose everything.
 # Written to checkpoints/**/<run>_latest[_<agent>].pkl, overwritten in place.
 "CHECKPOINT_EVERY": 20
+# Print [progress] update N/TOTAL, ETA, and mean reward every N PPO updates, so a
+# run isn't silent until it finishes. Cost is a cheap host callback; raise this if
+# a long run's log gets too noisy.
+"PROGRESS_EVERY": 1
 
 # WandB defaults
 "ENTITY": ""

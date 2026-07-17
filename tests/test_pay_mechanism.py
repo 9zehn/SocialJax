@@ -187,6 +187,23 @@ def test_env_step_on_vs_noop_zero_sum():
     assert np.array_equal(np.array(info_on["pay_attempts"]), np.ones(4, dtype=np.float32))
 
 
+def test_shaped_rewards_metric_reflects_pay_transfer():
+    """Regression test: info["shaped_rewards"] must include the pay transfer.
+
+    It's computed by the reward-mode branch (shared/individual/svo/etc.) before
+    the pay-transfer block runs later in the same function, so it's easy for a
+    future edit to silently revert to logging the pre-transfer value again --
+    which would make the WandB-logged "shaped_rewards" curve inconsistent with
+    the actual reward the policy trains on (which always includes the transfer;
+    verified separately by test_env_step_on_vs_noop_zero_sum).
+    """
+    all_pay = lambda state: jnp.array([PAY] * 4)
+    _, rewards_on, info_on = _step_env("on", all_pay)
+    assert np.allclose(
+        np.array(info_on["shaped_rewards"]), np.array(rewards_on).squeeze()
+    ), "info['shaped_rewards'] must match the actual (post-transfer) returned rewards"
+
+
 def test_env_metrics_present_and_absent():
     _, _, info_on = _step_env("on", lambda s: jnp.array([PAY] * 4))
     for k in ("pay_attempts", "pay_executed", "pay_volume"):
