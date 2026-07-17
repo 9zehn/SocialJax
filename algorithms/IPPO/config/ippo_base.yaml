@@ -37,6 +37,14 @@
 "SEED": 30
 "NUM_SEEDS": 1
 "GIF_NUM_FRAMES": 250
+# Post-training rollout + GIF render (evaluate_ippo). This is sequential,
+# unparallelized per-tile rendering and can take several minutes on its own --
+# set EVALUATE=False for calibration/iteration runs where you don't need the GIF.
+"EVALUATE": True
+# Save a rolling checkpoint every N PPO updates during training (in addition to
+# the final save), so a mid-run disconnect (e.g. Colab) doesn't lose everything.
+# Written to checkpoints/**/<run>_latest[_<agent>].pkl, overwritten in place.
+"CHECKPOINT_EVERY": 20
 
 # WandB defaults
 "ENTITY": ""

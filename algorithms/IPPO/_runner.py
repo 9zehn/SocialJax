@@ -60,7 +60,11 @@ def single_run(config, make_train, *, wandb_name):
             save_path = f"./checkpoints/individual/{filename}_{i}.pkl"
             save_params(train_state[i], save_path)
             params.append(load_params(save_path))
-    evaluate(params, socialjax.make(config["ENV_NAME"], **config["ENV_KWARGS"]), save_path, config)
+
+    if config.get("EVALUATE", True):
+        evaluate(params, socialjax.make(config["ENV_NAME"], **config["ENV_KWARGS"]), save_path, config)
+    else:
+        print("EVALUATE=False -- skipping post-training rollout/GIF render")
 
 
 def tune(default_config, make_train, *, sweep_name):

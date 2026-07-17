@@ -350,7 +350,28 @@ def make_train(config):
             def callback(metric):
                 wandb.log(metric)
 
+            def checkpoint_callback(train_state, update_step):
+                # jax.debug.callback hands us concrete (host) values, so ordinary
+                # Python control flow -- including this modulo gate -- is fine here.
+                update_step = int(update_step)
+                every = config.get("CHECKPOINT_EVERY", 20)
+                if every <= 0 or update_step % every != 0:
+                    return
+                reward = config.get("REWARD")
+                suffix = f"_reward_{reward}" if reward else ""
+                filename = f'{config["ENV_NAME"]}_seed{config["SEED"]}{suffix}_latest'
+                if config["PARAMETER_SHARING"]:
+                    # NB: mirrors the 'indvidual' typo in the final-save path in _runner.py,
+                    # so periodic and final checkpoints land in the same directory.
+                    save_params(train_state, f"./checkpoints/indvidual/{filename}.pkl")
+                else:
+                    for i in range(env.num_agents):
+                        save_params(train_state[i], f"./checkpoints/individual/{filename}_{i}.pkl")
+                print(f"[checkpoint] saved rolling checkpoint at update {update_step}")
+
             update_step = update_step + 1
+            jax.debug.callback(checkpoint_callback, train_state, update_step)
+
             metric = jax.tree.map(lambda x: x.mean(), metric)
             if config["PARAMETER_SHARING"]:
                 metric["update_step"] = update_step
