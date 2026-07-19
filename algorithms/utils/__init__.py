@@ -24,7 +24,9 @@ from algorithms.utils.vdn_networks import (
 from algorithms.utils.io_utils import (
     save_params,
     load_params,
-    checkpoint_filename
+    checkpoint_filename,
+    save_train_state,
+    load_train_state
 )
 
 from algorithms.utils.eval_utils import (
@@ -62,6 +64,8 @@ __all__ = [
     "save_params",
     "load_params",
     "checkpoint_filename",
+    "save_train_state",
+    "load_train_state",
     # Evaluation utilities
     "evaluate_ippo",
     "evaluate_mappo_style",

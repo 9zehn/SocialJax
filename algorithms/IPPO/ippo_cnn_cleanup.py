@@ -25,6 +25,8 @@ from algorithms.utils import (
     save_params,
     load_params,
     checkpoint_filename,
+    save_train_state,
+    load_train_state,
     evaluate_ippo as evaluate,
     Transition,
 )
@@ -107,6 +109,50 @@ def make_train(config):
                 params=network_params[i],
                 tx=tx,
             ) for i in range(env.num_agents)]
+
+        # RESUME (optional): splice a previously-saved params+opt_state+step into
+        # the freshly-created train_state(s) above, in place of the random init.
+        # This is plain Python file I/O happening once at trace time (train() is
+        # about to be jax.jit-ed in _runner.py), not a per-step jax operation, so
+        # resumed_update_step below is a static Python int, valid as a jax.lax.scan
+        # length/carry value. Restoring opt_state (not just params) matters: a
+        # fresh optimizer state would reset Adam's moment estimates and the LR
+        # schedule's step count to zero, silently changing training dynamics
+        # instead of truly continuing from where the run left off.
+        resumed_update_step = 0
+        resume_from = config.get("RESUME_FROM")
+        if resume_from:
+            import glob
+            matches = sorted(glob.glob(resume_from))
+            if not matches:
+                raise FileNotFoundError(f"RESUME_FROM={resume_from!r} matched no files")
+            if config["PARAMETER_SHARING"]:
+                if len(matches) != 1:
+                    raise ValueError(
+                        f"PARAMETER_SHARING=True expects exactly 1 resume file, "
+                        f"got {len(matches)}: {matches}"
+                    )
+                loaded = load_train_state(matches[0])
+                train_state = train_state.replace(
+                    params=loaded["params"], opt_state=loaded["opt_state"], step=loaded["step"]
+                )
+                resumed_update_step = loaded["update_step"]
+            else:
+                if len(matches) != env.num_agents:
+                    raise ValueError(
+                        f"expected {env.num_agents} resume files (one per agent) for "
+                        f"PARAMETER_SHARING=False, got {len(matches)}: {matches}"
+                    )
+                for i, m in enumerate(matches):
+                    loaded = load_train_state(m)
+                    train_state[i] = train_state[i].replace(
+                        params=loaded["params"], opt_state=loaded["opt_state"], step=loaded["step"]
+                    )
+                    resumed_update_step = loaded["update_step"]  # same across agents by construction
+            print(
+                f"[resume] loaded {len(matches)} checkpoint(s) from {resume_from!r}, "
+                f"continuing from update {resumed_update_step}/{config['NUM_UPDATES']}"
+            )
 
         # INIT ENV
         rng, _rng = jax.random.split(rng)
@@ -370,36 +416,51 @@ def make_train(config):
                     # NB: mirrors the 'indvidual' typo in the final-save path in _runner.py,
                     # so periodic and final checkpoints land in the same directory.
                     save_params(train_state, f"./checkpoints/indvidual/{filename}.pkl")
+                    # Separate file: params-only stays load_params()-compatible (used by
+                    # the viewer/evaluate_ippo), _resume additionally carries opt_state
+                    # and the update counter so a later RESUME_FROM can truly continue.
+                    save_train_state(train_state, update_step, f"./checkpoints/indvidual/{filename}_resume.pkl")
                 else:
                     for i in range(env.num_agents):
                         save_params(train_state[i], f"./checkpoints/individual/{filename}_{i}.pkl")
+                        save_train_state(
+                            train_state[i], update_step,
+                            f"./checkpoints/individual/{filename}_resume_{i}.pkl",
+                        )
                 print(f"[checkpoint] saved rolling checkpoint at update {update_step}")
 
             def progress_callback(update_step, mean_reward):
                 # Wall-clock ETA. The scan itself has no notion of time, so this is
                 # purely a host-side callback using progress_state captured above.
+                #
+                # "First update seen in THIS run" (not literally update 1) is what
+                # carries the one-off JIT compile cost -- after a RESUME_FROM, the
+                # first scan iteration is update resumed_update_step+1, not 1, so
+                # hardcoding "1" would never match again and the ETA would silently
+                # stay stuck on the single-line fallback for the whole resumed run.
                 update_step = int(update_step)
                 now = time.time()
                 progress_state["times"][update_step] = now
+                first_update = progress_state.setdefault("first_update", update_step)
 
                 every = config.get("PROGRESS_EVERY", 1)
                 if every <= 0 or update_step % every != 0:
                     return
 
                 total_updates = config["NUM_UPDATES"]
-                if update_step <= 1:
+                if update_step <= first_update:
                     print(f"[progress] update {update_step}/{total_updates} (JIT compiling -- "
                           f"first update is slow, timing starts after this)", flush=True)
                     return
 
-                t1 = progress_state["times"].get(1)
+                t1 = progress_state["times"].get(first_update)
                 if t1 is None:
                     print(f"[progress] update {update_step}/{total_updates}", flush=True)
                     return
 
-                # Rate from update 1 -> now, so the one-off compile cost at update 1
+                # Rate from the first-seen update -> now, so the one-off compile cost
                 # doesn't pollute the ETA the way total_elapsed/total_updates would.
-                rate = (now - t1) / (update_step - 1)
+                rate = (now - t1) / (update_step - first_update)
                 eta_min = rate * (total_updates - update_step) / 60
                 pct = 100 * update_step / total_updates
                 print(
@@ -434,9 +495,14 @@ def make_train(config):
             return runner_state, metric
 
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_state, env_state, obsv, 0, _rng)
+        runner_state = (train_state, env_state, obsv, resumed_update_step, _rng)
+        # Resuming continues to the ORIGINAL target (config["NUM_UPDATES"]), it
+        # doesn't add that many more on top -- e.g. resuming at update 200/780
+        # runs 580 more, landing back at 780, not 980. Increase TOTAL_TIMESTEPS
+        # explicitly if you want to extend beyond the original run's target.
+        remaining_updates = max(config["NUM_UPDATES"] - resumed_update_step, 0)
         runner_state, metric = jax.lax.scan(
-            _update_step, runner_state, None, config["NUM_UPDATES"]
+            _update_step, runner_state, None, remaining_updates
         )
         return {"runner_state": runner_state, "metrics": metric}
 

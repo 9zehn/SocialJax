@@ -49,6 +49,13 @@
 # run isn't silent until it finishes. Cost is a cheap host callback; raise this if
 # a long run's log gets too noisy.
 "PROGRESS_EVERY": 1
+# Resume training from a checkpoint saved by CHECKPOINT_EVERY's *_resume[_<agent>].pkl
+# files (not the plain params-only ones -- those don't carry optimizer state).
+# A single path for PARAMETER_SHARING=True, or a quoted glob matching exactly
+# num_agents files for PARAMETER_SHARING=False. null = train from scratch.
+# Must use the SAME hyperparameters (TOTAL_TIMESTEPS/NUM_STEPS/NUM_ENVS/etc.) as
+# the original run, or the LR schedule and remaining-updates math won't line up.
+"RESUME_FROM": null
 
 # WandB defaults
 "ENTITY": ""

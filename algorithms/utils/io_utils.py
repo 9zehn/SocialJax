@@ -102,3 +102,51 @@ def load_params(load_path: str) -> Dict[str, Any]:
     with open(load_path, 'rb') as f:
         params = pickle.load(f)
     return jax.tree_util.tree_map(lambda x: jnp.array(x), params)
+
+
+def save_train_state(train_state: TrainState, update_step: int, save_path: str) -> None:
+    """Save enough of a TrainState to properly *resume* training later.
+
+    save_params() only keeps .params, which is enough for evaluation/inference
+    but NOT enough to resume from: restarting with a fresh optimizer state resets
+    Adam's moment estimates and the LR schedule's internal step count back to
+    zero, silently changing training dynamics rather than truly continuing. This
+    additionally saves .opt_state, .step (the optimizer's own step counter, which
+    the LR schedule reads from), and update_step (this repo's own outer-loop
+    counter, used to resume progress/checkpoint logging and to compute how many
+    scan iterations remain).
+
+    Args:
+        train_state: the TrainState to snapshot (params + optimizer state).
+        update_step: this run's current outer-loop update counter (distinct from
+            train_state.step, the optimizer's internal gradient-step counter).
+        save_path: where to write the pickle; parent dirs created if needed.
+    """
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    payload = {
+        "params": jax.tree_util.tree_map(lambda x: np.array(x), train_state.params),
+        "opt_state": jax.tree_util.tree_map(lambda x: np.array(x), train_state.opt_state),
+        "step": int(train_state.step),
+        "update_step": int(update_step),
+    }
+    with open(save_path, 'wb') as f:
+        pickle.dump(payload, f)
+
+
+def load_train_state(load_path: str) -> Dict[str, Any]:
+    """Load a save_train_state() payload.
+
+    Returns {"params", "opt_state", "step", "update_step"} with params/opt_state
+    as JAX arrays, ready to splice into a freshly-created TrainState via
+    `train_state.replace(params=loaded["params"], opt_state=loaded["opt_state"],
+    step=loaded["step"])` -- apply_fn/tx aren't serialized here since they're
+    reconstructed fresh from the (assumed-matching) network/optimizer config.
+    """
+    with open(load_path, 'rb') as f:
+        payload = pickle.load(f)
+    return {
+        "params": jax.tree_util.tree_map(lambda x: jnp.array(x), payload["params"]),
+        "opt_state": jax.tree_util.tree_map(lambda x: jnp.array(x), payload["opt_state"]),
+        "step": payload["step"],
+        "update_step": payload["update_step"],
+    }
