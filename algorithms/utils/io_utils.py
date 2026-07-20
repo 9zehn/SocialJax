@@ -42,6 +42,12 @@ def checkpoint_filename(config: Dict[str, Any], latest: bool = False) -> str:
     pay_mode = env_kwargs.get("pay_mode")
     if pay_mode and pay_mode != "off":  # "off" is clean_up's own default; keep it unmarked
         suffix += f"_pay_{pay_mode}"
+        # Only meaningful when pay_mode is active; only marked when swept away from
+        # clean_up's own default (50), so existing pay_on/pay_noop runs at the
+        # default window keep their current filenames.
+        pay_clean_window = env_kwargs.get("pay_clean_window")
+        if pay_clean_window and pay_clean_window != 50:
+            suffix += f"_win{pay_clean_window}"
     num_agents = env_kwargs.get("num_agents")
     if num_agents:
         suffix += f"_agents{num_agents}"

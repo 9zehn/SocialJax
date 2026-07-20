@@ -43,6 +43,31 @@ def test_different_num_agents_same_seed_do_not_collide():
     assert len(names) == 3, f"num_agents variants must produce distinct filenames, got {names}"
 
 
+def test_different_pay_clean_windows_same_seed_do_not_collide():
+    names = {
+        checkpoint_filename(_config(ENV_KWARGS={"num_agents": 4, "pay_mode": "on", "pay_clean_window": w}))
+        for w in (10, 50, 100)
+    }
+    assert len(names) == 3, f"pay_clean_window variants must produce distinct filenames, got {names}"
+
+
+def test_pay_clean_window_only_marked_when_pay_active():
+    # pay_clean_window is meaningless under pay_mode="off" -- must not affect the name
+    off_default = checkpoint_filename(_config(ENV_KWARGS={"num_agents": 4, "pay_clean_window": 50}))
+    off_swept = checkpoint_filename(_config(ENV_KWARGS={"num_agents": 4, "pay_clean_window": 10}))
+    assert off_default == off_swept == "clean_up_seed42_reward_individual_agents4"
+
+
+def test_pay_clean_window_default_matches_unmarked_naming():
+    # 50 is clean_up's own default, so an explicit 50 must match omitting it entirely --
+    # existing pay_on/pay_noop runs at the default window keep their current filenames.
+    explicit_default = checkpoint_filename(
+        _config(ENV_KWARGS={"num_agents": 4, "pay_mode": "on", "pay_clean_window": 50})
+    )
+    omitted = checkpoint_filename(_config(ENV_KWARGS={"num_agents": 4, "pay_mode": "on"}))
+    assert explicit_default == omitted == "clean_up_seed42_reward_individual_pay_on_agents4"
+
+
 def test_pay_mode_off_or_absent_matches_original_naming():
     # pay_mode="off" (or omitted) shouldn't add a suffix, so old baseline runs
     # without any pay_mode key keep the same filename they always had.
