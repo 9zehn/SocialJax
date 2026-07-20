@@ -45,6 +45,13 @@ class State:
     potential_dirt_and_dirt_label: jnp.ndarray
     smooth_rewards: jnp.ndarray
 
+    # Monetary system (pay_mode != "off"): per-agent spendable balance (cumulative
+    # net reward -- apples earned +/- payments) and the inner_t at which each agent
+    # last actually cleaned a dirt patch (init far-negative so none are payable at
+    # reset). Present always (cheap) so State stays a fixed shape regardless of mode.
+    agent_balance: jnp.ndarray
+    last_clean_t: jnp.ndarray
+
 
 @chex.dataclass
 class EnvParams:
@@ -120,55 +127,71 @@ STEP_MOVE = jnp.array(
 )
 
 def compute_pay_transfers(
-    agent_locs: jnp.ndarray,
     actions: jnp.ndarray,
-    pay_radius: int,
+    last_clean_t: jnp.ndarray,
+    current_t: int,
+    balance: jnp.ndarray,
+    clean_window: int,
     pay_amount: float,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Resolve the `pay` action into a zero-sum per-agent reward delta.
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Resolve the `pay` action into a zero-sum per-agent reward delta (Option B:
+    payment goes to whoever recently cleaned the river, regardless of distance).
 
-    An agent that takes Actions.pay sends `pay_amount` of this step's reward to the
-    nearest *other* agent within Chebyshev distance `pay_radius` of it (ties broken
-    by lowest agent index). If no other agent is in range, the action is a no-op.
-    Multiple senders may target the same receiver in one step; their payments sum.
+    An agent that takes Actions.pay sends `pay_amount` to the *most recent other
+    agent that cleaned a dirt patch within the last `clean_window` steps*. The
+    payment is a no-op (attempted but not executed) if the payer can't afford it
+    (balance < pay_amount) or if no other agent has cleaned recently. This links
+    the subsidy to cleaning -- the behaviour we want to reward -- rather than to
+    proximity, and decouples payer/receiver location so a harvester in the orchard
+    can pay a cleaner working the distant river.
 
     Kept at module level (rather than inside Clean_up.__init__'s closure) so the
     accounting can be unit-tested in isolation. Pure jnp ops only: jit/vmap-safe.
 
     Args:
-        agent_locs: (N, 3) int array of [row, col, orientation] per agent.
         actions: (N,) int array of this step's actions.
-        pay_radius: max Chebyshev distance at which a target is payable.
+        last_clean_t: (N,) int, inner_t at which each agent last cleaned dirt
+            (far-negative if never), so age = current_t - last_clean_t.
+        current_t: this step's inner_t counter.
+        balance: (N,) float, each agent's spendable balance (cumulative net reward).
+        clean_window: max age (in steps) at which a cleaner is still payable.
         pay_amount: reward units moved per executed pay action.
 
     Returns:
         (delta, attempted, executed, target):
             delta: (N,) float32 zero-sum reward adjustment (sender -, receiver +).
             attempted: (N,) bool, agent chose Actions.pay.
-            executed: (N,) bool, pay attempt had a valid in-range target.
-            target: (N,) int, nearest other agent's index for each agent, regardless
-                of whether it paid this step -- only meaningful where executed=True
-                (used to draw who-paid-whom in the viewer).
+            executed: (N,) bool, pay had a valid recent-cleaner recipient AND the
+                payer could afford it.
+            target: (N,) int, recipient index per agent (the chosen recent cleaner);
+                only meaningful where executed=True (used for the viewer's arrows).
     """
-    n = agent_locs.shape[0]
-    pos = agent_locs[:, :2].astype(jnp.int32)
+    n = actions.shape[0]
 
-    # Pairwise Chebyshev distances; self excluded via the diagonal mask.
-    cheb = jnp.max(jnp.abs(pos[:, None, :] - pos[None, :, :]), axis=-1)
-    in_range = (cheb <= pay_radius) & ~jnp.eye(n, dtype=bool)
+    # A cleaner is payable if it cleaned within the window. Recency is the sort key
+    # for "most recent"; recent_key masks out non-recent agents with a floor below
+    # any valid last_clean_t so they never win the argmax.
+    age = current_t - last_clean_t
+    recent = age <= clean_window
+    FLOOR = jnp.int32(-1_000_000_000)
+    recent_key = jnp.where(recent, last_clean_t.astype(jnp.int32), FLOOR)
 
-    # Nearest in-range other agent; argmin on a masked matrix breaks ties by lowest index.
-    masked = jnp.where(in_range, cheb, jnp.iinfo(jnp.int32).max)
-    target = jnp.argmin(masked, axis=1)
-    has_target = in_range[jnp.arange(n), target]
+    # Per-payer recipient: most recent OTHER recent-cleaner. Self is masked out
+    # per-row (a payer can't pay itself even if it just cleaned), so the argmax is
+    # computed row-wise over an (N, N) key matrix.
+    not_self = ~jnp.eye(n, dtype=bool)
+    key_matrix = jnp.where(not_self, recent_key[None, :], FLOOR)  # row = payer, col = candidate
+    target = jnp.argmax(key_matrix, axis=1)
+    has_recipient = key_matrix[jnp.arange(n), target] > FLOOR  # some valid other recent-cleaner exists
 
     attempted = actions == Actions.pay
-    executed = attempted & has_target
+    can_afford = balance >= pay_amount
+    executed = attempted & has_recipient & can_afford
 
     sent = jnp.where(executed, jnp.float32(pay_amount), 0.0)
     delta = jnp.zeros((n,), dtype=jnp.float32)
-    delta = delta.at[jnp.arange(n)].add(-sent)  # senders pay...
-    delta = delta.at[target].add(sent)          # ...their nearest neighbour receives
+    delta = delta.at[jnp.arange(n)].add(-sent)  # payers pay...
+    delta = delta.at[target].add(sent)          # ...their chosen recent cleaner receives
     return delta, attempted, executed, target
 
 
@@ -266,14 +289,18 @@ class Clean_up(MultiAgentEnv):
         delayStartOfDirtSpawning=50, # 50
         jit=True,
 
-        # Monetary system: agents may wire reward to the nearest agent in view.
+        # Monetary system: an agent's `pay` action wires reward to whoever recently
+        # cleaned the river (Option B -- subsidy linked to cleaning, not proximity).
         #   "off"  -> 9 actions, no pay (original baseline)
         #   "noop" -> 10 actions, pay selectable but transfers nothing (placebo
         #             control: isolates action-space-size effects from the money itself)
-        #   "on"   -> 10 actions, pay moves pay_amount reward sender -> receiver
+        #   "on"   -> 10 actions, pay moves pay_amount to the most recent other agent
+        #             that cleaned dirt within pay_clean_window steps, if the payer's
+        #             balance covers it (else the attempt is a no-op).
         pay_mode="off",
         pay_amount=1.0,
-        pay_radius=None,  # default: obs_size // 2 (approximates the agent's view range)
+        pay_clean_window=50,  # a cleaner stays payable for this many steps after cleaning
+        pay_radius=None,      # deprecated (Option A only); accepted but unused under Option B
 
         obs_size=11,
         cnn=True,
@@ -336,6 +363,7 @@ class Clean_up(MultiAgentEnv):
             raise ValueError(f"pay_mode must be 'off', 'noop', or 'on', got {pay_mode!r}")
         self.pay_mode = pay_mode
         self.pay_amount = pay_amount
+        self.pay_clean_window = pay_clean_window
         self.pay_radius = (obs_size // 2) if pay_radius is None else pay_radius
         # "off" keeps the original 9-action space so old baselines stay comparable;
         # "noop"/"on" expose Actions.pay as a 10th action.
@@ -1147,6 +1175,17 @@ class Clean_up(MultiAgentEnv):
             all_zaped_locs = jnp.concatenate((one_step_targets, two_step_targets, target_right, target_left), 0)
             # zaps_3d = jnp.stack([zaps, zaps, zaps], axis=-1)
 
+            # Per-agent "actually cleaned a dirt patch this step": took zap_clean AND
+            # at least one of its 4 beam tiles was Items.dirt in the (pre-clean) grid.
+            # all_zaped_locs is laid out as [one_step(all agents), two_step(all), right(all),
+            # left(all)], so reshaping to (4, N, 2) groups the 4 tiles per agent on axis 0.
+            n_ag = self.num_agents
+            # all_zaped_locs rows are [row, col, orient] (3 cols), grouped as
+            # [one_step(all agents), two_step(all), right(all), left(all)].
+            _beam_tiles = all_zaped_locs.reshape(4, n_ag, all_zaped_locs.shape[-1])
+            _tile_is_dirt = state.grid[_beam_tiles[:, :, 0], _beam_tiles[:, :, 1]] == Items.dirt
+            cleaned_dirt = zaps.reshape(-1) & jnp.any(_tile_is_dirt, axis=0)
+
             zaps_4_locs_judge = jnp.concatenate((zaps, zaps, zaps, zaps), 0)
 
 
@@ -1259,7 +1298,7 @@ class Clean_up(MultiAgentEnv):
                     state.grid
                 )
             )
-            return state
+            return state, cleaned_dirt
 
 
         def _step(
@@ -1434,7 +1473,14 @@ class Clean_up(MultiAgentEnv):
 
             reborn_players, state = _interact_fire_zapping(key, state, actions)
 
-            state = _interact_fire_cleaning(key, state, actions)
+            state, cleaned_dirt = _interact_fire_cleaning(key, state, actions)
+
+            # Record when each agent last actually cleaned dirt (used to decide who is
+            # a payable "recent cleaner"). state.inner_t is this step's counter.
+            new_last_clean_t = jnp.where(
+                cleaned_dirt, jnp.int32(state.inner_t), state.last_clean_t
+            )
+            state = state.replace(last_clean_t=new_last_clean_t)
 
             reborn_players_3d = jnp.stack([reborn_players, reborn_players, reborn_players], axis=-1)
 
@@ -1539,15 +1585,17 @@ class Clean_up(MultiAgentEnv):
             # trace time (jit-safe; "off" compiles to the original reward graph).
             if self.pay_mode != "off":
                 pay_delta, pay_attempted, pay_executed, pay_target = compute_pay_transfers(
-                    state.agent_locs, actions, self.pay_radius, self.pay_amount
+                    actions, state.last_clean_t, state.inner_t,
+                    state.agent_balance, self.pay_clean_window, self.pay_amount,
                 )
                 if self.pay_mode == "on":
                     rewards = rewards + pay_delta[:, None]
-                # "noop" (placebo): action exists and is logged, but moves no reward.
+                # "noop" (placebo): action exists, recipient/affordability are computed
+                # and logged identically, but no reward actually moves.
                 info["pay_attempts"] = jnp.float32(pay_attempted).squeeze()
                 info["pay_executed"] = jnp.float32(pay_executed).squeeze()
-                # Sender -> nearest-agent index, valid only where pay_executed=True
-                # (used by the viewer to draw a "who paid whom" arrow).
+                # Payer -> recipient (chosen recent cleaner) index, valid only where
+                # pay_executed=True (used by the viewer to draw a "who paid whom" arrow).
                 info["pay_target"] = jnp.int32(pay_target).squeeze()
                 if self.pay_mode == "on":
                     pay_volume = jnp.sum(jnp.float32(pay_executed)) * self.pay_amount
@@ -1561,6 +1609,16 @@ class Clean_up(MultiAgentEnv):
                 # untouched on purpose, so the two together show how much of an agent's
                 # final reward came from payments vs. its own pickups.
                 info["shaped_rewards"] = rewards.squeeze()
+
+            # Balance = running cumulative net reward, so it equals what an agent has
+            # available to pay with. Updated in BOTH pay modes (off leaves it tracking
+            # pure apple income, harmless) using the final post-transfer reward, so
+            # received payments credit the recipient's balance and payments made debit
+            # the payer's. The gate above reads this step's incoming balance, so an
+            # agent spends only what it accumulated on prior steps.
+            state = state.replace(
+                agent_balance=state.agent_balance + rewards.squeeze().astype(jnp.float32)
+            )
 
             info["clean_action_info"] = jnp.where(actions == Actions.zap_clean, 1, 0).squeeze()
             info["cleaned_water"] = jnp.array([len(state.potential_dirt_and_dirt_label) - dirtCount] * self.num_agents).squeeze()
@@ -1577,7 +1635,9 @@ class Clean_up(MultiAgentEnv):
                 reborn_locs=state.reborn_locs,
                 potential_dirt_and_dirt_locs=state.potential_dirt_and_dirt_locs,
                 potential_dirt_and_dirt_label=state.potential_dirt_and_dirt_label,
-                smooth_rewards=state.smooth_rewards
+                smooth_rewards=state.smooth_rewards,
+                agent_balance=state.agent_balance,
+                last_clean_t=state.last_clean_t,
             )
 
             # now calculate if done for inner or outer episode
@@ -1698,7 +1758,9 @@ class Clean_up(MultiAgentEnv):
                 reborn_locs=agent_locs,
                 potential_dirt_and_dirt_locs=potential_dirt_and_dirt,
                 potential_dirt_and_dirt_label=potential_dirt_and_dirt_label,
-                smooth_rewards=jnp.zeros((self.num_agents, 1))
+                smooth_rewards=jnp.zeros((self.num_agents, 1)),
+                agent_balance=jnp.zeros((self.num_agents,), dtype=jnp.float32),
+                last_clean_t=jnp.full((self.num_agents,), -10_000, dtype=jnp.int32),
             )
 
         def reset(

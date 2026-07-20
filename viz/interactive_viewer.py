@@ -41,10 +41,10 @@ from algorithms.utils.io_utils import load_params
 def _extract_pay_events(info, prev_state):
     """(sender, receiver, sender_loc, receiver_loc) for this step's executed payments.
 
-    Positions are taken from prev_state (before the step), matching what
-    compute_pay_transfers itself used to decide who's in range -- the receiver may
-    have since moved by the time a later frame displays this event, but the arrow
-    is a fixed annotation of where the payment happened, not a tracker.
+    Positions are taken from prev_state (before the step). Under Option B the
+    receiver is whoever recently cleaned the river, so payer and receiver can be
+    far apart (the arrow may span the map) -- it's a fixed annotation of who paid
+    whom on that step, not a tracker of their later movement.
     Returns [] for envs/modes with no pay mechanism (info won't have these keys).
     """
     if "pay_executed" not in info or "pay_target" not in info:
