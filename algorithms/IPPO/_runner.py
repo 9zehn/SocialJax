@@ -37,7 +37,10 @@ def single_run(config, make_train, *, wandb_name):
         tags=["IPPO", "FF"],
         config=config,
         mode=config["WANDB_MODE"],
-        name=f"{wandb_name}_{filename}",
+        # WANDB_RUN_NAME overrides the auto-generated name for this one run (e.g. a
+        # short label like "baseline_seed42") without affecting checkpoint filenames,
+        # which always come from checkpoint_filename() regardless of this setting.
+        name=config.get("WANDB_RUN_NAME") or f"{wandb_name}_{filename}",
     )
 
     rng = jax.random.PRNGKey(config["SEED"])

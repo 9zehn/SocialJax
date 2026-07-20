@@ -61,3 +61,7 @@
 "ENTITY": ""
 "PROJECT": "socialjax"
 "WANDB_MODE": "online"
+# Override the auto-generated WandB run name for this run (e.g. "baseline_seed42").
+# null = auto-generate from wandb_name + checkpoint_filename(config), as before.
+# Only affects the WandB dashboard label; checkpoint filenames are unaffected.
+"WANDB_RUN_NAME": null
