@@ -205,15 +205,18 @@ def make_train(config):
                 # Bootstrap bonus for the pay mechanism: a small reward credited to the
                 # SENDER whenever a payment actually EXECUTES (not merely attempted, so
                 # this can't be farmed by spamming the pay action with no valid target),
-                # annealed linearly to zero over PAY_BONUS_HORIZON updates. Exists only
-                # here, in the training loop, not in the environment: annealing needs
-                # update_step (how far through TRAINING we are), which the env has no
-                # notion of -- it only tracks its own per-episode inner_t/outer_t, which
-                # reset every episode. PAY_BONUS=0 (default) makes this an exact no-op,
-                # and pay_mode="off" never adds "pay_executed" to info in the first
-                # place, so this can't affect the baseline/placebo conditions.
+                # annealed linearly to zero over PAY_BONUS_HORIZON updates. Works for
+                # both pay schemes, since each defines pay_executed as "a transfer
+                # actually fired this step" (instant: paid; tithe: shared a slice of a
+                # harvest). Exists only here, in the training loop, not the env:
+                # annealing needs update_step (how far through TRAINING we are), which
+                # the env has no notion of -- it only tracks per-episode inner_t/outer_t.
+                # PAY_BONUS=0 (default) makes this an exact no-op. Restricted to
+                # pay_mode=="on": under "noop" pay_executed is computed identically but
+                # transfers cost nothing, so a bonus there would be free farmable reward
+                # that corrupts the placebo (and "off" never emits pay_executed at all).
                 pay_bonus = config.get("PAY_BONUS", 0.0)
-                if pay_bonus and "pay_executed" in info:
+                if pay_bonus and config["ENV_KWARGS"].get("pay_mode") == "on":
                     horizon = config.get("PAY_BONUS_HORIZON", 0)
                     frac = jnp.clip(1.0 - update_step / horizon, 0.0, 1.0) if horizon else 1.0
                     reward = reward + jnp.float32(pay_bonus) * frac * info["pay_executed"]

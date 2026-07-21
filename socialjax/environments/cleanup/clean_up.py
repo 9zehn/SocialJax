@@ -51,6 +51,9 @@ class State:
     # reset). Present always (cheap) so State stays a fixed shape regardless of mode.
     agent_balance: jnp.ndarray
     last_clean_t: jnp.ndarray
+    # pay_scheme="tithe" only: inner_t until which each agent's share-mode pledge is
+    # active (exclusive). 0 at reset = inactive, since "active" means inner_t < expiry.
+    share_expiry_t: jnp.ndarray
 
 
 @chex.dataclass
@@ -68,7 +71,10 @@ class Actions(IntEnum):
     stay = 6
     zap_forward = 7
     zap_clean = 8
-    pay = 9  # transfer pay_amount of reward to nearest agent in range (only if pay_mode != "off")
+    pay = 9  # pay_scheme="instant": transfer pay_amount to the most recent cleaner.
+             # pay_scheme="tithe": pledge share-mode for share_duration steps, during
+             # which share_fraction of each apple harvested auto-flows to the most
+             # recent cleaner. (Action only exists when pay_mode != "off".)
 
 
 class Items(IntEnum):
@@ -166,8 +172,30 @@ def compute_pay_transfers(
             target: (N,) int, recipient index per agent (the chosen recent cleaner);
                 only meaningful where executed=True (used for the viewer's arrows).
     """
-    n = actions.shape[0]
+    attempted = actions == Actions.pay
+    target, has_recipient = _recent_cleaner_recipient(last_clean_t, current_t, clean_window)
+    can_afford = balance >= pay_amount
+    executed = attempted & has_recipient & can_afford
 
+    n = actions.shape[0]
+    sent = jnp.where(executed, jnp.float32(pay_amount), 0.0)
+    delta = jnp.zeros((n,), dtype=jnp.float32)
+    delta = delta.at[jnp.arange(n)].add(-sent)  # payers pay...
+    delta = delta.at[target].add(sent)          # ...their chosen recent cleaner receives
+    return delta, attempted, executed, target
+
+
+def _recent_cleaner_recipient(
+    last_clean_t: jnp.ndarray, current_t: int, clean_window: int
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Option B recipient rule, shared by both pay schemes: for each would-be payer,
+    the most recent OTHER agent that cleaned dirt within `clean_window` steps.
+
+    Returns (target, has_recipient): (N,) recipient index per agent (only meaningful
+    where has_recipient=True) and (N,) bool whether any valid other recent-cleaner
+    exists. Self is masked out per-row -- an agent is never its own recipient.
+    """
+    n = last_clean_t.shape[0]
     # A cleaner is payable if it cleaned within the window. Recency is the sort key
     # for "most recent"; recent_key masks out non-recent agents with a floor below
     # any valid last_clean_t so they never win the argmax.
@@ -176,23 +204,79 @@ def compute_pay_transfers(
     FLOOR = jnp.int32(-1_000_000_000)
     recent_key = jnp.where(recent, last_clean_t.astype(jnp.int32), FLOOR)
 
-    # Per-payer recipient: most recent OTHER recent-cleaner. Self is masked out
-    # per-row (a payer can't pay itself even if it just cleaned), so the argmax is
-    # computed row-wise over an (N, N) key matrix.
     not_self = ~jnp.eye(n, dtype=bool)
     key_matrix = jnp.where(not_self, recent_key[None, :], FLOOR)  # row = payer, col = candidate
     target = jnp.argmax(key_matrix, axis=1)
-    has_recipient = key_matrix[jnp.arange(n), target] > FLOOR  # some valid other recent-cleaner exists
+    has_recipient = key_matrix[jnp.arange(n), target] > FLOOR
+    return target, has_recipient
 
-    attempted = actions == Actions.pay
-    can_afford = balance >= pay_amount
-    executed = attempted & has_recipient & can_afford
 
-    sent = jnp.where(executed, jnp.float32(pay_amount), 0.0)
+def compute_tithe_transfers(
+    actions: jnp.ndarray,
+    last_clean_t: jnp.ndarray,
+    current_t: int,
+    share_expiry_t: jnp.ndarray,
+    income: jnp.ndarray,
+    clean_window: int,
+    share_fraction: float,
+    share_duration: int,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Resolve the pledge-style income-coupled tithe (pay_scheme="tithe").
+
+    Actions.pay is a *pledge*: it (re)activates share-mode for the next
+    `share_duration` steps (effective immediately, auto-expires, re-pledge to
+    extend). While share-mode is active, `share_fraction` of the agent's positive
+    income this step auto-transfers to the most recent other recent-cleaner (same
+    Option B recipient rule as the instant scheme). No balance gate is needed:
+    an agent only ever shares a slice of income it is earning this very step, so
+    the net-of-transfer reward on a harvest step stays positive
+    (income * (1 - share_fraction)) rather than a bare -pay_amount -- the
+    credit-assignment motivation for this scheme over the instant one.
+
+    If no valid recipient exists on a harvest step, nothing is transferred (the
+    harvester keeps full income); the pledge itself is free and never blocked.
+
+    Args:
+        actions: (N,) int array of this step's actions.
+        last_clean_t: (N,) int, inner_t at which each agent last cleaned dirt.
+        current_t: this step's inner_t counter.
+        share_expiry_t: (N,) int, inner_t until which each agent's pledge is active
+            (exclusive); 0 at reset means inactive.
+        income: (N,) float, this step's positive reward basis (apple income).
+            Callers should clip at 0 so negative rewards are never "shared".
+        clean_window: max age (in steps) at which a cleaner is a valid recipient.
+        share_fraction: fraction of income transferred while share-mode is active.
+        share_duration: steps a pledge stays active.
+
+    Returns:
+        (delta, pledged, executed, target, new_expiry, active):
+            delta: (N,) float32 zero-sum reward adjustment (sharer -, cleaner +).
+            pledged: (N,) bool, agent took the pledge action this step.
+            executed: (N,) bool, a transfer actually happened this step (share-mode
+                active AND positive income AND valid recipient).
+            target: (N,) int, recipient index (meaningful where executed=True).
+            new_expiry: (N,) int32, updated share_expiry_t to store in State.
+            active: (N,) bool, share-mode active this step (after pledges applied).
+    """
+    n = actions.shape[0]
+    pledged = actions == Actions.pay
+    new_expiry = jnp.where(
+        pledged, jnp.int32(current_t + share_duration), share_expiry_t.astype(jnp.int32)
+    )
+    active = current_t < new_expiry
+
+    target, has_recipient = _recent_cleaner_recipient(last_clean_t, current_t, clean_window)
+
+    sent = jnp.where(
+        active & has_recipient & (income > 0),
+        jnp.float32(share_fraction) * income.astype(jnp.float32),
+        0.0,
+    )
+    executed = sent > 0
     delta = jnp.zeros((n,), dtype=jnp.float32)
-    delta = delta.at[jnp.arange(n)].add(-sent)  # payers pay...
-    delta = delta.at[target].add(sent)          # ...their chosen recent cleaner receives
-    return delta, attempted, executed, target
+    delta = delta.at[jnp.arange(n)].add(-sent)  # sharers give up a slice of income...
+    delta = delta.at[target].add(sent)          # ...their chosen recent cleaner receives it
+    return delta, pledged, executed, target, new_expiry, active
 
 
 char_to_int = {
@@ -294,11 +378,21 @@ class Clean_up(MultiAgentEnv):
         #   "off"  -> 9 actions, no pay (original baseline)
         #   "noop" -> 10 actions, pay selectable but transfers nothing (placebo
         #             control: isolates action-space-size effects from the money itself)
-        #   "on"   -> 10 actions, pay moves pay_amount to the most recent other agent
-        #             that cleaned dirt within pay_clean_window steps, if the payer's
-        #             balance covers it (else the attempt is a no-op).
+        #   "on"   -> 10 actions, pay actually moves reward
         pay_mode="off",
-        pay_amount=1.0,
+        # What the pay action does when pay_mode != "off":
+        #   "instant" -> pay moves pay_amount immediately, gated by the payer's balance
+        #                (the original mechanism; a bare -pay_amount cost signal).
+        #   "tithe"   -> pay is a PLEDGE: activates share-mode for share_duration steps,
+        #                during which share_fraction of each apple harvested auto-flows
+        #                to the most recent cleaner. Cost is income-coupled (net reward
+        #                on a harvest step stays positive), which is the point: the
+        #                instant scheme's certain, immediate -pay_amount is near-worst-
+        #                case for policy-gradient credit assignment.
+        pay_scheme="instant",
+        pay_amount=1.0,       # instant scheme only
+        share_fraction=0.5,   # tithe scheme only: slice of income shared while pledged
+        share_duration=50,    # tithe scheme only: steps a pledge stays active
         pay_clean_window=50,  # a cleaner stays payable for this many steps after cleaning
         pay_radius=None,      # deprecated (Option A only); accepted but unused under Option B
 
@@ -361,8 +455,15 @@ class Clean_up(MultiAgentEnv):
 
         if pay_mode not in ("off", "noop", "on"):
             raise ValueError(f"pay_mode must be 'off', 'noop', or 'on', got {pay_mode!r}")
+        if pay_scheme not in ("instant", "tithe"):
+            raise ValueError(f"pay_scheme must be 'instant' or 'tithe', got {pay_scheme!r}")
+        if not (0.0 < share_fraction <= 1.0):
+            raise ValueError(f"share_fraction must be in (0, 1], got {share_fraction!r}")
         self.pay_mode = pay_mode
+        self.pay_scheme = pay_scheme
         self.pay_amount = pay_amount
+        self.share_fraction = share_fraction
+        self.share_duration = share_duration
         self.pay_clean_window = pay_clean_window
         self.pay_radius = (obs_size // 2) if pay_radius is None else pay_radius
         # "off" keeps the original 9-action space so old baselines stay comparable;
@@ -1581,26 +1682,45 @@ class Clean_up(MultiAgentEnv):
                 }
 
             # Monetary system: resolve pay actions into a zero-sum reward transfer.
-            # self.pay_mode is a static Python str, so these branches specialize at
-            # trace time (jit-safe; "off" compiles to the original reward graph).
+            # self.pay_mode / self.pay_scheme are static Python strs, so these branches
+            # specialize at trace time (jit-safe; "off" compiles to the original graph).
             if self.pay_mode != "off":
-                pay_delta, pay_attempted, pay_executed, pay_target = compute_pay_transfers(
-                    actions, state.last_clean_t, state.inner_t,
-                    state.agent_balance, self.pay_clean_window, self.pay_amount,
-                )
+                if self.pay_scheme == "tithe":
+                    # income basis: this step's positive reward only, so a sharer
+                    # never "shares" a negative reward into a refund
+                    tithe_income = jnp.maximum(rewards.squeeze(), 0.0)
+                    pay_delta, pay_attempted, pay_executed, pay_target, new_expiry, share_active = (
+                        compute_tithe_transfers(
+                            actions, state.last_clean_t, state.inner_t,
+                            state.share_expiry_t, tithe_income,
+                            self.pay_clean_window, self.share_fraction, self.share_duration,
+                        )
+                    )
+                    # Pledge state advances in BOTH on and noop: the placebo keeps the
+                    # action's dynamics identical and only withholds the money.
+                    state = state.replace(share_expiry_t=new_expiry)
+                    info["share_active"] = jnp.float32(share_active).squeeze()
+                    # Total sent this step (from the sender side, not the net delta,
+                    # which can mix sends and receipts for the same agent).
+                    pay_volume_on = jnp.sum(
+                        jnp.where(pay_executed, jnp.float32(self.share_fraction) * tithe_income, 0.0)
+                    )
+                else:  # "instant"
+                    pay_delta, pay_attempted, pay_executed, pay_target = compute_pay_transfers(
+                        actions, state.last_clean_t, state.inner_t,
+                        state.agent_balance, self.pay_clean_window, self.pay_amount,
+                    )
+                    pay_volume_on = jnp.sum(jnp.float32(pay_executed)) * self.pay_amount
                 if self.pay_mode == "on":
                     rewards = rewards + pay_delta[:, None]
-                # "noop" (placebo): action exists, recipient/affordability are computed
-                # and logged identically, but no reward actually moves.
+                # "noop" (placebo): action exists, recipient/affordability/pledging are
+                # computed and logged identically, but no reward actually moves.
                 info["pay_attempts"] = jnp.float32(pay_attempted).squeeze()
                 info["pay_executed"] = jnp.float32(pay_executed).squeeze()
                 # Payer -> recipient (chosen recent cleaner) index, valid only where
                 # pay_executed=True (used by the viewer to draw a "who paid whom" arrow).
                 info["pay_target"] = jnp.int32(pay_target).squeeze()
-                if self.pay_mode == "on":
-                    pay_volume = jnp.sum(jnp.float32(pay_executed)) * self.pay_amount
-                else:
-                    pay_volume = jnp.float32(0.0)
+                pay_volume = pay_volume_on if self.pay_mode == "on" else jnp.float32(0.0)
                 info["pay_volume"] = jnp.broadcast_to(pay_volume, (self.num_agents,)).squeeze()
                 # "shaped_rewards" was captured before this block ran (same pattern the
                 # SVO/inequity_aversion/interest branches above use: original = raw apple
@@ -1638,6 +1758,7 @@ class Clean_up(MultiAgentEnv):
                 smooth_rewards=state.smooth_rewards,
                 agent_balance=state.agent_balance,
                 last_clean_t=state.last_clean_t,
+                share_expiry_t=state.share_expiry_t,
             )
 
             # now calculate if done for inner or outer episode
@@ -1761,6 +1882,7 @@ class Clean_up(MultiAgentEnv):
                 smooth_rewards=jnp.zeros((self.num_agents, 1)),
                 agent_balance=jnp.zeros((self.num_agents,), dtype=jnp.float32),
                 last_clean_t=jnp.full((self.num_agents,), -10_000, dtype=jnp.int32),
+                share_expiry_t=jnp.zeros((self.num_agents,), dtype=jnp.int32),
             )
 
         def reset(

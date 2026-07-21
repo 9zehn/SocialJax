@@ -42,9 +42,19 @@ def checkpoint_filename(config: Dict[str, Any], latest: bool = False) -> str:
     pay_mode = env_kwargs.get("pay_mode")
     if pay_mode and pay_mode != "off":  # "off" is clean_up's own default; keep it unmarked
         suffix += f"_pay_{pay_mode}"
-        # Only meaningful when pay_mode is active; only marked when swept away from
-        # clean_up's own default (50), so existing pay_on/pay_noop runs at the
-        # default window keep their current filenames.
+        # Sub-parameters are only meaningful when pay_mode is active, and only
+        # marked when swept away from clean_up's own defaults, so existing
+        # pay_on/pay_noop runs at default settings keep their current filenames.
+        pay_scheme = env_kwargs.get("pay_scheme")
+        if pay_scheme and pay_scheme != "instant":  # "instant" is the default scheme
+            suffix += f"_{pay_scheme}"
+            # tithe's own knobs (fraction/duration), marked only off-default too
+            share_fraction = env_kwargs.get("share_fraction")
+            if share_fraction is not None and share_fraction != 0.5:
+                suffix += f"_f{share_fraction}"
+            share_duration = env_kwargs.get("share_duration")
+            if share_duration is not None and share_duration != 50:
+                suffix += f"_d{share_duration}"
         pay_clean_window = env_kwargs.get("pay_clean_window")
         if pay_clean_window and pay_clean_window != 50:
             suffix += f"_win{pay_clean_window}"

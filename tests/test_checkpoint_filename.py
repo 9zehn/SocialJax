@@ -68,6 +68,36 @@ def test_pay_clean_window_default_matches_unmarked_naming():
     assert explicit_default == omitted == "clean_up_seed42_reward_individual_pay_on_agents4"
 
 
+def test_tithe_scheme_marked_and_does_not_collide_with_instant():
+    instant = checkpoint_filename(_config(ENV_KWARGS={"num_agents": 4, "pay_mode": "on"}))
+    tithe = checkpoint_filename(
+        _config(ENV_KWARGS={"num_agents": 4, "pay_mode": "on", "pay_scheme": "tithe"})
+    )
+    assert instant != tithe, "tithe and instant runs at the same seed must not collide"
+    assert tithe == "clean_up_seed42_reward_individual_pay_on_tithe_agents4"
+    # "instant" is the default scheme: explicit instant matches omitting it, so all
+    # existing instant-scheme checkpoints keep their current filenames
+    explicit_instant = checkpoint_filename(
+        _config(ENV_KWARGS={"num_agents": 4, "pay_mode": "on", "pay_scheme": "instant"})
+    )
+    assert explicit_instant == instant
+
+
+def test_tithe_fraction_and_duration_marked_only_off_default():
+    base = {"num_agents": 4, "pay_mode": "on", "pay_scheme": "tithe"}
+    default = checkpoint_filename(_config(ENV_KWARGS={**base, "share_fraction": 0.5, "share_duration": 50}))
+    assert default == "clean_up_seed42_reward_individual_pay_on_tithe_agents4"
+    swept = checkpoint_filename(_config(ENV_KWARGS={**base, "share_fraction": 0.25, "share_duration": 100}))
+    assert swept == "clean_up_seed42_reward_individual_pay_on_tithe_f0.25_d100_agents4"
+    # sweeping either knob alone must also produce distinct names
+    names = {
+        default,
+        checkpoint_filename(_config(ENV_KWARGS={**base, "share_fraction": 0.25})),
+        checkpoint_filename(_config(ENV_KWARGS={**base, "share_duration": 100})),
+    }
+    assert len(names) == 3
+
+
 def test_pay_mode_off_or_absent_matches_original_naming():
     # pay_mode="off" (or omitted) shouldn't add a suffix, so old baseline runs
     # without any pay_mode key keep the same filename they always had.
