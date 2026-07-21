@@ -202,11 +202,23 @@ def make_train(config):
                     env.step, in_axes=(0, 0, 0)
                 )(rng_step, env_state, env_act)
 
-                # current_timestep = update_step*config["NUM_STEPS"]*config["NUM_ENVS"]
-                # shaped_reward = compute_grouped_rewards(reward)
-                # reward = jax.tree.map(lambda x,y: x*rew_shaping_anneal_org(current_timestep)+y*rew_shaping_anneal(current_timestep), reward, shaped_reward)
+                # Bootstrap bonus for the pay mechanism: a small reward credited to the
+                # SENDER whenever a payment actually EXECUTES (not merely attempted, so
+                # this can't be farmed by spamming the pay action with no valid target),
+                # annealed linearly to zero over PAY_BONUS_HORIZON updates. Exists only
+                # here, in the training loop, not in the environment: annealing needs
+                # update_step (how far through TRAINING we are), which the env has no
+                # notion of -- it only tracks its own per-episode inner_t/outer_t, which
+                # reset every episode. PAY_BONUS=0 (default) makes this an exact no-op,
+                # and pay_mode="off" never adds "pay_executed" to info in the first
+                # place, so this can't affect the baseline/placebo conditions.
+                pay_bonus = config.get("PAY_BONUS", 0.0)
+                if pay_bonus and "pay_executed" in info:
+                    horizon = config.get("PAY_BONUS_HORIZON", 0)
+                    frac = jnp.clip(1.0 - update_step / horizon, 0.0, 1.0) if horizon else 1.0
+                    reward = reward + jnp.float32(pay_bonus) * frac * info["pay_executed"]
 
-                
+
                 if config["PARAMETER_SHARING"]:
                     info = jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                     transition = Transition(

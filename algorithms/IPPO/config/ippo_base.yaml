@@ -56,6 +56,16 @@
 # Must use the SAME hyperparameters (TOTAL_TIMESTEPS/NUM_STEPS/NUM_ENVS/etc.) as
 # the original run, or the LR schedule and remaining-updates math won't line up.
 "RESUME_FROM": null
+# Bootstrap bonus for the monetary system: extra reward credited to the SENDER
+# whenever a pay action actually executes, annealed linearly to zero over
+# PAY_BONUS_HORIZON updates (0 = constant, never anneals). 0.0 (default) is an
+# exact no-op -- only meaningful with ENV_KWARGS.pay_mode="on"; pay_mode="off"
+# never triggers it at all. Existence is a training-loop concern (see
+# ippo_cnn_cleanup.py's _env_step), not an environment one, since annealing
+# needs to know how far through TRAINING we are, which only the algorithm
+# tracks via update_step.
+"PAY_BONUS": 0.0
+"PAY_BONUS_HORIZON": 0
 
 # WandB defaults
 "ENTITY": ""
