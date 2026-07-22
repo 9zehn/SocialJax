@@ -55,6 +55,11 @@ def checkpoint_filename(config: Dict[str, Any], latest: bool = False) -> str:
             share_duration = env_kwargs.get("share_duration")
             if share_duration is not None and share_duration != 50:
                 suffix += f"_d{share_duration}"
+            # recipient rule: split the tithe across all recent cleaners vs. the single
+            # most-recent one (False, clean_up's default) -- marked so split runs get
+            # their own checkpoint path and never overwrite winner-take-all ones.
+            if env_kwargs.get("split_recipients"):
+                suffix += "_split"
         pay_clean_window = env_kwargs.get("pay_clean_window")
         if pay_clean_window and pay_clean_window != 50:
             suffix += f"_win{pay_clean_window}"

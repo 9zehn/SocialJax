@@ -24,6 +24,7 @@ Examples:
         --checkpoint 'checkpoints/individual/clean_up_seed0_reward_individual_*.pkl'
 """
 import argparse
+import functools
 import math
 import os
 import time
@@ -38,24 +39,43 @@ import socialjax
 from algorithms.utils.io_utils import load_params
 
 
-def _extract_pay_events(info, prev_state):
-    """(sender, receiver, sender_loc, receiver_loc) for this step's executed payments.
+def _extract_share_events(info, prev_state):
+    """(sender, receiver, sender_loc, receiver_loc, amount) for every reward actually
+    shared this step -- one entry per sender->receiver edge.
 
-    Positions are taken from prev_state (before the step). Under Option B the
-    receiver is whoever recently cleaned the river, so payer and receiver can be
-    far apart (the arrow may span the map) -- it's a fixed annotation of who paid
-    whom on that step, not a tracker of their later movement.
-    Returns [] for envs/modes with no pay mechanism (info won't have these keys).
+    Under the tithe (toggle) scheme a single pledge turns share-mode ON for several
+    steps, and on *each* of those a slice of the sharer's harvest auto-flows to recent
+    cleaner(s). We reconstruct the edges from the two per-agent (N,) vectors the env
+    exposes: pay_sent[i] (what sharer i gave up) and pay_received[j] (what cleaner j
+    got). With split_recipients a sharer's slice fans across all recent cleaners, so we
+    draw one arrow per (sender, receiver) pair, dividing pay_sent[i] equally across the
+    receivers (excluding the sender itself). Under the single-recipient rule there's
+    just one receiver, so this reduces to a lone arrow. One arrow per real transfer --
+    not per pledge action.
+
+    Positions are taken from prev_state (before the step). Sender/receiver can be far
+    apart (a harvester in the orchard subsidising a river cleaner). Returns [] for
+    envs/modes with no pay mechanism; the caller suppresses arrows in the "noop"
+    placebo (nothing actually moves there).
     """
-    if "pay_executed" not in info or "pay_target" not in info:
+    if "pay_sent" not in info or "pay_received" not in info:
         return []
-    executed = np.atleast_1d(np.array(info["pay_executed"])).astype(bool)
-    target = np.atleast_1d(np.array(info["pay_target"]))
+    sent = np.atleast_1d(np.array(info["pay_sent"]))
+    received = np.atleast_1d(np.array(info["pay_received"]))
     locs = np.array(prev_state.agent_locs)
+    recipients = np.nonzero(received > 0)[0]
     events = []
-    for sender in np.nonzero(executed)[0]:
-        receiver = int(target[sender])
-        events.append((int(sender), receiver, tuple(locs[sender, :2]), tuple(locs[receiver, :2])))
+    for sender in np.nonzero(sent > 0)[0]:
+        # A sharer never pays itself, so its receivers are the recipients minus itself.
+        # (Equal-split amount; exact in the common case, a close approximation only in
+        # the degenerate case where some recent cleaner received nothing this step.)
+        rj = [int(j) for j in recipients if j != sender]
+        if not rj:
+            continue
+        amount = float(sent[sender]) / len(rj)
+        for j in rj:
+            events.append((int(sender), j, tuple(locs[sender, :2]),
+                           tuple(locs[j, :2]), amount))
     return events
 
 
@@ -63,10 +83,12 @@ def rollout(env, params, num_steps, seed):
     """Step the env and collect raw states (fast, sequential — each step depends on the last).
 
     Rendering is deferred to render_states() so it can be parallelized separately.
-    Also returns pay_events, aligned with states: pay_events[i] is the list of
-    (sender, receiver, sender_loc, receiver_loc) payments that produced states[i]
-    (pay_events[0] is always empty -- states[0] is the initial reset).
+    Also returns share_events, aligned with states: share_events[i] is the list of
+    (sender, receiver, sender_loc, receiver_loc) reward-shares that produced
+    states[i] (share_events[0] is always empty -- states[0] is the initial reset).
+    In the placebo "noop" mode nothing actually moves, so no arrows are emitted.
     """
+    emit_share_arrows = getattr(env, "pay_mode", "off") == "on"
     rng = jax.random.PRNGKey(seed)
     rng, rng_reset = jax.random.split(rng)
     obs, state = env.reset(rng_reset)
@@ -108,7 +130,7 @@ def rollout(env, params, num_steps, seed):
         prev_state = state
         obs, state, reward, done, info = env.step(rng_step, state, actions)
         states.append(state)
-        pay_events.append(_extract_pay_events(info, prev_state))
+        pay_events.append(_extract_share_events(info, prev_state) if emit_share_arrows else [])
 
         if bool(done["__all__"]):
             break
@@ -176,19 +198,33 @@ def _agent_pixel_center(env, row, col, frame_height):
     return cx, cy
 
 
-def _draw_arrow(draw, p1, p2, color=(255, 215, 0), width=3, head_len=12):
+def _draw_arrow(draw, p1, p2, color=(255, 215, 0), width=3, head_len=13, label=None, font=None):
+    # A thin dark casing under the colored line keeps the arrow readable over both
+    # the green orchard and the grey river.
+    draw.line([p1, p2], fill=(20, 20, 24), width=width + 2)
     draw.line([p1, p2], fill=color, width=width)
     angle = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
     for offset in (math.radians(150), math.radians(-150)):
         hx = p2[0] + head_len * math.cos(angle + offset)
         hy = p2[1] + head_len * math.sin(angle + offset)
+        draw.line([p2, (hx, hy)], fill=(20, 20, 24), width=width + 2)
         draw.line([p2, (hx, hy)], fill=color, width=width)
+    if label:
+        # Amount transferred, at the arrow midpoint, with a dark pill behind it so a
+        # fractional tithe share (e.g. "3.5") reads clearly over any tile.
+        mx, my = (p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2
+        if font is not None:
+            tb = draw.textbbox((mx, my), label, font=font, anchor="mm")
+            draw.rounded_rectangle([tb[0] - 4, tb[1] - 2, tb[2] + 4, tb[3] + 2], radius=5, fill=(20, 20, 24))
+            draw.text((mx, my), label, font=font, fill=color, anchor="mm")
 
 
-def draw_pay_arrows(frames, pay_events, env, persist_frames=3, color=(255, 215, 0)):
-    """Overlay a payer -> payee arrow for `persist_frames` frames starting at the
-    frame each payment occurred on. No-op (returns frames unchanged) if there are
-    no events at all, or if the env doesn't expose GRID_SIZE_ROW/COL.
+def draw_pay_arrows(frames, pay_events, env, persist_frames=3, colors=None):
+    """Overlay a sender -> receiver arrow, tinted the SENDER's agent color, for
+    `persist_frames` frames starting on the frame each reward-share occurred. The
+    color match lets you read at a glance which agent's income is flowing where and
+    ties the arrow to that agent's row in the info panel. No-op (returns frames
+    unchanged) if there are no events, or the env doesn't expose GRID_SIZE_ROW/COL.
     """
     if not any(pay_events) or _agent_pixel_center(env, 0, 0, frames[0].shape[0]) is None:
         return frames
@@ -200,6 +236,7 @@ def draw_pay_arrows(frames, pay_events, env, persist_frames=3, color=(255, 215, 
             for j in range(i, min(i + persist_frames, n)):
                 active[j].append(event)
 
+    label_font = _load_font(max(12, int(frames[0].shape[0] * 0.026)))
     out = []
     for i, frame in enumerate(frames):
         if not active[i]:
@@ -208,11 +245,226 @@ def draw_pay_arrows(frames, pay_events, env, persist_frames=3, color=(255, 215, 
         img = Image.fromarray(frame).convert("RGB")
         draw = ImageDraw.Draw(img)
         h = frame.shape[0]
-        for _sender, _receiver, sender_loc, receiver_loc in active[i]:
+        for sender, _receiver, sender_loc, receiver_loc, amount in active[i]:
             p1 = _agent_pixel_center(env, sender_loc[0], sender_loc[1], h)
             p2 = _agent_pixel_center(env, receiver_loc[0], receiver_loc[1], h)
-            _draw_arrow(draw, p1, p2, color=color)
+            color = colors[sender] if colors is not None and sender < len(colors) else (255, 215, 0)
+            label = f"{amount:g}" if amount else None
+            _draw_arrow(draw, p1, p2, color=color, label=label, font=label_font)
         out.append(np.array(img))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Per-agent info panel (drawn to the right of the grid).
+# ---------------------------------------------------------------------------
+
+@functools.lru_cache(maxsize=16)
+def _load_font(size):
+    """A scalable TrueType font at `size`, falling back gracefully.
+
+    Tries matplotlib's bundled DejaVu Sans (matplotlib is already a viewer
+    dependency, so it's always importable) then a couple of common OS paths, then
+    Pillow's built-in default. Cached so per-frame rendering doesn't reload the
+    font file. Returns an ImageFont.
+    """
+    from PIL import ImageFont
+
+    candidates = []
+    try:
+        from matplotlib import font_manager
+
+        candidates.append(font_manager.findfont(font_manager.FontProperties(family="DejaVu Sans")))
+    except Exception:
+        pass
+    candidates += [
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "DejaVuSans.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default(size=size)  # Pillow >= 10.1 scalable default
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _panel_supported(states, env):
+    """The panel needs per-agent balances/colors, which only clean_up exposes."""
+    return (
+        len(states) > 0
+        and hasattr(states[0], "agent_balance")
+        and getattr(env, "PLAYER_COLOURS", None) is not None
+    )
+
+
+def collect_panel_data(states, env):
+    """Per-step, per-agent stats for the info panel, aligned with `states`.
+
+    Returns a list (one entry per state) of dicts:
+        balance:   (N,) cumulative net reward = each agent's spendable balance.
+        clean:     (N,) running count of steps on which the agent cleaned dirt,
+                   derived from last_clean_t changing (the env keeps no cumulative
+                   counter, only the most-recent clean time).
+        share:     (N,) bool, share-mode toggle currently ON (tithe scheme only;
+                   all-False otherwise).
+    """
+    n = env.num_agents
+    clean_counts = np.zeros(n, dtype=int)
+    prev_lct = None
+    out = []
+    for s in states:
+        lct = np.array(s.last_clean_t) if hasattr(s, "last_clean_t") else None
+        if lct is not None and prev_lct is not None:
+            clean_counts = clean_counts + (lct != prev_lct).astype(int)
+        prev_lct = lct
+        balance = np.array(s.agent_balance) if hasattr(s, "agent_balance") else np.zeros(n)
+        if hasattr(s, "share_expiry_t"):
+            share = np.array(s.share_expiry_t) > int(s.inner_t)
+        else:
+            share = np.zeros(n, dtype=bool)
+        out.append({"balance": np.asarray(balance).reshape(-1),
+                    "clean": clean_counts.copy(),
+                    "share": np.asarray(share).reshape(-1)})
+    return out
+
+
+# Panel palette (dark, so the colored agent swatches pop and it reads next to the grid).
+_PANEL_BG = (26, 27, 38)
+_PANEL_FG = (228, 230, 240)
+_PANEL_MUTED = (150, 154, 170)
+_PANEL_ROW = (37, 39, 55)
+_PANEL_ON = (80, 220, 130)
+_PANEL_OFF = (222, 70, 74)
+
+
+def _scheme_caption(env):
+    """One-line description of the active reward + pay mechanism, shown in the panel
+    header. Names the reward mode explicitly because the env DEFAULTS to shared/common
+    reward (every agent gets each apple), which silently turns an individual-reward
+    checkpoint's replay into a common-reward economy -- and names the pay scheme so the
+    tithe toggle can't be confused with the old instant one-off payment.
+    """
+    reward = "shared-reward" if getattr(env, "shared_rewards", True) else "individual"
+    mode = getattr(env, "pay_mode", "off")
+    if mode == "off":
+        return f"{reward} · no payments"
+    scheme = getattr(env, "pay_scheme", "?")
+    tag = "" if mode == "on" else " [placebo]"
+    if scheme == "tithe":
+        who = "→all cleaners" if getattr(env, "split_recipients", False) else "→latest cleaner"
+        return f"{reward} · tithe {getattr(env, 'share_fraction', 0.5):g} {who}{tag}"
+    return f"{reward} · instant pays {getattr(env, 'pay_amount', 1.0):g}{tag}"
+
+
+def render_info_panel(height, datum, colors, env, step, width):
+    """Render one info-panel frame (RGB, height x width) for a single step.
+
+    First column is each agent's color (a swatch + a color bar down the row edge)
+    so every stat reads back to the matching agent in the grid and to its arrows.
+    Columns: color/label | Reward (balance) | Clean (count) | Share (ON/OFF), the
+    last shown only when the tithe toggle exists.
+    """
+    from PIL import ImageDraw
+
+    show_share = getattr(env, "pay_scheme", None) == "tithe" and getattr(env, "pay_mode", "off") != "off"
+    n = env.num_agents
+
+    img = Image.new("RGB", (width, height), _PANEL_BG)
+    draw = ImageDraw.Draw(img)
+
+    pad = max(14, int(width * 0.045))
+    title_f = _load_font(max(15, int(width * 0.062)))
+    head_f = _load_font(max(11, int(width * 0.04)))
+    cell_f = _load_font(max(13, int(width * 0.048)))
+
+    # Header: title + step, the active-mechanism caption, then a totals line.
+    draw.text((pad, pad), "Agents", font=title_f, fill=_PANEL_FG)
+    draw.text((width - pad, pad + 2), f"step {step}", font=head_f, fill=_PANEL_MUTED, anchor="ra")
+    y = pad + int(title_f.size * 1.5)
+    draw.text((pad, y), _scheme_caption(env), font=head_f, fill=_PANEL_MUTED)
+    total_reward = float(np.sum(datum["balance"]))
+    total_clean = int(np.sum(datum["clean"]))
+    y += int(head_f.size * 1.5)
+    draw.text((pad, y), f"total reward {total_reward:.1f}    total clean {total_clean}",
+              font=head_f, fill=_PANEL_MUTED)
+
+    # Column x anchors (right-aligned value columns). Share (dot + ON/OFF) needs the
+    # widest slot; leave a clear gap between it and the Clean number so they never
+    # run together.
+    x_share = width - pad                                            # rightmost
+    x_clean = (x_share - int(width * 0.26)) if show_share else (width - pad)
+    x_reward = x_clean - int(width * 0.20)
+
+    # Column header row.
+    y_head = y + int(head_f.size * 1.9)
+    draw.text((x_reward, y_head), "Reward", font=head_f, fill=_PANEL_MUTED, anchor="ra")
+    draw.text((x_clean, y_head), "Clean", font=head_f, fill=_PANEL_MUTED, anchor="ra")
+    if show_share:
+        draw.text((x_share, y_head), "Share", font=head_f, fill=_PANEL_MUTED, anchor="ra")
+
+    # Rows.
+    top = y_head + int(head_f.size * 1.5)
+    avail = height - top - pad
+    row_h = avail / max(n, 1)
+    swatch = min(int(row_h * 0.5), int(width * 0.09))
+
+    for i in range(n):
+        ry = top + row_h * i
+        cy = ry + row_h / 2
+        color = tuple(int(c) for c in colors[i]) if i < len(colors) else (200, 200, 200)
+
+        # Row background + left color bar (the "color first column").
+        draw.rounded_rectangle([pad - 4, ry + 2, width - pad + 4, ry + row_h - 2],
+                               radius=6, fill=_PANEL_ROW)
+        draw.rounded_rectangle([pad - 4, ry + 2, pad + 2, ry + row_h - 2], radius=3, fill=color)
+
+        # Color swatch + agent label.
+        sx = pad + int(width * 0.02)
+        draw.rounded_rectangle([sx, cy - swatch / 2, sx + swatch, cy + swatch / 2],
+                               radius=4, fill=color, outline=(15, 16, 24))
+        draw.text((sx + swatch + int(width * 0.03), cy), f"A{i}", font=cell_f,
+                  fill=_PANEL_FG, anchor="lm")
+
+        # Reward + clean values.
+        draw.text((x_reward, cy), f"{float(datum['balance'][i]):.1f}", font=cell_f,
+                  fill=_PANEL_FG, anchor="rm")
+        draw.text((x_clean, cy), f"{int(datum['clean'][i])}", font=cell_f,
+                  fill=_PANEL_FG, anchor="rm")
+
+        # Share toggle indicator: filled green square = ON, filled red square = OFF,
+        # so an inactive pledge is as obvious as an active one.
+        if show_share:
+            on = bool(datum["share"][i])
+            fill = _PANEL_ON if on else _PANEL_OFF
+            s = max(10, int(row_h * 0.32))
+            bx = x_share - s
+            draw.rounded_rectangle([bx, cy - s / 2, bx + s, cy + s / 2],
+                                   radius=4, fill=fill, outline=(15, 16, 24))
+            draw.text((bx - int(width * 0.015), cy), "ON" if on else "OFF",
+                      font=head_f, fill=fill, anchor="rm")
+
+    return np.array(img)
+
+
+def add_info_panels(frames, panel_data, colors, env, width=None):
+    """Composite a per-step info panel onto the right of each grid frame.
+
+    Returns new (wider) frames of uniform size so both the GIF export and the
+    interactive scrubber show the panel. Panel width defaults to ~62% of the grid
+    height, clamped to a sensible minimum.
+    """
+    h = frames[0].shape[0]
+    if width is None:
+        width = max(360, int(h * 0.75))
+    out = []
+    for i, frame in enumerate(frames):
+        panel = render_info_panel(h, panel_data[i], colors, env, i, width)
+        out.append(np.hstack([frame, panel]))
     return out
 
 
@@ -240,18 +492,22 @@ def interactive_view(frames, traces, interval_ms=150):
 
     state = {"playing": False, "loop": True, "interval": interval_ms}
 
-    fig, ax = plt.subplots(figsize=(6, 7))
+    # Frames may now be wide (grid + info panel), so pick a figure aspect that
+    # matches the frame instead of a fixed portrait size.
+    fh, fw = frames[0].shape[:2]
+    fig_w = 9.0
+    fig, ax = plt.subplots(figsize=(fig_w, fig_w * fh / fw + 1.4))
     plt.subplots_adjust(bottom=0.22)
     im = ax.imshow(frames[0])
     ax.axis("off")
-    ax.set_title(_frame_title(0, traces), fontsize=8)
+    ax.set_title(_frame_title(0, traces), fontsize=9)
 
     ax_slider = plt.axes([0.15, 0.14, 0.7, 0.03])
     slider = Slider(ax_slider, "Step", 0, len(frames) - 1, valinit=0, valstep=1)
 
     def show_frame(t):
         im.set_data(frames[t])
-        ax.set_title(_frame_title(t, traces), fontsize=8)
+        ax.set_title(_frame_title(t, traces), fontsize=9)
         fig.canvas.draw_idle()
 
     def on_slider_changed(val):
@@ -298,6 +554,13 @@ def interactive_view(frames, traces, interval_ms=150):
     def stop_playing(_event=None):
         state["playing"] = False
 
+    def step_frame(delta):
+        # Pause and nudge exactly one frame; clamp at the ends (don't wrap, so
+        # stepping is predictable for frame-by-frame inspection).
+        state["playing"] = False
+        t = max(0, min(len(frames) - 1, int(slider.val) + delta))
+        slider.set_val(t)  # triggers on_slider_changed -> show_frame
+
     def set_speed(factor):
         # lower bound = CLOCK_MS: the frame clock can't advance faster than it ticks,
         # so don't let the label promise an fps we can't actually deliver.
@@ -318,12 +581,14 @@ def interactive_view(frames, traces, interval_ms=150):
             path = out_dir / f"frame_{t:05d}.png"
             Image.fromarray(frames[t]).save(path)
             print(f"Saved frame {t} to {path}", flush=True)
-            ax.set_title(f"{_frame_title(t, traces)}  [saved -> {path.name}]", fontsize=8)
+            ax.set_title(f"{_frame_title(t, traces)}  [saved -> {path.name}]", fontsize=9)
             fig.canvas.draw_idle()
         except Exception as exc:  # surface errors instead of letting the GUI swallow them
             print(f"Save failed: {exc}", flush=True)
 
     button_specs = [
+        ("◀|", lambda e: step_frame(-1)),      # step one frame back
+        ("|▶", lambda e: step_frame(1)),       # step one frame forward
         ("▶", start_playing),    # play
         ("||", stop_playing),         # pause
         ("◀◀", lambda e: set_speed(1.5)),      # slower
@@ -332,7 +597,7 @@ def interactive_view(frames, traces, interval_ms=150):
         ("Save", save_frame),
     ]
     n = len(button_specs)
-    width, gap = 0.13, 0.015
+    width, gap = 0.105, 0.012
     total = n * width + (n - 1) * gap
     x0 = (1 - total) / 2
     buttons = []
@@ -341,7 +606,7 @@ def interactive_view(frames, traces, interval_ms=150):
         btn = Button(ax_btn, label)
         btn.on_clicked(callback)
         buttons.append(btn)
-    play_button, pause_button, slower_button, faster_button, loop_button, save_button = buttons
+    loop_button = buttons[6]
     loop_button.ax.set_facecolor("honeydew")
 
     speed_label = fig.text(0.5, 0.115, f"{1000 / state['interval']:.1f} fps", fontsize=8, ha="center")
@@ -350,8 +615,8 @@ def interactive_view(frames, traces, interval_ms=150):
 
 
 def _frame_title(t, traces):
-    locs = traces[t].get("locs")
-    return f"step {t}" if locs is None else f"step {t}  agent_locs={locs.tolist()}"
+    # Per-agent detail now lives in the side panel, so the title stays minimal.
+    return f"step {t}"
 
 
 def _parse_env_kwarg_value(raw):
@@ -378,6 +643,120 @@ def _load_checkpoint(arg):
         return load_params(matches[0])
     print(f"Loading {len(matches)} per-agent checkpoints (sorted -> agent 0..{len(matches) - 1})")
     return [load_params(m) for m in matches]
+
+
+def _infer_env_kwargs_from_checkpoint(checkpoint_arg):
+    """Best-effort recovery of the env config a checkpoint was TRAINED with, by parsing
+    the filename the training loop wrote (algorithms/utils/io_utils.checkpoint_filename).
+
+    That naming scheme OMITS any value left at its default, so an absent token means
+    "the env default": no `_pay_*` -> pay_mode off; `_pay_on`/`_pay_noop` without
+    `_tithe` -> instant scheme; no `_f`/`_d`/`_win` -> default fraction/duration/window.
+    We only trust this when the name is clearly from that scheme (it carries a
+    `reward_individual|common` or `_agents` token); for arbitrary/renamed files we
+    return {} and let the env defaults + the mismatch warning handle it. Reliability
+    caveat: this reads the filename, not the weights, so a mislabeled file misleads it
+    -- hence it's overridable by explicit --env-kwarg and printed for inspection.
+
+    Returns a dict of env kwargs (possibly empty).
+    """
+    import glob
+    import re
+
+    matches = sorted(glob.glob(checkpoint_arg))
+    name = os.path.basename(matches[0] if matches else checkpoint_arg).lower()
+
+    recognized = ("reward_individual" in name or "reward_common" in name
+                  or re.search(r"_agents\d+", name) is not None)
+    if not recognized:
+        return {}
+
+    kw = {}
+    # Reward mode: individual -> shared_rewards=False (differs from the env default!),
+    # common -> True. This is the token that most often needs fixing.
+    if "reward_individual" in name:
+        kw["shared_rewards"] = False
+    elif "reward_common" in name:
+        kw["shared_rewards"] = True
+
+    # Pay mode: token present for on/noop, absent means off.
+    if "pay_noop" in name:
+        kw["pay_mode"] = "noop"
+    elif "pay_on" in name:
+        kw["pay_mode"] = "on"
+    else:
+        kw["pay_mode"] = "off"
+
+    # Scheme + its off-default knobs only matter when pay is active.
+    if kw["pay_mode"] in ("on", "noop"):
+        kw["pay_scheme"] = "tithe" if "_tithe" in name else "instant"
+        if kw["pay_scheme"] == "tithe":
+            m = re.search(r"_f([0-9]*\.?[0-9]+)", name)
+            if m:
+                kw["share_fraction"] = float(m.group(1))
+            m = re.search(r"_d(\d+)", name)
+            if m:
+                kw["share_duration"] = int(m.group(1))
+            if "_split" in name:
+                kw["split_recipients"] = True
+        m = re.search(r"_win(\d+)", name)
+        if m:
+            kw["pay_clean_window"] = int(m.group(1))
+
+    m = re.search(r"_agents(\d+)", name)
+    if m:
+        kw["num_agents"] = int(m.group(1))
+    return kw
+
+
+def _report_env_config(env, checkpoint_arg):
+    """Print the reward/pay config the env was actually built with, and warn loudly if
+    it contradicts what the checkpoint filename says it was trained with.
+
+    Motivation: the env DEFAULTS to shared/common reward, so a viewer command that
+    forgets `--env-kwarg shared_rewards=False` silently replays an individual-reward
+    checkpoint inside a common-reward economy (every apple credits all agents) -- which
+    looks like a payment bug but is just a mode mismatch. Filenames written by the
+    training loop encode reward_{individual,common} and pay_{off,on,noop}[_scheme].
+    """
+    shared = getattr(env, "shared_rewards", True)
+    pay_mode = getattr(env, "pay_mode", "off")
+    pay_scheme = getattr(env, "pay_scheme", "?")
+    split = getattr(env, "split_recipients", False)
+    extra = ""
+    if pay_mode != "off" and pay_scheme == "tithe":
+        extra = (f", recipients={'split-all' if split else 'latest'}, "
+                 f"clean_window={getattr(env, 'pay_clean_window', '?')}")
+    print(
+        f"Env config: reward={'shared/common' if shared else 'individual'}, "
+        f"pay_mode={pay_mode}, pay_scheme={pay_scheme}{extra}, num_agents={env.num_agents}"
+    )
+    if not checkpoint_arg:
+        return
+    # checkpoint_arg may be a glob (e.g. ..._reward_individual*.pkl) that truncates
+    # before the pay-scheme tokens, so resolve it to a real matched filename first.
+    import glob
+
+    matches = sorted(glob.glob(checkpoint_arg))
+    name = os.path.basename(matches[0] if matches else checkpoint_arg).lower()
+    warnings = []
+    if "reward_individual" in name and shared:
+        warnings.append("checkpoint says reward_individual but env is shared/common reward "
+                        "-> add `--env-kwarg shared_rewards=False`")
+    if "reward_common" in name and not shared:
+        warnings.append("checkpoint says reward_common but env is individual reward "
+                        "-> add `--env-kwarg shared_rewards=True`")
+    if "_tithe" in name and pay_scheme != "tithe":
+        warnings.append("checkpoint trained with the tithe scheme but env pay_scheme="
+                        f"{pay_scheme!r} -> add `--env-kwarg pay_scheme=tithe`")
+    if "pay_on" in name and pay_mode != "on":
+        warnings.append(f"checkpoint trained with pay_mode=on but env pay_mode={pay_mode!r} "
+                        "-> add `--env-kwarg pay_mode=on`")
+    if "_split" in name and not split:
+        warnings.append("checkpoint trained with split recipients but env uses the single "
+                        "most-recent cleaner -> add `--env-kwarg split_recipients=True`")
+    for w in warnings:
+        print(f"  ⚠️  WARNING: {w}")
 
 
 def _warn_if_fixed_agent_count(env, env_name, requested_num_agents):
@@ -421,15 +800,32 @@ def main():
                         help="extra env kwarg, repeatable (e.g. --env-kwarg pay_mode=on); "
                              "values parsed as int/float/bool when possible")
     parser.add_argument("--pay-arrow-frames", type=int, default=3,
-                        help="how many frames a payer->payee arrow stays visible for (0 disables)")
+                        help="how many frames a sender->receiver reward-share arrow stays visible for (0 disables)")
+    parser.add_argument("--no-panel", action="store_true",
+                        help="don't draw the per-agent info panel to the right of the grid")
+    parser.add_argument("--no-autoconfig", action="store_true",
+                        help="don't infer env kwargs (reward mode / pay scheme / num_agents) from the "
+                             "checkpoint filename; use env defaults + explicit --env-kwarg only")
     args = parser.parse_args()
 
-    env_kwargs = {}
+    user_env_kwargs = {}
     for kv in args.env_kwarg:
         key, _, raw = kv.partition("=")
         if not _:
             raise SystemExit(f"--env-kwarg expects KEY=VALUE, got {kv!r}")
-        env_kwargs[key] = _parse_env_kwarg_value(raw)
+        user_env_kwargs[key] = _parse_env_kwarg_value(raw)
+
+    # Recover the training config from the checkpoint name, then let explicit
+    # --env-kwarg / --num_agents win over it (inference is a convenience, not a lock).
+    inferred = {}
+    if args.checkpoint and not args.no_autoconfig:
+        inferred = _infer_env_kwargs_from_checkpoint(args.checkpoint)
+        if inferred:
+            overridden = sorted(k for k, v in user_env_kwargs.items()
+                                if k in inferred and v != inferred[k])
+            print(f"Auto-config from checkpoint name: {inferred}"
+                  + (f"  (your --env-kwarg overrides: {overridden})" if overridden else ""))
+    env_kwargs = {**inferred, **user_env_kwargs}
     if args.no_jit:
         env_kwargs["jit"] = False
     if args.num_agents is not None:
@@ -440,6 +836,8 @@ def main():
 
     params = _load_checkpoint(args.checkpoint) if args.checkpoint else None
 
+    _report_env_config(env, args.checkpoint)
+
     states, pay_events = rollout(env, params, args.steps, args.seed)
     print(f"Rolled out {len(states) - 1} steps ({'trained checkpoint' if params else 'random policy'}).")
 
@@ -447,11 +845,21 @@ def main():
     frames = render_states(env, args.env, env_kwargs, states, workers=args.render_workers)
     print(f"Rendered {len(frames)} frames.")
 
+    colors = getattr(env, "PLAYER_COLOURS", None)
+
+    # Arrows first (they use grid pixel coords), then composite the panel to the
+    # right so both annotations survive into the GIF and the scrubber.
     if args.pay_arrow_frames > 0:
         n_events = sum(len(e) for e in pay_events)
         if n_events:
-            frames = draw_pay_arrows(frames, pay_events, env, persist_frames=args.pay_arrow_frames)
-            print(f"Drew {n_events} payment arrow(s).")
+            frames = draw_pay_arrows(frames, pay_events, env,
+                                     persist_frames=args.pay_arrow_frames, colors=colors)
+            print(f"Drew {n_events} reward-share arrow(s).")
+
+    if not args.no_panel and _panel_supported(states, env):
+        panel_data = collect_panel_data(states, env)
+        frames = add_info_panels(frames, panel_data, colors, env)
+        print("Added per-agent info panel.")
 
     if args.gif:
         save_gif(frames, args.gif)

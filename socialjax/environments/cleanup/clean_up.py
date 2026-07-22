@@ -211,6 +211,44 @@ def _recent_cleaner_recipient(
     return target, has_recipient
 
 
+def _recent_cleaner_weights(
+    last_clean_t: jnp.ndarray, current_t: int, clean_window: int, split: bool
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Per-payer distribution over recipient cleaners for the tithe.
+
+    Returns (weights, has_recipient): weights is (N, N) float32 where weights[i, j] is
+    the fraction of payer i's shared slice that flows to agent j (rows sum to 1 where a
+    recipient exists, else 0); has_recipient is (N,) bool. Self is excluded per-row --
+    an agent never tithes to itself.
+
+    split=False ("latest", the original Option B winner-take-all rule): all mass on the
+        single most-recent OTHER cleaner within the window.
+    split=True: mass divided EQUALLY among every OTHER agent that cleaned within the
+        window, so a harvester's tithe is spread across all current cleaners instead of
+        concentrated on the freshest one. Motivation: winner-take-all structurally
+        pushes toward a single specialist cleaner; splitting can support the multiple
+        simultaneous cleaners the apple ecology needs.
+
+    `split` is a static Python bool (from Clean_up.split_recipients), so the branch
+    specializes at trace time -- jit/vmap-safe.
+    """
+    n = last_clean_t.shape[0]
+    age = current_t - last_clean_t
+    recent = age <= clean_window
+    not_self = ~jnp.eye(n, dtype=bool)
+    eligible = not_self & recent[None, :]  # [i, j]: j is a valid recipient for payer i
+    has_recipient = jnp.any(eligible, axis=1)
+    if split:
+        counts = jnp.sum(eligible, axis=1, keepdims=True).astype(jnp.float32)
+        weights = jnp.where(eligible, 1.0 / jnp.maximum(counts, 1.0), 0.0)
+    else:
+        FLOOR = jnp.int32(-1_000_000_000)
+        key = jnp.where(eligible, last_clean_t.astype(jnp.int32)[None, :], FLOOR)
+        target = jnp.argmax(key, axis=1)
+        weights = jax.nn.one_hot(target, n, dtype=jnp.float32) * has_recipient[:, None].astype(jnp.float32)
+    return weights.astype(jnp.float32), has_recipient
+
+
 def compute_tithe_transfers(
     actions: jnp.ndarray,
     last_clean_t: jnp.ndarray,
@@ -220,14 +258,16 @@ def compute_tithe_transfers(
     clean_window: int,
     share_fraction: float,
     share_duration: int,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    split_recipients: bool = False,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Resolve the pledge-style income-coupled tithe (pay_scheme="tithe").
 
     Actions.pay is a *pledge*: it (re)activates share-mode for the next
     `share_duration` steps (effective immediately, auto-expires, re-pledge to
     extend). While share-mode is active, `share_fraction` of the agent's positive
-    income this step auto-transfers to the most recent other recent-cleaner (same
-    Option B recipient rule as the instant scheme). No balance gate is needed:
+    income this step auto-transfers to recent cleaner(s) -- either the single most
+    recent one (split_recipients=False) or split equally across all recent cleaners
+    (split_recipients=True), per _recent_cleaner_weights. No balance gate is needed:
     an agent only ever shares a slice of income it is earning this very step, so
     the net-of-transfer reward on a harvest step stays positive
     (income * (1 - share_fraction)) rather than a bare -pay_amount -- the
@@ -247,25 +287,32 @@ def compute_tithe_transfers(
         clean_window: max age (in steps) at which a cleaner is a valid recipient.
         share_fraction: fraction of income transferred while share-mode is active.
         share_duration: steps a pledge stays active.
+        split_recipients: if True, split each sharer's slice equally across all recent
+            cleaners; if False, give it all to the single most-recent cleaner.
 
     Returns:
-        (delta, pledged, executed, target, new_expiry, active):
+        (delta, pledged, executed, target, new_expiry, active, received):
             delta: (N,) float32 zero-sum reward adjustment (sharer -, cleaner +).
             pledged: (N,) bool, agent took the pledge action this step.
             executed: (N,) bool, a transfer actually happened this step (share-mode
                 active AND positive income AND valid recipient).
-            target: (N,) int, recipient index (meaningful where executed=True).
+            target: (N,) int, the primary recipient index (the most-recent cleaner);
+                exact under split_recipients=False, and just one of the recipients
+                under split (use `received` for the full picture).
             new_expiry: (N,) int32, updated share_expiry_t to store in State.
             active: (N,) bool, share-mode active this step (after pledges applied).
+            received: (N,) float32, amount each agent received this step (the split
+                counterpart of the per-sharer `sent` slice).
     """
-    n = actions.shape[0]
     pledged = actions == Actions.pay
     new_expiry = jnp.where(
         pledged, jnp.int32(current_t + share_duration), share_expiry_t.astype(jnp.int32)
     )
     active = current_t < new_expiry
 
-    target, has_recipient = _recent_cleaner_recipient(last_clean_t, current_t, clean_window)
+    weights, has_recipient = _recent_cleaner_weights(
+        last_clean_t, current_t, clean_window, split_recipients
+    )
 
     sent = jnp.where(
         active & has_recipient & (income > 0),
@@ -273,10 +320,10 @@ def compute_tithe_transfers(
         0.0,
     )
     executed = sent > 0
-    delta = jnp.zeros((n,), dtype=jnp.float32)
-    delta = delta.at[jnp.arange(n)].add(-sent)  # sharers give up a slice of income...
-    delta = delta.at[target].add(sent)          # ...their chosen recent cleaner receives it
-    return delta, pledged, executed, target, new_expiry, active
+    received = weights.T @ sent          # each cleaner's inflow (split across sharers)
+    delta = received - sent              # zero-sum: rows of weights sum to 1 where sent>0
+    target = jnp.argmax(weights, axis=1)  # primary recipient (exact under "latest")
+    return delta, pledged, executed, target, new_expiry, active, received
 
 
 char_to_int = {
@@ -394,6 +441,9 @@ class Clean_up(MultiAgentEnv):
         share_fraction=0.5,   # tithe scheme only: slice of income shared while pledged
         share_duration=50,    # tithe scheme only: steps a pledge stays active
         pay_clean_window=50,  # a cleaner stays payable for this many steps after cleaning
+        # tithe scheme only: if True, split each sharer's slice equally across ALL recent
+        # cleaners instead of giving it to the single most-recent one (winner-take-all).
+        split_recipients=False,
         pay_radius=None,      # deprecated (Option A only); accepted but unused under Option B
 
         obs_size=11,
@@ -465,6 +515,7 @@ class Clean_up(MultiAgentEnv):
         self.share_fraction = share_fraction
         self.share_duration = share_duration
         self.pay_clean_window = pay_clean_window
+        self.split_recipients = bool(split_recipients)
         self.pay_radius = (obs_size // 2) if pay_radius is None else pay_radius
         # "off" keeps the original 9-action space so old baselines stay comparable;
         # "noop"/"on" expose Actions.pay as a 10th action.
@@ -1689,34 +1740,50 @@ class Clean_up(MultiAgentEnv):
                     # income basis: this step's positive reward only, so a sharer
                     # never "shares" a negative reward into a refund
                     tithe_income = jnp.maximum(rewards.squeeze(), 0.0)
-                    pay_delta, pay_attempted, pay_executed, pay_target, new_expiry, share_active = (
+                    pay_delta, pay_attempted, pay_executed, pay_target, new_expiry, share_active, pay_received = (
                         compute_tithe_transfers(
                             actions, state.last_clean_t, state.inner_t,
                             state.share_expiry_t, tithe_income,
                             self.pay_clean_window, self.share_fraction, self.share_duration,
+                            self.split_recipients,
                         )
                     )
                     # Pledge state advances in BOTH on and noop: the placebo keeps the
                     # action's dynamics identical and only withholds the money.
                     state = state.replace(share_expiry_t=new_expiry)
                     info["share_active"] = jnp.float32(share_active).squeeze()
-                    # Total sent this step (from the sender side, not the net delta,
-                    # which can mix sends and receipts for the same agent).
-                    pay_volume_on = jnp.sum(
-                        jnp.where(pay_executed, jnp.float32(self.share_fraction) * tithe_income, 0.0)
+                    # Per-agent amount actually sent this step (sender side): the tithe
+                    # slice share_fraction*income on executed shares. For share_fraction
+                    # 0.5 this is a *fraction* of income, not a flat unit -- the point of
+                    # the scheme -- so it's exposed for the viewer to label arrows with.
+                    pay_sent = jnp.where(
+                        pay_executed, jnp.float32(self.share_fraction) * tithe_income, 0.0
                     )
                 else:  # "instant"
                     pay_delta, pay_attempted, pay_executed, pay_target = compute_pay_transfers(
                         actions, state.last_clean_t, state.inner_t,
                         state.agent_balance, self.pay_clean_window, self.pay_amount,
                     )
-                    pay_volume_on = jnp.sum(jnp.float32(pay_executed)) * self.pay_amount
+                    pay_sent = jnp.where(pay_executed, jnp.float32(self.pay_amount), 0.0)
+                    # Instant is single-recipient, so received is just sent scattered to
+                    # each payer's target (keeps info["pay_received"] present in all modes).
+                    pay_received = jnp.zeros((self.num_agents,), dtype=jnp.float32).at[pay_target].add(pay_sent)
                 if self.pay_mode == "on":
                     rewards = rewards + pay_delta[:, None]
                 # "noop" (placebo): action exists, recipient/affordability/pledging are
                 # computed and logged identically, but no reward actually moves.
+                # Total sent this step (from the sender side, not the net delta, which
+                # can mix sends and receipts for the same agent).
+                pay_volume_on = jnp.sum(pay_sent)
                 info["pay_attempts"] = jnp.float32(pay_attempted).squeeze()
                 info["pay_executed"] = jnp.float32(pay_executed).squeeze()
+                # Per-agent amount sent this step (only nonzero where pay_executed);
+                # lets the viewer show the transfer size on each arrow.
+                info["pay_sent"] = jnp.float32(pay_sent).squeeze()
+                # Per-agent amount RECEIVED this step. Under split_recipients this fans
+                # one sharer's slice across several cleaners, so received is the only way
+                # to see the split; the viewer uses sent+received to draw the arrows.
+                info["pay_received"] = jnp.float32(pay_received).squeeze()
                 # Payer -> recipient (chosen recent cleaner) index, valid only where
                 # pay_executed=True (used by the viewer to draw a "who paid whom" arrow).
                 info["pay_target"] = jnp.int32(pay_target).squeeze()

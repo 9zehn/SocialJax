@@ -46,8 +46,13 @@ def _pay(actions, last_clean_t, current_t, balance, clean_window=50, pay_amount=
 
 
 def _tithe(actions, last_clean_t, current_t, share_expiry_t, income,
-           clean_window=50, share_fraction=0.5, share_duration=50):
-    """Thin wrapper to keep the tithe tests readable."""
+           clean_window=50, share_fraction=0.5, share_duration=50, split_recipients=False):
+    """Thin wrapper to keep the tithe tests readable.
+
+    Returns the original 6-tuple (delta, pledged, executed, target, new_expiry,
+    active); the newer `received` element is sliced off so existing tests keep their
+    unpacking. Split-recipient tests call compute_tithe_transfers directly for it.
+    """
     return compute_tithe_transfers(
         jnp.array(actions),
         jnp.array(last_clean_t, dtype=jnp.int32),
@@ -57,7 +62,8 @@ def _tithe(actions, last_clean_t, current_t, share_expiry_t, income,
         clean_window,
         share_fraction,
         share_duration,
-    )
+        split_recipients,
+    )[:6]
 
 
 # ---------------------------------------------------------------- module-level arrays
@@ -250,6 +256,70 @@ def test_tithe_negative_income_never_shared():
     assert np.allclose(np.array(delta), [0, 0]) and not bool(executed[0])
 
 
+def test_tithe_split_divides_equally_among_recent_cleaners():
+    # agent 0 active, harvests income 4.0; agents 1 and 2 both cleaned recently.
+    # split: 0.5*4=2.0 shared, divided equally -> 1.0 each; harvester nets -2.0.
+    delta, _, executed, _, _, _, received = compute_tithe_transfers(
+        jnp.array([STAY, STAY, STAY]),
+        jnp.array([-10000, 8, 9], dtype=jnp.int32), 10,
+        jnp.array([20, 0, 0], dtype=jnp.int32),
+        jnp.array([4.0, 0.0, 0.0], dtype=jnp.float32),
+        50, 0.5, 50, True,
+    )
+    assert np.allclose(np.array(delta), [-2.0, 1.0, 1.0]), "2.0 split evenly across both cleaners"
+    assert np.allclose(np.array(received), [0.0, 1.0, 1.0])
+    assert bool(executed[0]) and abs(float(jnp.sum(delta))) < 1e-6
+
+
+def test_tithe_split_with_one_cleaner_matches_latest():
+    # only agent 1 cleaned recently -> split has nothing to divide, same as winner-take-all
+    args = (jnp.array([STAY, STAY, STAY]),
+            jnp.array([-10000, 8, -10000], dtype=jnp.int32), 10,
+            jnp.array([20, 0, 0], dtype=jnp.int32),
+            jnp.array([4.0, 0.0, 0.0], dtype=jnp.float32), 50, 0.5, 50)
+    split = compute_tithe_transfers(*args, True)
+    latest = compute_tithe_transfers(*args, False)
+    assert np.allclose(np.array(split[0]), np.array(latest[0]))
+    assert np.allclose(np.array(split[0]), [-2.0, 2.0, 0.0])
+
+
+def test_tithe_split_respects_clean_window_and_self_exclusion():
+    # agent 0 active + harvests; agent 1 cleaned within window (age 5), agent 2 too stale
+    # (age 40 > window 25); agent 0 itself cleaned recently but can't receive its own tithe.
+    delta, _, _, _, _, _, received = compute_tithe_transfers(
+        jnp.array([STAY, STAY, STAY]),
+        jnp.array([9, 5, -30], dtype=jnp.int32), 10,   # ages: 1, 5, 40
+        jnp.array([20, 0, 0], dtype=jnp.int32),
+        jnp.array([4.0, 0.0, 0.0], dtype=jnp.float32),
+        25, 0.5, 50, True,
+    )
+    # only agent 1 is an eligible recipient -> all 2.0 to it, none to self (0) or stale (2)
+    assert np.allclose(np.array(delta), [-2.0, 2.0, 0.0])
+    assert np.allclose(np.array(received), [0.0, 2.0, 0.0])
+
+
+def test_tithe_split_env_end_to_end():
+    # split_recipients propagates through socialjax.make and the full env step
+    env = socialjax.make("clean_up", num_agents=4, pay_mode="on", pay_scheme="tithe",
+                         shared_rewards=False, split_recipients=True, pay_clean_window=25)
+    assert env.split_recipients is True
+    key = jax.random.PRNGKey(0)
+    _, state = env.reset(key)
+    # agents 1 and 2 cleaned recently; agent 0 pledged and is about to harvest
+    state = state.replace(
+        last_clean_t=jnp.array([-10000, 0, 0, -10000], dtype=jnp.int32),
+        share_expiry_t=jnp.array([1000, 0, 0, 0], dtype=jnp.int32),
+    )
+    state, move_act = _place_apple_next_to(state, 0)
+    obs, ns, rewards, done, info = env.step_env(key, state, [move_act, STAY, STAY, STAY])
+    r = np.array(rewards).squeeze()
+    # apple = num_agents = 4; 0.5*4 = 2.0 shared, split across agents 1 and 2 -> 1.0 each
+    assert abs(r[0] - 2.0) < 1e-5, f"harvester keeps 4 - 2 = 2.0, got {r[0]}"
+    assert abs(r[1] - 1.0) < 1e-5 and abs(r[2] - 1.0) < 1e-5, "each cleaner gets half of 2.0"
+    assert np.allclose(np.array(info["pay_received"]), [0.0, 1.0, 1.0, 0.0])
+    assert abs(float(np.sum(r)) - 4.0) < 1e-5, "zero-sum: total still one apple's 4.0"
+
+
 def test_tithe_zero_sum_under_random_configurations():
     rng = np.random.default_rng(1)
     for _ in range(100):
@@ -258,9 +328,10 @@ def test_tithe_zero_sum_under_random_configurations():
         last_clean_t = jnp.array(rng.integers(-20, 20, n), dtype=jnp.int32)
         expiry = jnp.array(rng.integers(0, 40, n), dtype=jnp.int32)
         income = jnp.array(rng.uniform(0, 5, n), dtype=jnp.float32)
-        delta, _, _, _, _, _ = compute_tithe_transfers(
-            actions, last_clean_t, 15, expiry, income, 10, 0.5, 20
-        )
+        split = bool(rng.integers(0, 2))  # zero-sum must hold for both recipient rules
+        delta = compute_tithe_transfers(
+            actions, last_clean_t, 15, expiry, income, 10, 0.5, 20, split
+        )[0]
         assert abs(float(jnp.sum(delta))) < 1e-4, "tithe transfers must be zero-sum"
 
 
