@@ -27,6 +27,7 @@ ALGO_PREFIX = {
     "IRAT":     "IRAT",       # preserves the original capitalization on disk
     "TRANSFER": "transfer",
     "VDN":      "vdn",
+    "MOCA":     "moca",       # formal contracting (arXiv:2208.10469)
 }
 
 

@@ -1,0 +1,8 @@
+# @package _global_
+# Common-reward variant: all agents share a single summed reward (no dilemma, so
+# contracts have nothing to redistribute -- useful only as an upper-bound control).
+ENV_KWARGS:
+  shared_rewards: True
+REWARD: common
+WANDB_TAGS:
+  - COMMON_REWARD

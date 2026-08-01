@@ -437,6 +437,14 @@ class Clean_up(MultiAgentEnv):
         #                instant scheme's certain, immediate -pay_amount is near-worst-
         #                case for policy-gradient credit assignment.
         pay_scheme="instant",
+        # Reward for harvesting one apple. None keeps the ORIGINAL upstream SocialJax
+        # behaviour of num_agents: in shared_rewards mode every agent receives the sum
+        # over all agents (1 apple -> everyone +1 -> total mass N), so scaling the
+        # individual-mode reward by N makes the total reward mass identical across the
+        # two arms, keeping their value/gradient scales comparable. Set apple_reward=1.0
+        # for a plain "one apple = one reward to whoever ate it" economy (what the
+        # formal-contracting literature assumes).
+        apple_reward=None,
         pay_amount=1.0,       # instant scheme only
         share_fraction=0.5,   # tithe scheme only: slice of income shared while pledged
         share_duration=50,    # tithe scheme only: steps a pledge stays active
@@ -509,6 +517,7 @@ class Clean_up(MultiAgentEnv):
             raise ValueError(f"pay_scheme must be 'instant' or 'tithe', got {pay_scheme!r}")
         if not (0.0 < share_fraction <= 1.0):
             raise ValueError(f"share_fraction must be in (0, 1], got {share_fraction!r}")
+        self.apple_reward = float(num_agents if apple_reward is None else apple_reward)
         self.pay_mode = pay_mode
         self.pay_scheme = pay_scheme
         self.pay_amount = pay_amount
@@ -1669,7 +1678,7 @@ class Clean_up(MultiAgentEnv):
                 }
             elif self.inequity_aversion:
                 rewards = jnp.zeros((self.num_agents, 1))
-                original_rewards = jnp.where(apple_matches, 1, rewards) * self.num_agents
+                original_rewards = jnp.where(apple_matches, 1, rewards) * self.apple_reward
                 if self.smooth_rewards:
                     should_smooth = (state.inner_t % 1) == 0
                     new_smooth_rewards = 0.99 * 0.01* state.smooth_rewards + original_rewards
@@ -1688,7 +1697,7 @@ class Clean_up(MultiAgentEnv):
                 }
             elif self.svo:
                 rewards = jnp.zeros((self.num_agents, 1))
-                original_rewards = jnp.where(apple_matches, 1, rewards) * self.num_agents
+                original_rewards = jnp.where(apple_matches, 1, rewards) * self.apple_reward
                 rewards, theta = self.get_svo_rewards(original_rewards, self.svo_w, self.svo_ideal_angle_degrees, self.svo_target_agents)
                 info = {
                     "original_rewards": original_rewards.squeeze(),
@@ -1697,7 +1706,7 @@ class Clean_up(MultiAgentEnv):
                 }
             elif self.interest:
                 rewards = jnp.zeros((self.num_agents, 1))
-                original_rewards = jnp.where(apple_matches, 1, rewards) * self.num_agents
+                original_rewards = jnp.where(apple_matches, 1, rewards) * self.apple_reward
                 original_flat = original_rewards.squeeze()
 
                 # Calculate current s_interest based on timestep
@@ -1717,7 +1726,7 @@ class Clean_up(MultiAgentEnv):
                 }
             elif self.cf:
                 rewards = jnp.zeros((self.num_agents, 1))
-                original_rewards = jnp.where(apple_matches, 1, rewards) * self.num_agents
+                original_rewards = jnp.where(apple_matches, 1, rewards) * self.apple_reward
                 rewards, theta = self.get_cf_rewards(original_rewards, self.cf_w, self.cf_ideal_angle_degrees, self.cf_target_agents)
                 info = {
                     "original_rewards": original_rewards.squeeze(),
@@ -1726,7 +1735,7 @@ class Clean_up(MultiAgentEnv):
                 }
             else:
                 rewards = jnp.zeros((self.num_agents, 1))
-                rewards = jnp.where(apple_matches, 1, rewards) * self.num_agents
+                rewards = jnp.where(apple_matches, 1, rewards) * self.apple_reward
                 info = {
                     "original_rewards": rewards.squeeze(),
                     "shaped_rewards": rewards.squeeze(),
@@ -1808,6 +1817,13 @@ class Clean_up(MultiAgentEnv):
             )
 
             info["clean_action_info"] = jnp.where(actions == Actions.zap_clean, 1, 0).squeeze()
+            # PER-AGENT successful cleaning this step (1.0 if this agent's clean beam
+            # actually hit dirt, else 0.0). Distinct from "clean_action_info", which only
+            # says the agent TRIED to clean, and from "waste_cleared", which is a single
+            # grid-wide count broadcast to every agent. This is the per-agent credit the
+            # formal-contracting literature calls "cleaned_squares" -- a contract
+            # conditions transfers on it, so it has to be attributable to an individual.
+            info["cleaned_by_agent"] = jnp.float32(cleaned_dirt).squeeze()
             info["cleaned_water"] = jnp.array([len(state.potential_dirt_and_dirt_label) - dirtCount] * self.num_agents).squeeze()
             info["waste_cleared"] = jnp.array([len(state.potential_dirt_and_dirt_label) - dirtCount] * self.num_agents).squeeze() 
             

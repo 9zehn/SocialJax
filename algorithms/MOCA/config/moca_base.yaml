@@ -1,0 +1,66 @@
+# Base MOCA configuration.
+# Implements Christoffersen et al. (arXiv:2208.10469 / AAMAS 2023), Algorithm 1.
+
+# PPO training hyperparameters (phase 1, the contract-conditioned subgame policy)
+"LR": 0.0005
+"NUM_ENVS": 128
+"NUM_STEPS": 1000          # must equal ENV_KWARGS.num_inner_steps (one rollout = one episode)
+"TOTAL_TIMESTEPS": 1e8
+"UPDATE_EPOCHS": 2
+"NUM_MINIBATCHES": 500
+"GAMMA": 0.99
+"GAE_LAMBDA": 0.95
+"CLIP_EPS": 0.2
+"ENT_COEF": 0.01
+"VF_COEF": 0.5
+"MAX_GRAD_NORM": 0.5
+"ACTIVATION": "relu"
+"ANNEAL_LR": True
+
+# MOCA requires per-agent policies (see moca_cnn_cleanup.py).
+"PARAMETER_SHARING": False
+"TUNE": False
+
+# ---- Contracting ----------------------------------------------------------
+# Contract space. "cleanup" = pay theta per waste cell cleaned, funded evenly by
+# the other agents (the paper's Cleanup contract space).
+"CONTRACT_SPACE": "cleanup"
+# theta range. The paper uses [0, 0.2] with an apple worth 1, so this pairs with
+# ENV_KWARGS.apple_reward=1.0 below to reproduce their economics.
+"CONTRACT_LOW": 0.0
+"CONTRACT_HIGH": 0.2
+# Phase 2 proposes from a discretised grid over [CONTRACT_LOW, CONTRACT_HIGH].
+"NUM_CONTRACT_BINS": 11
+# Fraction of the update budget spent in phase 1 (Algorithm 1 uses 9/10).
+"PHASE1_FRAC": 0.9
+# Probability that phase 1 draws the NULL contract instead of a uniform sample, so
+# the policy keeps experience of playing uncontracted (reference impl: null_prob).
+"NULL_CONTRACT_PROB": 0.1
+# Learning rate for the phase-2 proposal/voting policies (episode-level REINFORCE,
+# so far fewer gradient steps than phase 1 -- needs a larger step size).
+"CONTRACT_LR": 0.003
+
+# Environment defaults
+"ENV_KWARGS":
+  "num_inner_steps": 1000
+  "shared_rewards": False
+  "cnn": True
+  "jit": True
+  # One apple = one reward to whoever ate it, matching the contracting literature.
+  # (Upstream SocialJax defaults this to num_agents so that individual- and
+  # shared-reward arms carry equal total reward mass; contracts are calibrated
+  # against a unit apple instead.)
+  "apple_reward": 1.0
+
+# Seed / evaluation
+"SEED": 30
+"NUM_SEEDS": 1
+"EVALUATE": False
+"CHECKPOINT_EVERY": 20
+"PROGRESS_EVERY": 1
+
+# WandB
+"ENTITY": ""
+"PROJECT": "socialjax"
+"WANDB_MODE": "online"
+"WANDB_RUN_NAME": null

@@ -494,17 +494,36 @@ def make_train(config):
                 metric["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
                 # jax.debug.callback(callback, metric)
             else:
-                for i in range(env.num_agents):
-                    metric[i]["update_step"] = update_step
-                    metric[i]["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
-                metric = metric[0]
-                # jax.debug.callback(callback, metric)
+                # metric is a list of N per-agent dicts, each already reduced to a
+                # scalar by the .mean() above (this update's per-agent mean over the
+                # rollout). Under individual reward, per-agent behavior genuinely
+                # diverges -- one agent can specialize into cleaning while others
+                # harvest -- so collapsing to a single agent's slice (the previous
+                # `metric[0]`) silently hid the other N-1 agents entirely. Log the
+                # cross-agent MEAN (population trend) and STD (specialization
+                # spread: near 0 means agents behave alike, large means roles have
+                # diverged) for every key instead. pay_target is an agent INDEX, not
+                # a magnitude, so averaging it is meaningless -- drop it rather than
+                # log nonsense.
+                keys = [k for k in metric[0].keys() if k != "pay_target"]
+                stacked = {k: jnp.stack([d[k] for d in metric]) for k in keys}
+                metric = {}
+                for key, values in stacked.items():
+                    metric[f"{key}_mean"] = values.mean()
+                    metric[f"{key}_std"] = values.std()
             metric["update_step"] = update_step
             metric["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
-            metric["clean_action_info"] = metric["clean_action_info"] * config["ENV_KWARGS"]["num_inner_steps"]
+            if config["PARAMETER_SHARING"]:
+                metric["clean_action_info"] = metric["clean_action_info"] * config["ENV_KWARGS"]["num_inner_steps"]
+                reward_key = "shaped_rewards"
+            else:
+                scale = config["ENV_KWARGS"]["num_inner_steps"]
+                metric["clean_action_info_mean"] = metric["clean_action_info_mean"] * scale
+                metric["clean_action_info_std"] = metric["clean_action_info_std"] * scale
+                reward_key = "shaped_rewards_mean"
 
             jax.debug.callback(callback, metric)
-            jax.debug.callback(progress_callback, update_step, metric["shaped_rewards"])
+            jax.debug.callback(progress_callback, update_step, metric[reward_key])
 
             runner_state = (train_state, env_state, last_obs, update_step, rng)
             return runner_state, metric

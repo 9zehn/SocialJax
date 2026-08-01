@@ -1,0 +1,14 @@
+# MOCA configuration for Clean Up
+defaults:
+  - moca_base
+  - _self_
+  - reward: individual   # contracts assume an intact individual-reward dilemma
+
+"ENV_NAME": "clean_up"
+
+"ENV_KWARGS":
+  "num_agents": 7
+  "num_inner_steps": 1000
+  "cnn": True
+  "jit": True
+  "apple_reward": 1.0
