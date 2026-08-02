@@ -453,6 +453,15 @@ class Clean_up(MultiAgentEnv):
         # simultaneous cleaners" premise never binds. Expected dirt per step is
         # dirt_spawn_cells * dirtSpawnProbability.
         dirt_spawn_cells=1,
+        # Add payment-state channels to the observation (see _get_obs). OFF by default:
+        # turning it on changes the observation SHAPE, so a policy trained with it is
+        # not loadable by, or comparable to, a baseline trained without it.
+        observe_payment=False,
+        # When True the `pay` action no longer changes an agent's pledge state, so an
+        # externally imposed share pattern stays binding for the episode. Used by
+        # two-phase training, whose first phase forces payments exogenously and must
+        # not let the policy overwrite them.
+        freeze_share_state=False,
         # Per-step probability that a standing apple disappears uneaten. 0.0 (default)
         # reproduces upstream, where apples PERSIST forever and therefore accumulate as
         # a stock: harvesting stays profitable long after cleaning stops, which
@@ -526,6 +535,8 @@ class Clean_up(MultiAgentEnv):
 
         self.maxAppleGrowthRate = maxAppleGrowthRate
         self.dirt_spawn_cells = int(dirt_spawn_cells)
+        self.observe_payment = bool(observe_payment)
+        self.freeze_share_state = bool(freeze_share_state)
         self.appleDecayProbability = float(appleDecayProbability)
         self.thresholdDepletion = thresholdDepletion
         self.thresholdRestoration = thresholdRestoration
@@ -1104,6 +1115,30 @@ class Clean_up(MultiAgentEnv):
                 agent_pickups,
                 state
             )
+
+            if self.observe_payment:
+                # Payment observability (opt-in; OFF by default so baselines keep their
+                # 19-channel observation and stay comparable).
+                #
+                # Without this an agent cannot see the incentive landscape at all -- the
+                # observation is purely a local tile view -- so "clean only while I am
+                # being paid" is not merely unlearned but UNREPRESENTABLE. Two scalars,
+                # broadcast across the spatial dims so the existing CNN consumes them:
+                #   ch0: fraction of the OTHER agents currently sharing. Aggregate is
+                #        enough here because withholding cleaning is inherently
+                #        collective -- you cannot clean the river "for" one agent -- so
+                #        payer identity would add nothing a strike could act on.
+                #   ch1: this agent's own share state, so it knows its own pledge.
+                active = (state.share_expiry_t > state.inner_t).astype(jnp.float32)  # (N,)
+                others_frac = (
+                    (jnp.sum(active) - active) / jnp.maximum(self.num_agents - 1, 1)
+                )
+                feats = jnp.stack([others_frac, active], axis=-1)          # (N, 2)
+                feats = jnp.broadcast_to(
+                    feats[:, None, None, :],
+                    (self.num_agents, self.OBS_SIZE, self.OBS_SIZE, 2),
+                )
+                grids = jnp.concatenate([grids.astype(jnp.float32), feats], axis=-1)
 
             return grids
 
@@ -1856,9 +1891,19 @@ class Clean_up(MultiAgentEnv):
                     # income basis: this step's positive reward only, so a sharer
                     # never "shares" a negative reward into a refund
                     tithe_income = jnp.maximum(rewards.squeeze(), 0.0)
+                    # freeze_share_state: neutralise the pay action before it is
+                    # resolved, so an externally imposed share pattern governs BOTH the
+                    # stored pledge state and this step's transfers. (Suppressing only
+                    # the state write would still let a pledge move money on the step it
+                    # was taken.) self.freeze_share_state is a static Python bool, so
+                    # this branch specialises at trace time.
+                    pay_actions = (
+                        jnp.full_like(jnp.asarray(actions), jnp.asarray(Actions.stay))
+                        if self.freeze_share_state else actions
+                    )
                     pay_delta, pay_attempted, pay_executed, pay_target, new_expiry, share_active, pay_received = (
                         compute_tithe_transfers(
-                            actions, state.last_clean_t, state.inner_t,
+                            pay_actions, state.last_clean_t, state.inner_t,
                             state.share_expiry_t, tithe_income,
                             self.pay_clean_window, self.share_fraction, self.share_duration,
                             self.split_recipients,
@@ -2114,10 +2159,11 @@ class Clean_up(MultiAgentEnv):
 
     def observation_space(self) -> spaces.Dict:
         """Observation space of the environment."""
+        n_ch = (len(Items) - 1) + 10 + (2 if self.observe_payment else 0)
         _shape_obs = (
-            (self.OBS_SIZE, self.OBS_SIZE, (len(Items)-1) + 10)
+            (self.OBS_SIZE, self.OBS_SIZE, n_ch)
             if self.cnn
-            else (self.OBS_SIZE**2 * ((len(Items)-1) + 10),)
+            else (self.OBS_SIZE**2 * n_ch,)
         )
 
         return spaces.Box(

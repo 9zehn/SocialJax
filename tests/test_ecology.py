@@ -105,6 +105,54 @@ def test_decay_reaches_a_nonzero_equilibrium_while_clean():
     assert min(tail) > 5, f"clean river should hold a standing crop, got min {min(tail)}"
 
 
+# ------------------------------------------------- payment observability flags
+
+def test_observe_payment_is_off_by_default():
+    """Baselines must keep their 19-channel observation, or a policy trained before
+    this flag existed is neither loadable nor comparable."""
+    env = _env(pay_mode="on", pay_scheme="tithe")
+    assert env.observation_space()[1] == (11, 11, 19)
+    o, _ = env.reset(jax.random.PRNGKey(0))
+    assert o.shape[-1] == 19
+
+
+def test_observe_payment_adds_share_state_channels():
+    env = _env(pay_mode="on", pay_scheme="tithe", observe_payment=True)
+    assert env.observation_space()[1] == (11, 11, 21)
+    key = jax.random.PRNGKey(0)
+    _, s = env.reset(key)
+    # force agents 0 and 1 to be sharing
+    s = s.replace(share_expiry_t=jnp.array([999, 999, 0, 0, 0, 0, 0], dtype=jnp.int32))
+    o, _, _, _, _ = env.step_env(key, s, [STAY] * 7)
+    others = np.array(o[:, 0, 0, -2])
+    own = np.array(o[:, 0, 0, -1])
+    assert np.allclose(own, [1, 1, 0, 0, 0, 0, 0]), "own share state channel wrong"
+    # a sharer sees 1 of the other 6 sharing; a non-sharer sees 2 of 6
+    assert abs(others[0] - 1 / 6) < 1e-5 and abs(others[2] - 2 / 6) < 1e-5
+
+
+def test_freeze_share_state_makes_an_imposed_pattern_binding():
+    """Phase 1 of two-phase training imposes payments exogenously; the policy taking
+    the pay action must not be able to overwrite them -- in the stored state OR in the
+    transfers resolved on that same step."""
+    from socialjax.environments.cleanup.clean_up import Actions
+    PAY = int(Actions.pay)
+    key = jax.random.PRNGKey(0)
+
+    frozen = _env(pay_mode="on", pay_scheme="tithe", freeze_share_state=True)
+    _, s = frozen.reset(key)
+    s = s.replace(share_expiry_t=jnp.zeros((7,), dtype=jnp.int32))
+    _, ns, _, _, info = frozen.step_env(key, s, [PAY] * 7)
+    assert np.all(np.array(ns.share_expiry_t) == 0), "imposed pattern was overwritten"
+    assert np.all(np.array(info["share_active"]) == 0), "pledge moved money anyway"
+
+    normal = _env(pay_mode="on", pay_scheme="tithe")
+    _, s2 = normal.reset(key)
+    s2 = s2.replace(share_expiry_t=jnp.zeros((7,), dtype=jnp.int32))
+    _, ns2, _, _, _ = normal.step_env(key, s2, [PAY] * 7)
+    assert np.all(np.array(ns2.share_expiry_t) > 0), "unfrozen pledges must still work"
+
+
 ALL_TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 if __name__ == "__main__":
@@ -118,3 +166,5 @@ if __name__ == "__main__":
             print(f"FAIL  {t.__name__}: {type(e).__name__}: {e}")
     print(f"\n{len(ALL_TESTS) - failed}/{len(ALL_TESTS)} tests passed")
     sys.exit(1 if failed else 0)
+
+
