@@ -284,6 +284,89 @@ def test_parameter_sharing_rejected():
         raise AssertionError("PARAMETER_SHARING=True should be rejected")
 
 
+# ------------------------------------------------------------------- viewer
+
+def _write_fake_moca_run(tmp, n=3, k=11, modal=7):
+    """Write a checkpoint set shaped like a real MOCA run (gameplay + proposal + voting)."""
+    from algorithms.utils.io_utils import save_params
+    import pickle
+
+    stem = Path(tmp) / f"clean_up_seed42_reward_individual_agents{n}"
+    for i in range(n):
+        for suffix, payload in (
+            (f"_{i}", {"params": {"Dense_0": {"kernel": np.zeros((66, 64))}}}),
+            (f"_proposal_{i}", {"params": {"proposal_logits": np.eye(k)[modal] * 5.0}}),
+            (f"_voting_{i}", {"params": {"Dense_0": {"kernel": np.zeros((n + 1, 32))}}}),
+        ):
+            with open(f"{stem}{suffix}.pkl", "wb") as f:
+                pickle.dump(payload, f)
+    return f"{stem}*.pkl"
+
+
+def test_glob_excludes_proposal_and_voting_checkpoints():
+    """The obvious glob matches 3N files for a MOCA run; only the N gameplay policies
+    may be zipped onto agents 0..N-1."""
+    import tempfile
+    from viz.interactive_viewer import _gameplay_checkpoints
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pattern = _write_fake_moca_run(tmp, n=5)
+        import glob
+        assert len(glob.glob(pattern)) == 15, "fixture should have 3N files"
+        gameplay = _gameplay_checkpoints(pattern)
+        assert len(gameplay) == 5, f"expected 5 gameplay policies, got {len(gameplay)}"
+        assert all("_proposal_" not in g and "_voting_" not in g for g in gameplay)
+
+
+def test_detect_moca_and_learned_theta():
+    import tempfile
+    from viz.interactive_viewer import detect_moca, load_contract_policies
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pattern = _write_fake_moca_run(tmp, n=3, k=11, modal=7)
+        moca = detect_moca(pattern)
+        assert moca is not None and len(moca["proposal_paths"]) == 3
+        info = load_contract_policies(moca, 0.0, 0.2)
+        assert info["probs"].shape == (3, 11)
+        # logits peaked at bin 7 of 11 over [0, 0.2] -> theta = 0.2 * 7/10
+        assert abs(info["modal_theta"] - 0.14) < 1e-6, info["modal_theta"]
+
+
+def test_detect_moca_returns_none_for_payment_run():
+    """A pay-mechanism checkpoint set has no _proposal_ files and must not be
+    mistaken for a contracting run."""
+    import tempfile
+    import pickle
+    from viz.interactive_viewer import detect_moca
+
+    with tempfile.TemporaryDirectory() as tmp:
+        stem = Path(tmp) / "clean_up_seed42_reward_individual_pay_on_tithe_agents7_latest"
+        for i in range(7):
+            with open(f"{stem}_{i}.pkl", "wb") as f:
+                pickle.dump({"params": {}}, f)
+        assert detect_moca(f"{stem}*.pkl") is None
+
+
+def test_contract_arrow_events_fund_the_cleaner():
+    """Each cleaner draws one incoming arrow from each of the N-1 funders, sized
+    theta/(N-1) -- the visual statement of 'the group subsidises the public good'."""
+    from viz.interactive_viewer import _extract_contract_events
+
+    class FakeState:
+        agent_locs = np.array([[1, 1, 0], [2, 2, 0], [3, 3, 0], [4, 4, 0], [5, 5, 0]])
+
+    n, theta = 5, 0.12
+    cleaned = np.array([1.0, 0, 0, 0, 0])
+    transfers = np.array([0.12, -0.03, -0.03, -0.03, -0.03])
+    ev = _extract_contract_events(transfers, cleaned, theta, None, FakeState())
+    assert len(ev) == n - 1, f"expected {n-1} funder arrows, got {len(ev)}"
+    assert all(r == 0 for _s, r, _sl, _rl, _a in ev), "all arrows point at the cleaner"
+    assert all(abs(a - theta / (n - 1)) < 1e-9 for *_x, a in ev)
+    assert sorted(s for s, *_ in ev) == [1, 2, 3, 4], "every non-cleaner funds it"
+    # nobody cleaned -> no transfers, no arrows
+    assert _extract_contract_events(np.zeros(n), np.zeros(n), theta, None, FakeState()) == []
+
+
 ALL_TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 if __name__ == "__main__":

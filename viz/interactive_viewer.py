@@ -27,6 +27,7 @@ import argparse
 import functools
 import math
 import os
+import re
 import time
 from pathlib import Path
 
@@ -79,31 +80,52 @@ def _extract_share_events(info, prev_state):
     return events
 
 
-def rollout(env, params, num_steps, seed):
+def rollout(env, params, num_steps, seed, contract=None, theta=None):
     """Step the env and collect raw states (fast, sequential — each step depends on the last).
 
     Rendering is deferred to render_states() so it can be parallelized separately.
-    Also returns share_events, aligned with states: share_events[i] is the list of
-    (sender, receiver, sender_loc, receiver_loc) reward-shares that produced
-    states[i] (share_events[0] is always empty -- states[0] is the initial reset).
-    In the placebo "noop" mode nothing actually moves, so no arrows are emitted.
+    Also returns arrow events, aligned with states: events[i] is the list of
+    (sender, receiver, sender_loc, receiver_loc, amount) transfers that produced
+    states[i] (events[0] is always empty -- states[0] is the initial reset).
+
+    Two mechanisms can produce those transfers:
+      * the pay mechanism (pay_mode="on"), read out of the env's pay_* info fields;
+      * a MOCA contract, when `contract` and `theta` are supplied -- the gameplay
+        policy is then the contract-conditioned network and transfers are computed
+        here from the env's per-agent cleaning credit.
+    In the placebo "noop" pay mode nothing actually moves, so no arrows are emitted.
+
+    Returns (states, events, extras) where extras["transfers"] is the per-step
+    (N,) transfer vector under a contract (empty list otherwise).
     """
     emit_share_arrows = getattr(env, "pay_mode", "off") == "on"
+    use_contract = contract is not None and theta is not None
     rng = jax.random.PRNGKey(seed)
     rng, rng_reset = jax.random.split(rng)
     obs, state = env.reset(rng_reset)
 
     states = [state]
     pay_events = [[]]
+    transfers_per_step = [np.zeros(env.num_agents)]
 
     network = None
+    contract_vec = None
     if params is not None:
-        from algorithms.utils.networks import ActorCritic
-        network = ActorCritic(action_dim=env.action_space().n, activation="relu")
+        if use_contract:
+            from algorithms.MOCA.networks import ContractActorCritic
+            network = ContractActorCritic(action_dim=env.action_space().n, activation="relu")
+            # Same feature vector the policy was trained on: [theta_normalised, stage].
+            contract_vec = contract.to_obs(jnp.float32(theta))[None, ...]
+        else:
+            from algorithms.utils.networks import ActorCritic
+            network = ActorCritic(action_dim=env.action_space().n, activation="relu")
         if isinstance(params, list) and len(params) != env.num_agents:
             raise SystemExit(
                 f"got {len(params)} per-agent checkpoints but env has {env.num_agents} agents"
             )
+
+    def _apply(p, x):
+        return network.apply(p, x, contract_vec) if use_contract else network.apply(p, x)
 
     for _ in range(num_steps):
         rng, rng_act, rng_step = jax.random.split(rng, 3)
@@ -119,23 +141,57 @@ def rollout(env, params, num_steps, seed):
             actions = []
             act_keys = jax.random.split(rng_act, env.num_agents)
             for i, a in enumerate(env.agents):
-                pi, _ = network.apply(params[i], obs[a][None, ...])
+                pi, _ = _apply(params[i], obs[a][None, ...])
                 actions.append(int(pi.sample(seed=act_keys[i]).squeeze()))
         else:
             obs_batch = jnp.stack([obs[a] for a in env.agents])
-            pi, _ = network.apply(params, obs_batch)
+            pi, _ = _apply(params, obs_batch)
             sampled = pi.sample(seed=rng_act)
             actions = [int(sampled[i]) for i in range(env.num_agents)]
 
         prev_state = state
         obs, state, reward, done, info = env.step(rng_step, state, actions)
         states.append(state)
-        pay_events.append(_extract_share_events(info, prev_state) if emit_share_arrows else [])
+
+        if use_contract:
+            cleaned = np.atleast_1d(np.array(info["cleaned_by_agent"], dtype=np.float32))
+            tr = np.array(contract.compute_transfer(jnp.float32(theta), jnp.asarray(cleaned)))
+            transfers_per_step.append(tr)
+            pay_events.append(_extract_contract_events(tr, cleaned, theta, contract, prev_state))
+        else:
+            transfers_per_step.append(np.zeros(env.num_agents))
+            pay_events.append(
+                _extract_share_events(info, prev_state) if emit_share_arrows else []
+            )
 
         if bool(done["__all__"]):
             break
 
-    return states, pay_events
+    return states, pay_events, {"transfers": transfers_per_step}
+
+
+def _extract_contract_events(transfers, cleaned, theta, contract, prev_state):
+    """Arrow events for one step of MOCA contract transfers.
+
+    Under the Cleanup contract every agent that cleaned is paid `theta` per cell,
+    funded evenly by all the others, so each cleaner draws one incoming arrow from
+    each of the N-1 funders -- which is precisely the picture the mechanism is meant
+    to create: the group collectively subsidising whoever did the public-good work.
+    """
+    n = len(transfers)
+    locs = np.array(prev_state.agent_locs)
+    per_funder = float(theta) / (n - 1)
+    events = []
+    for receiver in np.nonzero(cleaned > 0)[0]:
+        amount = per_funder * float(cleaned[receiver])
+        if amount <= 0:
+            continue
+        for sender in range(n):
+            if sender == receiver:
+                continue
+            events.append((int(sender), int(receiver), tuple(locs[sender, :2]),
+                           tuple(locs[receiver, :2]), amount))
+    return events
 
 
 def _agent_snapshot(state):
@@ -302,7 +358,7 @@ def _panel_supported(states, env):
     )
 
 
-def collect_panel_data(states, env):
+def collect_panel_data(states, env, transfers=None):
     """Per-step, per-agent stats for the info panel, aligned with `states`.
 
     Returns a list (one entry per state) of dicts:
@@ -312,12 +368,19 @@ def collect_panel_data(states, env):
                    counter, only the most-recent clean time).
         share:     (N,) bool, share-mode toggle currently ON (tithe scheme only;
                    all-False otherwise).
+        transfer:  (N,) CUMULATIVE contract transfer received (negative = net
+                   funder). Only meaningful under MOCA; zeros otherwise.
+
+    Note the contract case needs `transfers` passed in: contract transfers are
+    computed by the viewer during the rollout, not stored in env State the way the
+    pay mechanism's balance is.
     """
     n = env.num_agents
     clean_counts = np.zeros(n, dtype=int)
+    cum_transfer = np.zeros(n)
     prev_lct = None
     out = []
-    for s in states:
+    for idx, s in enumerate(states):
         lct = np.array(s.last_clean_t) if hasattr(s, "last_clean_t") else None
         if lct is not None and prev_lct is not None:
             clean_counts = clean_counts + (lct != prev_lct).astype(int)
@@ -327,9 +390,12 @@ def collect_panel_data(states, env):
             share = np.array(s.share_expiry_t) > int(s.inner_t)
         else:
             share = np.zeros(n, dtype=bool)
+        if transfers is not None and idx < len(transfers):
+            cum_transfer = cum_transfer + np.asarray(transfers[idx]).reshape(-1)
         out.append({"balance": np.asarray(balance).reshape(-1),
                     "clean": clean_counts.copy(),
-                    "share": np.asarray(share).reshape(-1)})
+                    "share": np.asarray(share).reshape(-1),
+                    "transfer": cum_transfer.copy()})
     return out
 
 
@@ -342,14 +408,19 @@ _PANEL_ON = (80, 220, 130)
 _PANEL_OFF = (222, 70, 74)
 
 
-def _scheme_caption(env):
-    """One-line description of the active reward + pay mechanism, shown in the panel
-    header. Names the reward mode explicitly because the env DEFAULTS to shared/common
-    reward (every agent gets each apple), which silently turns an individual-reward
-    checkpoint's replay into a common-reward economy -- and names the pay scheme so the
-    tithe toggle can't be confused with the old instant one-off payment.
+def _scheme_caption(env, contract_info=None):
+    """One-line description of the active reward + redistribution mechanism, shown in
+    the panel header. Names the reward mode explicitly because the env DEFAULTS to
+    shared/common reward (every agent gets each apple), which silently turns an
+    individual-reward checkpoint's replay into a common-reward economy -- and names
+    the mechanism so a MOCA contract, a tithe toggle and the old instant one-off
+    payment can't be confused for one another.
     """
     reward = "shared-reward" if getattr(env, "shared_rewards", True) else "individual"
+    if contract_info is not None:
+        theta = contract_info["theta"]
+        src = contract_info.get("source", "")
+        return f"{reward} · contract θ={theta:g}/cell{(' ' + src) if src else ''}"
     mode = getattr(env, "pay_mode", "off")
     if mode == "off":
         return f"{reward} · no payments"
@@ -361,17 +432,21 @@ def _scheme_caption(env):
     return f"{reward} · instant pays {getattr(env, 'pay_amount', 1.0):g}{tag}"
 
 
-def render_info_panel(height, datum, colors, env, step, width):
+def render_info_panel(height, datum, colors, env, step, width, contract_info=None):
     """Render one info-panel frame (RGB, height x width) for a single step.
 
     First column is each agent's color (a swatch + a color bar down the row edge)
     so every stat reads back to the matching agent in the grid and to its arrows.
-    Columns: color/label | Reward (balance) | Clean (count) | Share (ON/OFF), the
-    last shown only when the tithe toggle exists.
+    Columns: color/label | Reward (balance) | Clean (count) | and then either
+    Share (ON/OFF) for the tithe toggle, or Transfer (cumulative net contract
+    transfer, + receiver / - funder) under a MOCA contract.
     """
     from PIL import ImageDraw
 
-    show_share = getattr(env, "pay_scheme", None) == "tithe" and getattr(env, "pay_mode", "off") != "off"
+    show_contract = contract_info is not None
+    show_share = (not show_contract
+                  and getattr(env, "pay_scheme", None) == "tithe"
+                  and getattr(env, "pay_mode", "off") != "off")
     n = env.num_agents
 
     img = Image.new("RGB", (width, height), _PANEL_BG)
@@ -386,18 +461,24 @@ def render_info_panel(height, datum, colors, env, step, width):
     draw.text((pad, pad), "Agents", font=title_f, fill=_PANEL_FG)
     draw.text((width - pad, pad + 2), f"step {step}", font=head_f, fill=_PANEL_MUTED, anchor="ra")
     y = pad + int(title_f.size * 1.5)
-    draw.text((pad, y), _scheme_caption(env), font=head_f, fill=_PANEL_MUTED)
+    draw.text((pad, y), _scheme_caption(env, contract_info), font=head_f, fill=_PANEL_MUTED)
     total_reward = float(np.sum(datum["balance"]))
     total_clean = int(np.sum(datum["clean"]))
     y += int(head_f.size * 1.5)
-    draw.text((pad, y), f"total reward {total_reward:.1f}    total clean {total_clean}",
-              font=head_f, fill=_PANEL_MUTED)
+    totals = f"total reward {total_reward:.1f}    total clean {total_clean}"
+    if show_contract:
+        # Under a zero-sum contract the transfers must cancel; showing the moved
+        # volume instead makes "is the contract doing anything" readable at a glance.
+        moved = float(np.sum(np.maximum(datum["transfer"], 0.0)))
+        totals += f"    moved {moved:.2f}"
+    draw.text((pad, y), totals, font=head_f, fill=_PANEL_MUTED)
 
-    # Column x anchors (right-aligned value columns). Share (dot + ON/OFF) needs the
-    # widest slot; leave a clear gap between it and the Clean number so they never
-    # run together.
-    x_share = width - pad                                            # rightmost
-    x_clean = (x_share - int(width * 0.26)) if show_share else (width - pad)
+    # Column x anchors (right-aligned value columns). The rightmost column (Share's
+    # dot + ON/OFF, or the signed Transfer figure) needs the widest slot; leave a
+    # clear gap between it and the Clean number so they never run together.
+    x_last = width - pad                                             # rightmost
+    has_last = show_share or show_contract
+    x_clean = (x_last - int(width * 0.26)) if has_last else (width - pad)
     x_reward = x_clean - int(width * 0.20)
 
     # Column header row.
@@ -405,7 +486,10 @@ def render_info_panel(height, datum, colors, env, step, width):
     draw.text((x_reward, y_head), "Reward", font=head_f, fill=_PANEL_MUTED, anchor="ra")
     draw.text((x_clean, y_head), "Clean", font=head_f, fill=_PANEL_MUTED, anchor="ra")
     if show_share:
-        draw.text((x_share, y_head), "Share", font=head_f, fill=_PANEL_MUTED, anchor="ra")
+        draw.text((x_last, y_head), "Share", font=head_f, fill=_PANEL_MUTED, anchor="ra")
+    elif show_contract:
+        draw.text((x_last, y_head), "Transfer", font=head_f, fill=_PANEL_MUTED, anchor="ra")
+    x_share = x_last
 
     # Rows.
     top = y_head + int(head_f.size * 1.5)
@@ -448,10 +532,23 @@ def render_info_panel(height, datum, colors, env, step, width):
             draw.text((bx - int(width * 0.015), cy), "ON" if on else "OFF",
                       font=head_f, fill=fill, anchor="rm")
 
+        # Cumulative contract transfer: green = net receiver (was subsidised for
+        # cleaning), red = net funder. Reading this column tells you at a glance
+        # whether the contract actually moved money toward the cleaners.
+        elif show_contract:
+            t = float(datum["transfer"][i])
+            if t > 1e-9:
+                fill, txt = _PANEL_ON, f"+{t:.2f}"
+            elif t < -1e-9:
+                fill, txt = _PANEL_OFF, f"{t:.2f}"
+            else:
+                fill, txt = _PANEL_MUTED, "0.00"
+            draw.text((x_share, cy), txt, font=cell_f, fill=fill, anchor="rm")
+
     return np.array(img)
 
 
-def add_info_panels(frames, panel_data, colors, env, width=None):
+def add_info_panels(frames, panel_data, colors, env, width=None, contract_info=None):
     """Composite a per-step info panel onto the right of each grid frame.
 
     Returns new (wider) frames of uniform size so both the GIF export and the
@@ -463,7 +560,8 @@ def add_info_panels(frames, panel_data, colors, env, width=None):
         width = max(360, int(h * 0.75))
     out = []
     for i, frame in enumerate(frames):
-        panel = render_info_panel(h, panel_data[i], colors, env, i, width)
+        panel = render_info_panel(h, panel_data[i], colors, env, i, width,
+                                  contract_info=contract_info)
         out.append(np.hstack([frame, panel]))
     return out
 
@@ -632,17 +730,87 @@ def _parse_env_kwarg_value(raw):
     return raw
 
 
+# Suffixes of the auxiliary policies a MOCA run saves next to its gameplay policies.
+# A plain `..._reward_individual*.pkl` glob matches these too, so they must be
+# filtered out before the remaining files are zipped onto agents 0..N-1.
+_AUX_CKPT_MARKERS = ("_proposal_", "_voting_", "_resume")
+
+
+def _gameplay_checkpoints(arg):
+    """Files from `arg` that are GAMEPLAY policies (one per agent), sorted.
+
+    MOCA writes three checkpoints per agent -- gameplay, proposal and voting -- into
+    one directory, all sharing the run stem, so the obvious glob returns 3N files.
+    Loading those as if they were N per-agent gameplay policies is the failure this
+    guards against.
+    """
+    import glob
+
+    matches = sorted(glob.glob(arg))
+    return [m for m in matches if not any(t in os.path.basename(m) for t in _AUX_CKPT_MARKERS)]
+
+
 def _load_checkpoint(arg):
     """Load --checkpoint: single .pkl -> shared params; glob with N matches -> per-agent list."""
     import glob
 
-    matches = sorted(glob.glob(arg))
-    if not matches:
+    if not sorted(glob.glob(arg)):
         raise SystemExit(f"no checkpoint file matches {arg!r}")
+    matches = _gameplay_checkpoints(arg)
+    if not matches:
+        raise SystemExit(
+            f"{arg!r} matched only auxiliary checkpoints "
+            f"({'/'.join(_AUX_CKPT_MARKERS)}) and no gameplay policies"
+        )
     if len(matches) == 1:
         return load_params(matches[0])
     print(f"Loading {len(matches)} per-agent checkpoints (sorted -> agent 0..{len(matches) - 1})")
     return [load_params(m) for m in matches]
+
+
+# ---------------------------------------------------------------------------
+# MOCA (formal contracting) support.
+# ---------------------------------------------------------------------------
+
+def detect_moca(checkpoint_arg):
+    """Detect a MOCA run and load its contracting policies.
+
+    A MOCA checkpoint set is recognised by the `_proposal_<i>.pkl` files saved
+    alongside the gameplay policies. Returns None for non-MOCA runs, else a dict:
+
+        theta_grid : (K,) the discretised contract space the run proposed over,
+                     recovered from the proposal-logit width (K) -- the contract
+                     BOUNDS are not encoded in the filename, so they come from
+                     --contract-low/--contract-high (defaults match the paper).
+        probs      : (N, K) each agent's learned proposal distribution.
+        modal_theta: the contract the population most wants to propose -- the
+                     headline result of a MOCA run, and the natural one to replay.
+    """
+    import glob
+
+    gameplay = _gameplay_checkpoints(checkpoint_arg)
+    if not gameplay:
+        return None
+    # Proposal files sit next to the gameplay ones, sharing the run stem.
+    stem = re.sub(r"_\d+\.pkl$", "", gameplay[0])
+    proposals = sorted(glob.glob(f"{stem}_proposal_*.pkl"))
+    if not proposals:
+        return None
+    votings = sorted(glob.glob(f"{stem}_voting_*.pkl"))
+    return {"proposal_paths": proposals, "voting_paths": votings, "gameplay": gameplay}
+
+
+def load_contract_policies(moca, low, high):
+    """Read the learned proposal distributions and the contract grid they span."""
+    logits = np.stack([
+        np.asarray(load_params(p)["params"]["proposal_logits"]) for p in moca["proposal_paths"]
+    ])                                                     # (N, K)
+    probs = np.exp(logits - logits.max(axis=-1, keepdims=True))
+    probs = probs / probs.sum(axis=-1, keepdims=True)
+    k = logits.shape[-1]
+    theta_grid = np.linspace(low, high, k)
+    modal_theta = float(theta_grid[int(probs.mean(axis=0).argmax())])
+    return {"theta_grid": theta_grid, "probs": probs, "modal_theta": modal_theta}
 
 
 def _infer_env_kwargs_from_checkpoint(checkpoint_arg):
@@ -706,6 +874,16 @@ def _infer_env_kwargs_from_checkpoint(checkpoint_arg):
     m = re.search(r"_agents(\d+)", name)
     if m:
         kw["num_agents"] = int(m.group(1))
+
+    # MOCA runs are detected from the sibling contracting checkpoints rather than the
+    # filename, which carries no contract tokens. They train with a UNIT apple
+    # (apple_reward=1.0, the scale the contracting literature calibrates theta to)
+    # and no pay action, neither of which is recoverable from the name -- replaying
+    # them at the env's default num_agents-valued apple would silently rescale the
+    # whole economy relative to the contract.
+    if detect_moca(checkpoint_arg) is not None:
+        kw["apple_reward"] = 1.0
+        kw["pay_mode"] = "off"
     return kw
 
 
@@ -729,7 +907,8 @@ def _report_env_config(env, checkpoint_arg):
                  f"clean_window={getattr(env, 'pay_clean_window', '?')}")
     print(
         f"Env config: reward={'shared/common' if shared else 'individual'}, "
-        f"pay_mode={pay_mode}, pay_scheme={pay_scheme}{extra}, num_agents={env.num_agents}"
+        f"pay_mode={pay_mode}, pay_scheme={pay_scheme}{extra}, "
+        f"apple_reward={getattr(env, 'apple_reward', '?')}, num_agents={env.num_agents}"
     )
     if not checkpoint_arg:
         return
@@ -806,6 +985,14 @@ def main():
     parser.add_argument("--no-autoconfig", action="store_true",
                         help="don't infer env kwargs (reward mode / pay scheme / num_agents) from the "
                              "checkpoint filename; use env defaults + explicit --env-kwarg only")
+    parser.add_argument("--contract-theta", type=float, default=None,
+                        help="MOCA only: replay under this contract value instead of the one the "
+                             "learned proposal policy favours (0 = null contract, no transfers)")
+    parser.add_argument("--contract-low", type=float, default=0.0,
+                        help="MOCA only: lower bound of the contract space the run was trained on "
+                             "(not encoded in the filename; must match CONTRACT_LOW)")
+    parser.add_argument("--contract-high", type=float, default=0.2,
+                        help="MOCA only: upper bound of the contract space (must match CONTRACT_HIGH)")
     args = parser.parse_args()
 
     user_env_kwargs = {}
@@ -838,7 +1025,36 @@ def main():
 
     _report_env_config(env, args.checkpoint)
 
-    states, pay_events = rollout(env, params, args.steps, args.seed)
+    # MOCA: pick the contract to replay under. The learned proposal distribution is
+    # the run's actual result, so its mode is the default -- what the agents ended up
+    # wanting to sign -- with --contract-theta available to replay a counterfactual
+    # (notably 0, the null contract, to see what the same policies do unsubsidised).
+    contract, theta, contract_info = None, None, None
+    moca = detect_moca(args.checkpoint) if args.checkpoint else None
+    if moca is not None:
+        from algorithms.MOCA.contracts import CleanupContract
+
+        info = load_contract_policies(moca, args.contract_low, args.contract_high)
+        if args.contract_theta is not None:
+            theta, source = float(args.contract_theta), "(manual)"
+        else:
+            theta, source = info["modal_theta"], "(learned)"
+        contract = CleanupContract(env.num_agents, args.contract_low, args.contract_high)
+        contract_info = {"theta": theta, "source": source}
+        print(f"MOCA run detected: {len(moca['proposal_paths'])} proposal + "
+              f"{len(moca['voting_paths'])} voting policies")
+        print(f"  contract space: theta in [{args.contract_low}, {args.contract_high}], "
+              f"{len(info['theta_grid'])} bins")
+        print("  learned proposal distribution (mean over agents):")
+        mean_p = info["probs"].mean(axis=0)
+        for th, p in zip(info["theta_grid"], mean_p):
+            bar = "#" * int(round(p * 40))
+            print(f"    theta={th:.3f}  p={p:.3f}  {bar}")
+        print(f"  replaying under theta={theta:g} {source}")
+
+    states, pay_events, extras = rollout(
+        env, params, args.steps, args.seed, contract=contract, theta=theta
+    )
     print(f"Rolled out {len(states) - 1} steps ({'trained checkpoint' if params else 'random policy'}).")
 
     traces = [_agent_snapshot(s) for s in states]
@@ -854,11 +1070,14 @@ def main():
         if n_events:
             frames = draw_pay_arrows(frames, pay_events, env,
                                      persist_frames=args.pay_arrow_frames, colors=colors)
-            print(f"Drew {n_events} reward-share arrow(s).")
+            label = "contract transfer" if contract is not None else "reward-share"
+            print(f"Drew {n_events} {label} arrow(s).")
+        elif contract is not None:
+            print("No contract transfers fired (nobody cleaned, or theta=0).")
 
     if not args.no_panel and _panel_supported(states, env):
-        panel_data = collect_panel_data(states, env)
-        frames = add_info_panels(frames, panel_data, colors, env)
+        panel_data = collect_panel_data(states, env, transfers=extras["transfers"])
+        frames = add_info_panels(frames, panel_data, colors, env, contract_info=contract_info)
         print("Added per-agent info panel.")
 
     if args.gif:
