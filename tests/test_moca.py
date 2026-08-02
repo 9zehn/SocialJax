@@ -347,25 +347,6 @@ def test_detect_moca_returns_none_for_payment_run():
         assert detect_moca(f"{stem}*.pkl") is None
 
 
-def test_contract_arrow_events_fund_the_cleaner():
-    """Each cleaner draws one incoming arrow from each of the N-1 funders, sized
-    theta/(N-1) -- the visual statement of 'the group subsidises the public good'."""
-    from viz.interactive_viewer import _extract_contract_events
-
-    class FakeState:
-        agent_locs = np.array([[1, 1, 0], [2, 2, 0], [3, 3, 0], [4, 4, 0], [5, 5, 0]])
-
-    n, theta = 5, 0.12
-    cleaned = np.array([1.0, 0, 0, 0, 0])
-    transfers = np.array([0.12, -0.03, -0.03, -0.03, -0.03])
-    ev = _extract_contract_events(transfers, cleaned, theta, None, FakeState())
-    assert len(ev) == n - 1, f"expected {n-1} funder arrows, got {len(ev)}"
-    assert all(r == 0 for _s, r, _sl, _rl, _a in ev), "all arrows point at the cleaner"
-    assert all(abs(a - theta / (n - 1)) < 1e-9 for *_x, a in ev)
-    assert sorted(s for s, *_ in ev) == [1, 2, 3, 4], "every non-cleaner funds it"
-    # nobody cleaned -> no transfers, no arrows
-    assert _extract_contract_events(np.zeros(n), np.zeros(n), theta, None, FakeState()) == []
-
 
 ALL_TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 

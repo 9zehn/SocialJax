@@ -1401,7 +1401,20 @@ class Clean_up(MultiAgentEnv):
             _tile_is_dirt = (
                 state.grid[_beam_tiles[:, :, 0], _beam_tiles[:, :, 1]] == Items.dirt
             ) & _beam_valid
-            cleaned_dirt = zaps.reshape(-1) & jnp.any(_tile_is_dirt, axis=0)
+            # HOW MANY dirt cells this agent's beam cleared this step (0..4). The beam
+            # covers 4 tiles, so a single clean action routinely clears several at once;
+            # crediting only a boolean would under-count the public good and, under a
+            # contract priced "per waste cell cleaned", pay the same for clearing 4
+            # cells as for 1. Kept as a count for that reason.
+            # Caveat: if two agents' beams cover the same dirt cell on the same step the
+            # cell is cleared once but both are credited -- beam overlap is inherently
+            # ambiguous to attribute, and the env has always resolved it this way.
+            cleaned_count = jnp.where(
+                zaps.reshape(-1), jnp.sum(_tile_is_dirt, axis=0), 0
+            ).astype(jnp.float32)
+            # Boolean form ("did this agent clean at all"), which is what last_clean_t
+            # and the recent-cleaner recipient rules need.
+            cleaned_dirt = cleaned_count > 0
 
             zaps_4_locs_judge = jnp.concatenate((zaps, zaps, zaps, zaps), 0)
 
@@ -1517,7 +1530,7 @@ class Clean_up(MultiAgentEnv):
                     state.grid
                 )
             )
-            return state, cleaned_dirt
+            return state, cleaned_dirt, cleaned_count
 
 
         def _step(
@@ -1692,7 +1705,7 @@ class Clean_up(MultiAgentEnv):
 
             reborn_players, state = _interact_fire_zapping(key, state, actions)
 
-            state, cleaned_dirt = _interact_fire_cleaning(key, state, actions)
+            state, cleaned_dirt, cleaned_count = _interact_fire_cleaning(key, state, actions)
 
             # Record when each agent last actually cleaned dirt (used to decide who is
             # a payable "recent cleaner"). state.inner_t is this step's counter.
@@ -1881,7 +1894,7 @@ class Clean_up(MultiAgentEnv):
             # grid-wide count broadcast to every agent. This is the per-agent credit the
             # formal-contracting literature calls "cleaned_squares" -- a contract
             # conditions transfers on it, so it has to be attributable to an individual.
-            info["cleaned_by_agent"] = jnp.float32(cleaned_dirt).squeeze()
+            info["cleaned_by_agent"] = jnp.float32(cleaned_count).squeeze()
             info["cleaned_water"] = jnp.array([len(state.potential_dirt_and_dirt_label) - dirtCount] * self.num_agents).squeeze()
             info["waste_cleared"] = jnp.array([len(state.potential_dirt_and_dirt_label) - dirtCount] * self.num_agents).squeeze() 
             

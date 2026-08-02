@@ -124,6 +124,47 @@ def test_cleaning_beam_cannot_reach_across_the_map():
         assert c[0] == 0.0, f"agent at edge {locs[0]} cleaned dirt that is off-grid"
 
 
+def test_cleaning_credit_counts_cells_not_actions():
+    """The beam covers 4 tiles, so one clean action often clears several cells.
+
+    Crediting a boolean under-reports the public good, and under a contract priced
+    "per waste cell cleaned" it would pay the same for clearing 4 cells as for 1.
+    """
+    env = _env()
+    key = jax.random.PRNGKey(0)
+    # agent 0 at (8,10) facing col+1 -> beam covers exactly these four cells
+    beam = [(8, 11), (8, 12), (7, 11), (9, 11)]
+    for k in range(len(beam) + 1):
+        s, L = _placed(env, [[8, 10, 1], [3, 25, 0]])
+        g = s.grid
+        for (r, c) in beam[:k]:
+            g = g.at[r, c].set(jnp.int16(Items.dirt))
+        g = g.at[L[:, 0], L[:, 1]].set(env._agents)
+        s = s.replace(grid=g)
+        before = np.array(s.grid)
+        _, ns, _, _, info = env.step_env(key, s, [CLEAN, STAY])
+        after = np.array(ns.grid)
+        actually_cleared = sum(
+            1 for (r, c) in beam[:k]
+            if before[r, c] == int(Items.dirt) and after[r, c] != int(Items.dirt)
+        )
+        credited = float(np.array(info["cleaned_by_agent"])[0])
+        assert credited == actually_cleared, (
+            f"{k} dirt cells in beam: cleared {actually_cleared} but credited {credited}"
+        )
+        assert float(np.array(info["cleaned_by_agent"])[1]) == 0.0, "idle agent credited"
+
+
+def test_cleaning_credit_is_zero_without_the_clean_action():
+    env = _env()
+    key = jax.random.PRNGKey(0)
+    s, L = _placed(env, [[8, 10, 1], [3, 25, 0]])
+    g = s.grid.at[8, 11].set(jnp.int16(Items.dirt))
+    g = g.at[L[:, 0], L[:, 1]].set(env._agents)
+    _, _, _, _, info = env.step_env(key, s.replace(grid=g), [STAY, STAY])
+    assert float(np.array(info["cleaned_by_agent"])[0]) == 0.0
+
+
 ALL_TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 if __name__ == "__main__":

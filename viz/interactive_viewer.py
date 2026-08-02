@@ -34,79 +34,31 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
 
 import socialjax
 from algorithms.utils.io_utils import load_params
 
-
-def _extract_share_events(info, prev_state):
-    """(sender, receiver, sender_loc, receiver_loc, amount) for every reward actually
-    shared this step -- one entry per sender->receiver edge.
-
-    Under the tithe (toggle) scheme a single pledge turns share-mode ON for several
-    steps, and on *each* of those a slice of the sharer's harvest auto-flows to recent
-    cleaner(s). We reconstruct the edges from the two per-agent (N,) vectors the env
-    exposes: pay_sent[i] (what sharer i gave up) and pay_received[j] (what cleaner j
-    got). With split_recipients a sharer's slice fans across all recent cleaners, so we
-    draw one arrow per (sender, receiver) pair, dividing pay_sent[i] equally across the
-    receivers (excluding the sender itself). Under the single-recipient rule there's
-    just one receiver, so this reduces to a lone arrow. One arrow per real transfer --
-    not per pledge action.
-
-    Positions are taken from prev_state (before the step). Sender/receiver can be far
-    apart (a harvester in the orchard subsidising a river cleaner). Returns [] for
-    envs/modes with no pay mechanism; the caller suppresses arrows in the "noop"
-    placebo (nothing actually moves there).
-    """
-    if "pay_sent" not in info or "pay_received" not in info:
-        return []
-    sent = np.atleast_1d(np.array(info["pay_sent"]))
-    received = np.atleast_1d(np.array(info["pay_received"]))
-    locs = np.array(prev_state.agent_locs)
-    recipients = np.nonzero(received > 0)[0]
-    events = []
-    for sender in np.nonzero(sent > 0)[0]:
-        # A sharer never pays itself, so its receivers are the recipients minus itself.
-        # (Equal-split amount; exact in the common case, a close approximation only in
-        # the degenerate case where some recent cleaner received nothing this step.)
-        rj = [int(j) for j in recipients if j != sender]
-        if not rj:
-            continue
-        amount = float(sent[sender]) / len(rj)
-        for j in rj:
-            events.append((int(sender), j, tuple(locs[sender, :2]),
-                           tuple(locs[j, :2]), amount))
-    return events
 
 
 def rollout(env, params, num_steps, seed, contract=None, theta=None):
     """Step the env and collect raw states (fast, sequential — each step depends on the last).
 
     Rendering is deferred to render_states() so it can be parallelized separately.
-    Also returns arrow events, aligned with states: events[i] is the list of
-    (sender, receiver, sender_loc, receiver_loc, amount) transfers that produced
-    states[i] (events[0] is always empty -- states[0] is the initial reset).
 
-    Two mechanisms can produce those transfers:
-      * the pay mechanism (pay_mode="on"), read out of the env's pay_* info fields;
-      * a MOCA contract, when `contract` and `theta` are supplied -- the gameplay
-        policy is then the contract-conditioned network and transfers are computed
-        here from the env's per-agent cleaning credit.
-    In the placebo "noop" pay mode nothing actually moves, so no arrows are emitted.
-
-    Returns (states, events, extras) where extras["transfers"] is the per-step
-    (N,) transfer vector under a contract (empty list otherwise).
+    Returns (states, extras). extras["cleaned"] is the per-step (N,) count of dirt
+    cells each agent cleared, and extras["transfers"] the per-step (N,) zero-sum
+    contract transfer (all zeros unless a MOCA `contract` and `theta` are supplied,
+    in which case the gameplay policy is the contract-conditioned network).
     """
-    emit_share_arrows = getattr(env, "pay_mode", "off") == "on"
     use_contract = contract is not None and theta is not None
     rng = jax.random.PRNGKey(seed)
     rng, rng_reset = jax.random.split(rng)
     obs, state = env.reset(rng_reset)
 
     states = [state]
-    pay_events = [[]]
     transfers_per_step = [np.zeros(env.num_agents)]
+    cleaned_per_step = [np.zeros(env.num_agents, dtype=np.float32)]
 
     network = None
     contract_vec = None
@@ -153,45 +105,21 @@ def rollout(env, params, num_steps, seed, contract=None, theta=None):
         obs, state, reward, done, info = env.step(rng_step, state, actions)
         states.append(state)
 
+        cleaned = np.atleast_1d(np.array(info["cleaned_by_agent"], dtype=np.float32)) \
+            if "cleaned_by_agent" in info else np.zeros(env.num_agents, dtype=np.float32)
+        cleaned_per_step.append(cleaned)
+
         if use_contract:
-            cleaned = np.atleast_1d(np.array(info["cleaned_by_agent"], dtype=np.float32))
             tr = np.array(contract.compute_transfer(jnp.float32(theta), jnp.asarray(cleaned)))
             transfers_per_step.append(tr)
-            pay_events.append(_extract_contract_events(tr, cleaned, theta, contract, prev_state))
         else:
             transfers_per_step.append(np.zeros(env.num_agents))
-            pay_events.append(
-                _extract_share_events(info, prev_state) if emit_share_arrows else []
-            )
 
         if bool(done["__all__"]):
             break
 
-    return states, pay_events, {"transfers": transfers_per_step}
+    return states, {"transfers": transfers_per_step, "cleaned": cleaned_per_step}
 
-
-def _extract_contract_events(transfers, cleaned, theta, contract, prev_state):
-    """Arrow events for one step of MOCA contract transfers.
-
-    Under the Cleanup contract every agent that cleaned is paid `theta` per cell,
-    funded evenly by all the others, so each cleaner draws one incoming arrow from
-    each of the N-1 funders -- which is precisely the picture the mechanism is meant
-    to create: the group collectively subsidising whoever did the public-good work.
-    """
-    n = len(transfers)
-    locs = np.array(prev_state.agent_locs)
-    per_funder = float(theta) / (n - 1)
-    events = []
-    for receiver in np.nonzero(cleaned > 0)[0]:
-        amount = per_funder * float(cleaned[receiver])
-        if amount <= 0:
-            continue
-        for sender in range(n):
-            if sender == receiver:
-                continue
-            events.append((int(sender), int(receiver), tuple(locs[sender, :2]),
-                           tuple(locs[receiver, :2]), amount))
-    return events
 
 
 def _agent_snapshot(state):
@@ -245,7 +173,7 @@ class _ReplayEnv:
     """Stand-in for the env when replaying a recording.
 
     A recording is rendered and panelled without importing the environment at all, but
-    the panel/arrow code reads a few attributes off `env`; this exposes exactly those
+    the panel code reads a few attributes off `env`; this exposes exactly those
     from the recorded metadata so replay and live rendering share one code path.
     """
 
@@ -280,83 +208,6 @@ def render_states(env, env_name, env_kwargs, states, workers=None):
     ) as ex:
         return list(ex.map(_render_worker, states))
 
-
-def _agent_pixel_center(env, row, col, frame_height):
-    """Map an unpadded (row, col) grid position to a pixel (x, y) center in the
-    image env.render() produces.
-
-    Specific to clean_up.py's render() pipeline: it pads the grid by env.PADDING,
-    draws tile_size=32px tiles, then crops (PADDING-1)*tile_size off each edge and
-    rotates 180 degrees. Working through that transform: a cell at unpadded row r
-    ends up centered at pixel row tile_size*(GRID_SIZE_ROW - r + 0.5) (symmetric
-    for columns) -- derived once here rather than re-deriving per call. Returns
-    None for envs without GRID_SIZE_ROW/COL (i.e. this is a no-op there).
-    """
-    grid_rows = getattr(env, "GRID_SIZE_ROW", None)
-    grid_cols = getattr(env, "GRID_SIZE_COL", None)
-    if grid_rows is None or grid_cols is None:
-        return None
-    tile_size = frame_height / (grid_rows + 2)
-    cy = tile_size * (grid_rows - row + 0.5)
-    cx = tile_size * (grid_cols - col + 0.5)
-    return cx, cy
-
-
-def _draw_arrow(draw, p1, p2, color=(255, 215, 0), width=3, head_len=13, label=None, font=None):
-    # A thin dark casing under the colored line keeps the arrow readable over both
-    # the green orchard and the grey river.
-    draw.line([p1, p2], fill=(20, 20, 24), width=width + 2)
-    draw.line([p1, p2], fill=color, width=width)
-    angle = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
-    for offset in (math.radians(150), math.radians(-150)):
-        hx = p2[0] + head_len * math.cos(angle + offset)
-        hy = p2[1] + head_len * math.sin(angle + offset)
-        draw.line([p2, (hx, hy)], fill=(20, 20, 24), width=width + 2)
-        draw.line([p2, (hx, hy)], fill=color, width=width)
-    if label:
-        # Amount transferred, at the arrow midpoint, with a dark pill behind it so a
-        # fractional tithe share (e.g. "3.5") reads clearly over any tile.
-        mx, my = (p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2
-        if font is not None:
-            tb = draw.textbbox((mx, my), label, font=font, anchor="mm")
-            draw.rounded_rectangle([tb[0] - 4, tb[1] - 2, tb[2] + 4, tb[3] + 2], radius=5, fill=(20, 20, 24))
-            draw.text((mx, my), label, font=font, fill=color, anchor="mm")
-
-
-def draw_pay_arrows(frames, pay_events, env, persist_frames=3, colors=None):
-    """Overlay a sender -> receiver arrow, tinted the SENDER's agent color, for
-    `persist_frames` frames starting on the frame each reward-share occurred. The
-    color match lets you read at a glance which agent's income is flowing where and
-    ties the arrow to that agent's row in the info panel. No-op (returns frames
-    unchanged) if there are no events, or the env doesn't expose GRID_SIZE_ROW/COL.
-    """
-    if not any(pay_events) or _agent_pixel_center(env, 0, 0, frames[0].shape[0]) is None:
-        return frames
-
-    n = len(frames)
-    active = [[] for _ in range(n)]
-    for i, events in enumerate(pay_events):
-        for event in events:
-            for j in range(i, min(i + persist_frames, n)):
-                active[j].append(event)
-
-    label_font = _load_font(max(12, int(frames[0].shape[0] * 0.026)))
-    out = []
-    for i, frame in enumerate(frames):
-        if not active[i]:
-            out.append(frame)
-            continue
-        img = Image.fromarray(frame).convert("RGB")
-        draw = ImageDraw.Draw(img)
-        h = frame.shape[0]
-        for sender, _receiver, sender_loc, receiver_loc, amount in active[i]:
-            p1 = _agent_pixel_center(env, sender_loc[0], sender_loc[1], h)
-            p2 = _agent_pixel_center(env, receiver_loc[0], receiver_loc[1], h)
-            color = colors[sender] if colors is not None and sender < len(colors) else (255, 215, 0)
-            label = f"{amount:g}" if amount else None
-            _draw_arrow(draw, p1, p2, color=color, label=label, font=label_font)
-        out.append(np.array(img))
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -406,14 +257,16 @@ def _panel_supported(states, env):
     )
 
 
-def collect_panel_data(states, env, transfers=None):
+def collect_panel_data(states, env, transfers=None, cleaned=None):
     """Per-step, per-agent stats for the info panel, aligned with `states`.
 
     Returns a list (one entry per state) of dicts:
         balance:   (N,) cumulative net reward = each agent's spendable balance.
-        clean:     (N,) running count of steps on which the agent cleaned dirt,
-                   derived from last_clean_t changing (the env keeps no cumulative
-                   counter, only the most-recent clean time).
+        clean:     (N,) running count of dirt CELLS the agent has cleared. Taken from
+                   the env's per-step info["cleaned_by_agent"] when `cleaned` is
+                   supplied. The fallback (last_clean_t changing) can only count
+                   cleaning STEPS, and the beam covers 4 tiles, so it under-reports
+                   whenever an agent clears more than one cell in a single action.
         share:     (N,) bool, share-mode toggle currently ON (tithe scheme only;
                    all-False otherwise).
         transfer:  (N,) CUMULATIVE contract transfer received (negative = net
@@ -429,10 +282,14 @@ def collect_panel_data(states, env, transfers=None):
     prev_lct = None
     out = []
     for idx, s in enumerate(states):
-        lct = np.array(s.last_clean_t) if hasattr(s, "last_clean_t") else None
-        if lct is not None and prev_lct is not None:
-            clean_counts = clean_counts + (lct != prev_lct).astype(int)
-        prev_lct = lct
+        if cleaned is not None:
+            if idx < len(cleaned):
+                clean_counts = clean_counts + np.asarray(cleaned[idx]).reshape(-1).astype(int)
+        else:
+            lct = np.array(s.last_clean_t) if hasattr(s, "last_clean_t") else None
+            if lct is not None and prev_lct is not None:
+                clean_counts = clean_counts + (lct != prev_lct).astype(int)
+            prev_lct = lct
         balance = np.array(s.agent_balance) if hasattr(s, "agent_balance") else np.zeros(n)
         if hasattr(s, "share_expiry_t"):
             share = np.array(s.share_expiry_t) > int(s.inner_t)
@@ -484,7 +341,7 @@ def render_info_panel(height, datum, colors, env, step, width, contract_info=Non
     """Render one info-panel frame (RGB, height x width) for a single step.
 
     First column is each agent's color (a swatch + a color bar down the row edge)
-    so every stat reads back to the matching agent in the grid and to its arrows.
+    so every stat reads back to the matching agent in the grid.
     Columns: color/label | Reward (balance) | Clean (count) | and then either
     Share (ON/OFF) for the tithe toggle, or Transfer (cumulative net contract
     transfer, + receiver / - funder) under a MOCA contract.
@@ -1026,8 +883,6 @@ def main():
     parser.add_argument("--env-kwarg", action="append", default=[], metavar="KEY=VALUE",
                         help="extra env kwarg, repeatable (e.g. --env-kwarg pay_mode=on); "
                              "values parsed as int/float/bool when possible")
-    parser.add_argument("--pay-arrow-frames", type=int, default=3,
-                        help="how many frames a sender->receiver reward-share arrow stays visible for (0 disables)")
     parser.add_argument("--no-panel", action="store_true",
                         help="don't draw the per-agent info panel to the right of the grid")
     parser.add_argument("--no-autoconfig", action="store_true",
@@ -1134,7 +989,7 @@ def main():
             print(f"    theta={th:.3f}  p={p:.3f}  {bar}")
         print(f"  replaying under theta={theta:g} {source}")
 
-    states, pay_events, extras = rollout(
+    states, extras = rollout(
         env, params, args.steps, args.seed, contract=contract, theta=theta
     )
     print(f"Rolled out {len(states) - 1} steps ({'trained checkpoint' if params else 'random policy'}).")
@@ -1158,21 +1013,11 @@ def main():
 
     colors = getattr(env, "PLAYER_COLOURS", None)
 
-    # Arrows first (they use grid pixel coords), then composite the panel to the
-    # right so both annotations survive into the GIF and the scrubber.
-    if args.pay_arrow_frames > 0:
-        n_events = sum(len(e) for e in pay_events)
-        if n_events:
-            frames = draw_pay_arrows(frames, pay_events, env,
-                                     persist_frames=args.pay_arrow_frames, colors=colors)
-            label = "contract transfer" if contract is not None else "reward-share"
-            print(f"Drew {n_events} {label} arrow(s).")
-        elif contract is not None:
-            print("No contract transfers fired (nobody cleaned, or theta=0).")
 
     panel_data = None
     if _panel_supported(states, env):
-        panel_data = collect_panel_data(states, env, transfers=extras["transfers"])
+        panel_data = collect_panel_data(states, env, transfers=extras["transfers"],
+                                        cleaned=extras["cleaned"])
 
     # Record BEFORE the panel is composited: a recording stores world state, not
     # pixels, so it can be re-rendered later at any size or with a different panel.
