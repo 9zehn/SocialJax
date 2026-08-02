@@ -440,11 +440,26 @@ class Clean_up(MultiAgentEnv):
         s_interest_change_every=30000000,
         cf=False,
         cf_alpha=1,
-        maxAppleGrowthRate=0.05, 
+        maxAppleGrowthRate=0.05,
         thresholdDepletion=0.4,  # 0.4
         thresholdRestoration=0.0,
         dirtSpawnProbability=0.5,
         delayStartOfDirtSpawning=50, # 50
+        # --- ecology balance (both default to the ORIGINAL upstream behaviour) ---
+        # How many candidate cells may turn to dirt per step. Upstream hard-codes 1,
+        # which caps dirt accumulation at dirtSpawnProbability <= 1 cell/step while a
+        # single cleaner's 4-tile beam clears up to 4 cells/step -- an 8x surplus, so
+        # one part-time cleaner sustains the whole commons and the "needs >=3
+        # simultaneous cleaners" premise never binds. Expected dirt per step is
+        # dirt_spawn_cells * dirtSpawnProbability.
+        dirt_spawn_cells=1,
+        # Per-step probability that a standing apple disappears uneaten. 0.0 (default)
+        # reproduces upstream, where apples PERSIST forever and therefore accumulate as
+        # a stock: harvesting stays profitable long after cleaning stops, which
+        # decouples reward from current river state. With decay > 0 apples become a
+        # flow whose equilibrium stock is growth/(growth+decay), so letting the river
+        # foul visibly costs harvest within the same episode.
+        appleDecayProbability=0.0,
         jit=True,
 
         # Monetary system: an agent's `pay` action wires reward to whoever recently
@@ -510,6 +525,8 @@ class Clean_up(MultiAgentEnv):
         super().__init__(num_agents=num_agents)
 
         self.maxAppleGrowthRate = maxAppleGrowthRate
+        self.dirt_spawn_cells = int(dirt_spawn_cells)
+        self.appleDecayProbability = float(appleDecayProbability)
         self.thresholdDepletion = thresholdDepletion
         self.thresholdRestoration = thresholdRestoration
         self.dirtSpawnProbability = dirtSpawnProbability
@@ -1551,13 +1568,19 @@ class Clean_up(MultiAgentEnv):
 
             interpolation = jnp.clip(interpolation, -jnp.inf, 1.0)
             probability = self.maxAppleGrowthRate * interpolation
-            def regrow_apple(apple_locs, p):
-                new_apple = jnp.where((((grid_apple[apple_locs[0], apple_locs[1]] == Items.empty) & (p < probability)) 
-                                       | ((grid_apple[apple_locs[0], apple_locs[1]] == Items.apple))),  
-                                      Items.apple, Items.empty)
-                return new_apple
+            key, key_decay = jax.random.split(key)
+            decay_draw = jax.random.uniform(key_decay, shape=(len(self.POTENTIAL_APPLE),))
+
+            def regrow_apple(apple_locs, p, d):
+                is_empty = grid_apple[apple_locs[0], apple_locs[1]] == Items.empty
+                is_apple = grid_apple[apple_locs[0], apple_locs[1]] == Items.apple
+                # A standing apple survives unless it decays; decay=0 keeps the original
+                # "apples persist forever" behaviour exactly.
+                survives = is_apple & (d >= self.appleDecayProbability)
+                return jnp.where((is_empty & (p < probability)) | survives,
+                                 Items.apple, Items.empty)
             prob = jax.random.uniform(key, shape=(len(self.POTENTIAL_APPLE),))
-            new_apple = jax.vmap(regrow_apple)(self.POTENTIAL_APPLE, prob)
+            new_apple = jax.vmap(regrow_apple)(self.POTENTIAL_APPLE, prob, decay_draw)
 
             new_apple_grid = grid_apple.at[self.POTENTIAL_APPLE[:, 0], self.POTENTIAL_APPLE[:, 1]].set(new_apple)
             state = state.replace(grid=new_apple_grid)
@@ -1573,12 +1596,25 @@ class Clean_up(MultiAgentEnv):
 
             unstable_sorted_locs = state.potential_dirt_and_dirt_locs[unstable_indices]
             
-            p = jax.random.uniform(key, shape=(1,)) 
-            one_piece_dirt = jnp.where(((grid_dirt[unstable_sorted_locs[0, 0], unstable_sorted_locs[0, 1]] == Items.potential_dirt) 
-                                       & (p < self.dirtSpawnProbability) & (state.inner_t>self.delayStartOfDirtSpawning)),  
-                        Items.dirt, label_with_noise_rank[0])
+            # Sorting puts potential_dirt (7) ahead of dirt (8), so the first
+            # `dirt_spawn_cells` entries are the cleanest candidates. Upstream only ever
+            # converted entry 0, capping dirt growth at 1 cell/step; attempting the
+            # first k (each with its own draw) makes the expected rate
+            # k * dirtSpawnProbability, so the commons can actually outpace one cleaner.
+            k = max(int(self.dirt_spawn_cells), 1)
+            k = min(k, int(label_with_noise_rank.shape[0]))
+            p = jax.random.uniform(key, shape=(k,))
+            cand = unstable_sorted_locs[:k]
+            spawn = (
+                (grid_dirt[cand[:, 0], cand[:, 1]] == Items.potential_dirt)
+                & (p < self.dirtSpawnProbability)
+                & (state.inner_t > self.delayStartOfDirtSpawning)
+            )
+            new_piece_dirt = jnp.where(
+                spawn, jnp.float32(Items.dirt), label_with_noise_rank[:k]
+            )
 
-            label_with_noise_rank_new = label_with_noise_rank.at[0].set(one_piece_dirt[0]) 
+            label_with_noise_rank_new = label_with_noise_rank.at[:k].set(new_piece_dirt)
 
             label_rank_new = jnp.round(label_with_noise_rank_new).astype(jnp.int16)
             
