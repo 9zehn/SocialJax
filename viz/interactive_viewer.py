@@ -217,6 +217,54 @@ def _render_worker(state):
     return np.array(_WORKER_ENV.render(state))
 
 
+def recording_meta(env, contract_info=None):
+    """Everything render_recording() needs to rasterise without the env or JAX."""
+    from socialjax.environments.cleanup.clean_up import Items
+
+    return {
+        "version": 1,
+        "n_items": len(Items),
+        "padding": int(env.PADDING),
+        "player_colours": [list(map(int, c)) for c in env.PLAYER_COLOURS],
+        "num_agents": int(env.num_agents),
+        "grid_rows": int(env.GRID_SIZE_ROW),
+        "grid_cols": int(env.GRID_SIZE_COL),
+        "shared_rewards": bool(getattr(env, "shared_rewards", True)),
+        "pay_mode": getattr(env, "pay_mode", "off"),
+        "pay_scheme": getattr(env, "pay_scheme", "instant"),
+        "split_recipients": bool(getattr(env, "split_recipients", False)),
+        "share_fraction": float(getattr(env, "share_fraction", 0.5)),
+        "pay_amount": float(getattr(env, "pay_amount", 1.0)),
+        "pay_clean_window": int(getattr(env, "pay_clean_window", 50)),
+        "apple_reward": float(getattr(env, "apple_reward", env.num_agents)),
+        "contract_info": contract_info,
+    }
+
+
+class _ReplayEnv:
+    """Stand-in for the env when replaying a recording.
+
+    A recording is rendered and panelled without importing the environment at all, but
+    the panel/arrow code reads a few attributes off `env`; this exposes exactly those
+    from the recorded metadata so replay and live rendering share one code path.
+    """
+
+    def __init__(self, meta):
+        self.num_agents = meta["num_agents"]
+        self.PLAYER_COLOURS = [tuple(c) for c in meta["player_colours"]]
+        self.GRID_SIZE_ROW = meta["grid_rows"]
+        self.GRID_SIZE_COL = meta["grid_cols"]
+        self.PADDING = meta["padding"]
+        self.shared_rewards = meta["shared_rewards"]
+        self.pay_mode = meta["pay_mode"]
+        self.pay_scheme = meta["pay_scheme"]
+        self.split_recipients = meta["split_recipients"]
+        self.share_fraction = meta["share_fraction"]
+        self.pay_amount = meta["pay_amount"]
+        self.pay_clean_window = meta["pay_clean_window"]
+        self.apple_reward = meta["apple_reward"]
+
+
 def render_states(env, env_name, env_kwargs, states, workers=None):
     """Render a list of states to RGB frames, parallelized across processes."""
     if workers is None:
@@ -993,7 +1041,41 @@ def main():
                              "(not encoded in the filename; must match CONTRACT_LOW)")
     parser.add_argument("--contract-high", type=float, default=0.2,
                         help="MOCA only: upper bound of the contract space (must match CONTRACT_HIGH)")
+    parser.add_argument("--record", default=None, metavar="PATH",
+                        help="save the rollout to PATH (.npz) so it can be reopened later "
+                             "with --replay, without re-running the simulation")
+    parser.add_argument("--replay", default=None, metavar="PATH",
+                        help="load a recording saved by --record and render it; needs no "
+                             "env, policies or checkpoint")
+    parser.add_argument("--slow-render", action="store_true",
+                        help="use the environment's own per-tile renderer instead of the fast "
+                             "vectorised one. ~20x slower; its only visible difference is that "
+                             "it also tints each agent's field-of-view window")
     args = parser.parse_args()
+
+    # ---- replay path: no env, no policies, no simulation ------------------
+    if args.replay:
+        from viz.recording import load_recording, render_recording
+
+        rec = load_recording(args.replay)
+        meta = rec["meta"]
+        env = _ReplayEnv(meta)
+        contract_info = meta.get("contract_info")
+        print(f"Replaying {args.replay}: {len(rec['grids'])} steps, "
+              f"{meta['num_agents']} agents")
+        t0 = time.time()
+        frames = render_recording(rec["grids"], rec["agent_locs"], meta)
+        print(f"Rendered {len(frames)} frames in {time.time() - t0:.1f}s")
+        if not args.no_panel and rec["panel_data"] is not None:
+            frames = add_info_panels(frames, rec["panel_data"],
+                                     env.PLAYER_COLOURS, env, contract_info=contract_info)
+            print("Added per-agent info panel.")
+        if args.gif:
+            save_gif(frames, args.gif)
+            print(f"Saved GIF to {args.gif}")
+        if not args.no_interactive:
+            interactive_view(frames, [{} for _ in frames])
+        return
 
     user_env_kwargs = {}
     for kv in args.env_kwarg:
@@ -1058,8 +1140,21 @@ def main():
     print(f"Rolled out {len(states) - 1} steps ({'trained checkpoint' if params else 'random policy'}).")
 
     traces = [_agent_snapshot(s) for s in states]
-    frames = render_states(env, args.env, env_kwargs, states, workers=args.render_workers)
-    print(f"Rendered {len(frames)} frames.")
+    t0 = time.time()
+    if args.slow_render:
+        frames = render_states(env, args.env, env_kwargs, states, workers=args.render_workers)
+    else:
+        # Vectorised path: one palette lookup + block upscale per frame instead of a
+        # Python loop over ~1900 padded tiles (each of which forced a device sync).
+        from viz.recording import render_recording
+
+        meta = recording_meta(env, contract_info)
+        frames = render_recording(
+            np.stack([np.array(s.grid) for s in states]),
+            np.stack([np.array(s.agent_locs) for s in states]),
+            meta,
+        )
+    print(f"Rendered {len(frames)} frames in {time.time() - t0:.1f}s.")
 
     colors = getattr(env, "PLAYER_COLOURS", None)
 
@@ -1075,8 +1170,28 @@ def main():
         elif contract is not None:
             print("No contract transfers fired (nobody cleaned, or theta=0).")
 
-    if not args.no_panel and _panel_supported(states, env):
+    panel_data = None
+    if _panel_supported(states, env):
         panel_data = collect_panel_data(states, env, transfers=extras["transfers"])
+
+    # Record BEFORE the panel is composited: a recording stores world state, not
+    # pixels, so it can be re-rendered later at any size or with a different panel.
+    if args.record:
+        from viz.recording import save_recording
+
+        Path(args.record).parent.mkdir(parents=True, exist_ok=True)
+        save_recording(
+            args.record,
+            np.stack([np.array(s.grid) for s in states]),
+            np.stack([np.array(s.agent_locs) for s in states]),
+            panel_data,
+            recording_meta(env, contract_info),
+        )
+        size_kb = Path(args.record).stat().st_size / 1024
+        print(f"Recorded {len(states)} steps to {args.record} ({size_kb:.0f} KB) "
+              f"-- reopen with --replay {args.record}")
+
+    if not args.no_panel and panel_data is not None:
         frames = add_info_panels(frames, panel_data, colors, env, contract_info=contract_info)
         print("Added per-agent info panel.")
 

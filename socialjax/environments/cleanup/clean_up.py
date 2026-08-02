@@ -185,6 +185,33 @@ def compute_pay_transfers(
     return delta, attempted, executed, target
 
 
+def clip_beam_targets(
+    targets: jnp.ndarray, n_rows: int, n_cols: int
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Clamp beam target cells into the grid and report which were already inside.
+
+    Beam cells are built by adding a direction offset to an agent's position, so an
+    agent standing at an edge and facing outward produces targets outside the grid.
+    Indexing a jnp array with those is silently WRONG rather than an error: negative
+    indices wrap around Python-style (a beam fired off the top of the map reappears at
+    the bottom) and too-large indices clamp to the last row/column (a beam fired off
+    the bottom lands back on the firing agent's own cell). Both let a zap "hit"
+    something it is nowhere near -- in particular an agent could stun ITSELF by facing
+    a wall, and respawn at a random mid-map spawn point, which is a fast-travel exploit
+    rather than a game mechanic.
+
+    Returns (clamped_targets, valid) where `valid` is False for any cell that fell
+    outside the grid. Callers must use `clamped_targets` for indexing (so the gather is
+    in-range) and mask any hit/draw with `valid` (so out-of-grid cells never register).
+    """
+    rows = targets[:, 0]
+    cols = targets[:, 1]
+    valid = (rows >= 0) & (rows < n_rows) & (cols >= 0) & (cols < n_cols)
+    clamped = targets.at[:, 0].set(jnp.clip(rows, 0, n_rows - 1))
+    clamped = clamped.at[:, 1].set(jnp.clip(cols, 0, n_cols - 1))
+    return clamped, valid
+
+
 def _recent_cleaner_recipient(
     last_clean_t: jnp.ndarray, current_t: int, clean_window: int
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
@@ -1157,18 +1184,30 @@ class Clean_up(MultiAgentEnv):
                 target_left
             )
 
+            # Beam cells that fall outside the grid must not hit or draw anything.
+            # Without this an agent facing a wall zaps ITSELF (off-grid indices clamp
+            # back onto its own cell) or an agent at the far edge (negative indices wrap
+            # around), and the victim respawns mid-map -- a fast-travel exploit, not a
+            # game mechanic. Clamping keeps every gather in range; the mask is what
+            # actually suppresses the phantom hit.
+            R_, C_ = self.GRID_SIZE_ROW, self.GRID_SIZE_COL
+            one_step_targets, one_valid = clip_beam_targets(one_step_targets, R_, C_)
+            two_step_targets, two_valid = clip_beam_targets(two_step_targets, R_, C_)
+            target_right, right_valid = clip_beam_targets(target_right, R_, C_)
+            target_left, left_valid = clip_beam_targets(target_left, R_, C_)
+
             all_zaped_locs = jnp.concatenate((one_step_targets, two_step_targets, target_right, target_left), 0)
             # zaps_3d = jnp.stack([zaps, zaps, zaps], axis=-1)
 
             zaps_4_locs = jnp.concatenate((zaps, zaps, zaps, zaps), 0)
-
+            all_zaped_valid = jnp.concatenate((one_valid, two_valid, right_valid, left_valid), 0)
 
             # all_zaped_locs = jax.vmap(filter_zaped_locs)(all_zaped_locs)
 
-            def zaped_gird(a, z):
-                return jnp.where(z, state.grid[a[0], a[1]], -1)
+            def zaped_gird(a, z, v):
+                return jnp.where(z & v, state.grid[a[0], a[1]], -1)
 
-            all_zaped_gird = jax.vmap(zaped_gird)(all_zaped_locs, zaps_4_locs)
+            all_zaped_gird = jax.vmap(zaped_gird)(all_zaped_locs, zaps_4_locs, all_zaped_valid)
             # jax.debug.print("all_zaped_gird {all_zaped_gird} 🤯", all_zaped_gird=all_zaped_gird)
 
             def check_reborn_player(a):
@@ -1229,10 +1268,12 @@ class Clean_up(MultiAgentEnv):
             qualified_to_zap = zaps.squeeze()
             # jax.debug.print("qualified_to_zap {qualified_to_zap} 🤯", qualified_to_zap=qualified_to_zap)
             # update grid
-            def update_grid(a_i, t, i, grid):
+            # `valid` keeps the beam graphic from being drawn on a clamped (off-grid)
+            # cell, which would otherwise paint a stray beam onto the map edge.
+            def update_grid(a_i, t, i, grid, valid):
                 return grid.at[t[:, 0], t[:, 1]].set(
                     jax.vmap(jnp.where)(
-                        a_i,
+                        a_i & valid,
                         i,
                         aux_grid[t[:, 0], t[:, 1]]
                     )
@@ -1242,10 +1283,10 @@ class Clean_up(MultiAgentEnv):
 
 
             # jax.debug.print("one_step_targets {one_step_targets} 🤯", one_step_targets=one_step_targets)
-            aux_grid = update_grid(qualified_to_zap, one_step_targets, o_items, aux_grid)
-            aux_grid = update_grid(qualified_to_zap, two_step_targets, t_items, aux_grid)
-            aux_grid = update_grid(qualified_to_zap, target_right, r_items, aux_grid)
-            aux_grid = update_grid(qualified_to_zap, target_left, l_items, aux_grid)
+            aux_grid = update_grid(qualified_to_zap, one_step_targets, o_items, aux_grid, one_valid)
+            aux_grid = update_grid(qualified_to_zap, two_step_targets, t_items, aux_grid, two_valid)
+            aux_grid = update_grid(qualified_to_zap, target_right, r_items, aux_grid, right_valid)
+            aux_grid = update_grid(qualified_to_zap, target_left, l_items, aux_grid, left_valid)
 
             # jax.debug.print("aux_grid {aux_grid} 🤯", aux_grid=aux_grid)
             state = state.replace(
@@ -1333,18 +1374,33 @@ class Clean_up(MultiAgentEnv):
             )
 
 
+            # Same off-grid hazard as the zap beam: without clamping+masking, an agent
+            # at an edge would "clean" dirt on the opposite side of the map (negative
+            # indices wrap) or re-clean its own cell (large indices clamp). That would
+            # also corrupt cleaned_dirt, which credits cleaning per agent and therefore
+            # drives both the tithe recipient rule and MOCA contract transfers.
+            R_, C_ = self.GRID_SIZE_ROW, self.GRID_SIZE_COL
+            one_step_targets, one_valid = clip_beam_targets(one_step_targets, R_, C_)
+            two_step_targets, two_valid = clip_beam_targets(two_step_targets, R_, C_)
+            target_right, right_valid = clip_beam_targets(target_right, R_, C_)
+            target_left, left_valid = clip_beam_targets(target_left, R_, C_)
+
             all_zaped_locs = jnp.concatenate((one_step_targets, two_step_targets, target_right, target_left), 0)
+            all_zaped_valid = jnp.concatenate((one_valid, two_valid, right_valid, left_valid), 0)
             # zaps_3d = jnp.stack([zaps, zaps, zaps], axis=-1)
 
             # Per-agent "actually cleaned a dirt patch this step": took zap_clean AND
-            # at least one of its 4 beam tiles was Items.dirt in the (pre-clean) grid.
+            # at least one of its 4 IN-GRID beam tiles was Items.dirt in the (pre-clean) grid.
             # all_zaped_locs is laid out as [one_step(all agents), two_step(all), right(all),
             # left(all)], so reshaping to (4, N, 2) groups the 4 tiles per agent on axis 0.
             n_ag = self.num_agents
             # all_zaped_locs rows are [row, col, orient] (3 cols), grouped as
             # [one_step(all agents), two_step(all), right(all), left(all)].
             _beam_tiles = all_zaped_locs.reshape(4, n_ag, all_zaped_locs.shape[-1])
-            _tile_is_dirt = state.grid[_beam_tiles[:, :, 0], _beam_tiles[:, :, 1]] == Items.dirt
+            _beam_valid = all_zaped_valid.reshape(4, n_ag)
+            _tile_is_dirt = (
+                state.grid[_beam_tiles[:, :, 0], _beam_tiles[:, :, 1]] == Items.dirt
+            ) & _beam_valid
             cleaned_dirt = zaps.reshape(-1) & jnp.any(_tile_is_dirt, axis=0)
 
             zaps_4_locs_judge = jnp.concatenate((zaps, zaps, zaps, zaps), 0)
@@ -1362,9 +1418,11 @@ class Clean_up(MultiAgentEnv):
                         state.grid[a[:, 0], a[:, 1]]
                     )
                 )
-            
-            
-            grid_clean = clean_gird(all_zaped_locs, zaps_4_locs_judge.squeeze())
+
+
+            grid_clean = clean_gird(
+                all_zaped_locs, (zaps_4_locs_judge.squeeze() & all_zaped_valid)
+            )
             state = state.replace(grid=grid_clean)
 
             # refresh label
