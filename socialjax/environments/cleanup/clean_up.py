@@ -54,6 +54,9 @@ class State:
     # pay_scheme="tithe" only: inner_t until which each agent's share-mode pledge is
     # active (exclusive). 0 at reset = inactive, since "active" means inner_t < expiry.
     share_expiry_t: jnp.ndarray
+    # toggle_cooldown > 0 only: inner_t at which each agent last flipped its share
+    # toggle, so flips can be rate-limited. Far-negative at reset = free to flip.
+    last_toggle_t: jnp.ndarray
 
 
 @chex.dataclass
@@ -286,6 +289,8 @@ def compute_tithe_transfers(
     share_fraction: float,
     share_duration: int,
     split_recipients: bool = False,
+    last_toggle_t: jnp.ndarray = None,
+    toggle_cooldown: int = 0,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Resolve the pledge-style income-coupled tithe (pay_scheme="tithe").
 
@@ -332,9 +337,33 @@ def compute_tithe_transfers(
                 counterpart of the per-sharer `sent` slice).
     """
     pledged = actions == Actions.pay
-    new_expiry = jnp.where(
-        pledged, jnp.int32(current_t + share_duration), share_expiry_t.astype(jnp.int32)
-    )
+    if toggle_cooldown > 0:
+        # Rate-limited ON/OFF toggle. Without this an agent can game the
+        # income-coupled design: holding the toggle ON while idle costs nothing (the
+        # tithe only takes a slice of income actually earned), so it can look like a
+        # payer to everyone else and flip OFF just before harvesting -- a free-riding
+        # "fake cleaner-supporter". Forcing a minimum dwell time between flips means a
+        # displayed pledge has to be honoured across a whole window, so it cannot be
+        # timed around a harvest.
+        can_toggle = (jnp.int32(current_t) - last_toggle_t.astype(jnp.int32)) >= toggle_cooldown
+        currently_on = current_t < share_expiry_t
+        flip = pledged & can_toggle
+        FAR = jnp.int32(1 << 30)   # "on until switched off"
+        new_expiry = jnp.where(
+            flip,
+            jnp.where(currently_on, jnp.int32(current_t), FAR),   # on->off / off->on
+            share_expiry_t.astype(jnp.int32),
+        )
+        new_last_toggle = jnp.where(flip, jnp.int32(current_t), last_toggle_t.astype(jnp.int32))
+    else:
+        # Original pledge semantics: pay (re)arms share-mode for share_duration steps.
+        new_expiry = jnp.where(
+            pledged, jnp.int32(current_t + share_duration), share_expiry_t.astype(jnp.int32)
+        )
+        new_last_toggle = (
+            share_expiry_t.astype(jnp.int32) * 0 if last_toggle_t is None
+            else last_toggle_t.astype(jnp.int32)
+        )
     active = current_t < new_expiry
 
     weights, has_recipient = _recent_cleaner_weights(
@@ -350,7 +379,7 @@ def compute_tithe_transfers(
     received = weights.T @ sent          # each cleaner's inflow (split across sharers)
     delta = received - sent              # zero-sum: rows of weights sum to 1 where sent>0
     target = jnp.argmax(weights, axis=1)  # primary recipient (exact under "latest")
-    return delta, pledged, executed, target, new_expiry, active, received
+    return delta, pledged, executed, target, new_expiry, active, received, new_last_toggle
 
 
 char_to_int = {
@@ -462,6 +491,12 @@ class Clean_up(MultiAgentEnv):
         # two-phase training, whose first phase forces payments exogenously and must
         # not let the policy overwrite them.
         freeze_share_state=False,
+        # tithe scheme only. 0 (default) keeps the original pledge-with-expiry
+        # semantics. >0 switches the pay action to an explicit ON/OFF toggle that can
+        # only be flipped every `toggle_cooldown` steps, so a displayed pledge must be
+        # honoured for a whole window instead of being switched off moments before a
+        # harvest (see compute_tithe_transfers).
+        toggle_cooldown=0,
         # Per-step probability that a standing apple disappears uneaten. 0.0 (default)
         # reproduces upstream, where apples PERSIST forever and therefore accumulate as
         # a stock: harvesting stays profitable long after cleaning stops, which
@@ -537,6 +572,7 @@ class Clean_up(MultiAgentEnv):
         self.dirt_spawn_cells = int(dirt_spawn_cells)
         self.observe_payment = bool(observe_payment)
         self.freeze_share_state = bool(freeze_share_state)
+        self.toggle_cooldown = int(toggle_cooldown)
         self.appleDecayProbability = float(appleDecayProbability)
         self.thresholdDepletion = thresholdDepletion
         self.thresholdRestoration = thresholdRestoration
@@ -1901,17 +1937,18 @@ class Clean_up(MultiAgentEnv):
                         jnp.full_like(jnp.asarray(actions), jnp.asarray(Actions.stay))
                         if self.freeze_share_state else actions
                     )
-                    pay_delta, pay_attempted, pay_executed, pay_target, new_expiry, share_active, pay_received = (
+                    pay_delta, pay_attempted, pay_executed, pay_target, new_expiry, share_active, pay_received, new_last_toggle = (
                         compute_tithe_transfers(
                             pay_actions, state.last_clean_t, state.inner_t,
                             state.share_expiry_t, tithe_income,
                             self.pay_clean_window, self.share_fraction, self.share_duration,
-                            self.split_recipients,
+                            self.split_recipients, state.last_toggle_t, self.toggle_cooldown,
                         )
                     )
                     # Pledge state advances in BOTH on and noop: the placebo keeps the
                     # action's dynamics identical and only withholds the money.
-                    state = state.replace(share_expiry_t=new_expiry)
+                    state = state.replace(share_expiry_t=new_expiry,
+                                          last_toggle_t=new_last_toggle)
                     info["share_active"] = jnp.float32(share_active).squeeze()
                     # Per-agent amount actually sent this step (sender side): the tithe
                     # slice share_fraction*income on executed shares. For share_fraction
@@ -1994,6 +2031,7 @@ class Clean_up(MultiAgentEnv):
                 agent_balance=state.agent_balance,
                 last_clean_t=state.last_clean_t,
                 share_expiry_t=state.share_expiry_t,
+                last_toggle_t=state.last_toggle_t,
             )
 
             # now calculate if done for inner or outer episode
@@ -2118,6 +2156,7 @@ class Clean_up(MultiAgentEnv):
                 agent_balance=jnp.zeros((self.num_agents,), dtype=jnp.float32),
                 last_clean_t=jnp.full((self.num_agents,), -10_000, dtype=jnp.int32),
                 share_expiry_t=jnp.zeros((self.num_agents,), dtype=jnp.int32),
+                last_toggle_t=jnp.full((self.num_agents,), -1_000_000, dtype=jnp.int32),
             )
 
         def reset(

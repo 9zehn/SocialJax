@@ -153,6 +153,45 @@ def test_freeze_share_state_makes_an_imposed_pattern_binding():
     assert np.all(np.array(ns2.share_expiry_t) > 0), "unfrozen pledges must still work"
 
 
+# ----------------------------------------------------------- toggle cooldown
+
+def test_toggle_cooldown_rate_limits_flips():
+    """Blocks the "fake supporter" exploit: because the tithe only takes a slice of
+    income actually earned, holding the toggle ON while idle is free, so an agent could
+    look like a payer and flip OFF just before harvesting. A minimum dwell time between
+    flips means a displayed pledge must be honoured across a whole window."""
+    from socialjax.environments.cleanup.clean_up import Actions
+    PAY = int(Actions.pay)
+    env = _env(pay_mode="on", pay_scheme="tithe", toggle_cooldown=25)
+    key = jax.random.PRNGKey(0)
+    _, s = env.reset(key)
+    flips, prev = [], 0
+    for t in range(60):
+        _, s, _, _, info = env.step_env(key, s, [PAY] + [STAY] * 6)
+        cur = int(np.array(info["share_active"])[0])
+        if cur != prev:
+            flips.append(t)
+        prev = cur
+    assert flips == [0, 25, 50], f"expected flips every 25 steps, got {flips}"
+
+
+def test_toggle_cooldown_defaults_to_pledge_semantics():
+    """cooldown=0 must keep the original pledge-for-share_duration behaviour."""
+    from socialjax.environments.cleanup.clean_up import Actions
+    PAY = int(Actions.pay)
+    env = _env(pay_mode="on", pay_scheme="tithe")
+    key = jax.random.PRNGKey(0)
+    _, s = env.reset(key)
+    _, ns, _, _, _ = env.step_env(key, s, [PAY] + [STAY] * 6)
+    assert int(np.array(ns.share_expiry_t)[0]) == env.share_duration
+
+
+def test_dirt_rate_three_per_step_config():
+    """The configuration used for the two-phase experiments."""
+    r = _dirt_rate(dirt_spawn_cells=3, dirtSpawnProbability=1.0)
+    assert abs(r - 3.0) < 0.3, f"expected ~3 dirt/step, got {r}"
+
+
 ALL_TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 if __name__ == "__main__":
