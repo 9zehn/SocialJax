@@ -33,6 +33,21 @@ def single_run(config, make_train, *, wandb_name):
     train_state = out["runner_state"][0]
     for i in range(num_agents):
         save_params(train_state[i], f"./checkpoints/moca/{filename}_{i}.pkl")
+
+    if "proposal_state" not in out:
+        # Solver phase 2: nothing is learned in phase 2, so the run's result is the
+        # contract the search settled on, which lives in the logged metrics rather
+        # than in any saved policy.
+        theta = np.array(out["metrics_phase2"]["stage_2/contract_theta_effective"])
+        null_rate = np.array(out["metrics_phase2"]["stage_2/solver_null_rate"])
+        tail = max(len(theta) // 10, 1)
+        print("\n=== Solver-selected contracts ===")
+        print(f"  mean theta over phase 2 : {theta.mean():.4f}")
+        print(f"  mean theta (last 10%)   : {theta[-tail:].mean():.4f}")
+        print(f"  null-contract rate      : {null_rate.mean():.4f}")
+        return out
+
+    for i in range(num_agents):
         save_params(out["proposal_state"][i], f"./checkpoints/moca/{filename}_proposal_{i}.pkl")
         save_params(out["voting_state"][i], f"./checkpoints/moca/{filename}_voting_{i}.pkl")
 

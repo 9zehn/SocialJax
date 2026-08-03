@@ -250,6 +250,77 @@ def test_phase_split_follows_algorithm_1():
     assert cfg["NUM_UPDATES_PHASE1"] == 90 and cfg["NUM_UPDATES_PHASE2"] == 10
 
 
+# ------------------------------------------------------- solver phase 2
+
+def test_solver_sampling_is_continuous_with_null_first():
+    """The reference samples from gym.spaces.Box, not a grid, and always scores the
+    null contract alongside the samples."""
+    from algorithms.MOCA.solver import sample_contract_candidates
+    c = CleanupContract(4, 0.0, 0.2)
+    thetas = np.array(sample_contract_candidates(jax.random.PRNGKey(0), c, 50, 8))
+    assert thetas.shape == (51, 8), thetas.shape
+    assert np.all(thetas[0] == 0.0), "row 0 must be the null contract"
+    assert thetas.min() >= 0.0 and thetas.max() <= 0.2
+    # Continuous: 50 draws should essentially never land on an 11-point grid.
+    on_grid = np.isclose(thetas[1:, :, None], np.linspace(0, 0.2, 11)).any(axis=-1)
+    assert on_grid.mean() < 0.05, "samples look discretised, not continuous"
+
+
+def test_solver_majority_rule_respects_acceptance():
+    """Highest-welfare contract loses to a lower-welfare one when a majority would
+    reject it: the rule maximises welfare SUBJECT TO majority acceptance."""
+    from algorithms.MOCA.solver import select_contract
+    # 5 agents, 1 env. Row 0 = null (the disagreement point).
+    values = jnp.array([
+        [[10.0], [10.0], [10.0], [10.0], [10.0]],   # k=0 null,  welfare 50
+        [[40.0], [9.0], [9.0], [9.0], [9.0]],       # k=1 welfare 76, only 1 accepts
+        [[12.0], [12.0], [12.0], [9.0], [9.0]],     # k=2 welfare 54, 3 accept
+    ])
+    assert int(select_contract(values, "majority")[0]) == 2, "majority rule ignored"
+    # The unconstrained rule takes the welfare-maximising contract regardless.
+    assert int(select_contract(values, "max")[0]) == 1, "max rule should ignore acceptance"
+
+
+def test_solver_falls_back_to_null_contract():
+    """When every sampled contract would be rejected by a majority, the solver must
+    still return something -- the reference seeds the accepted set with the null
+    contract precisely so this cannot fail."""
+    from algorithms.MOCA.solver import select_contract
+    values = jnp.array([
+        [[10.0], [10.0], [10.0]],                   # null
+        [[30.0], [1.0], [1.0]],                     # higher welfare, 2 of 3 reject
+        [[25.0], [2.0], [2.0]],                     # higher welfare, 2 of 3 reject
+    ])
+    assert int(select_contract(values, "majority")[0]) == 0
+
+
+def test_solver_rejects_unknown_decision_rule():
+    from algorithms.MOCA.solver import select_contract
+    try:
+        select_contract(jnp.zeros((2, 3, 1)), "nope")
+    except ValueError as e:
+        assert "decision rule" in str(e)
+    else:
+        raise AssertionError("unknown decision rule should raise")
+
+
+def test_solver_values_come_from_the_frozen_critic():
+    """contract_values must return V_i(s_0, theta) per (contract, agent, env), and
+    must actually vary with theta -- a critic blind to the contract would make every
+    candidate score identically and the search meaningless."""
+    from algorithms.MOCA.solver import contract_values
+    c = CleanupContract(3, 0.0, 0.2)
+    nets = [ContractActorCritic(9) for _ in range(3)]
+    obs = jnp.zeros((3, 4, 11, 11, 19))              # (N, num_envs, ...)
+    params = [nets[i].init(jax.random.PRNGKey(i), obs[i], jnp.zeros((4, 2)))
+              for i in range(3)]
+    thetas = jnp.array([[0.0] * 4, [0.1] * 4, [0.2] * 4])
+    vals = contract_values(nets, params, obs, c, thetas)
+    assert vals.shape == (3, 3, 4), vals.shape
+    assert not np.allclose(np.array(vals[0]), np.array(vals[2])), \
+        "values do not depend on the contract"
+
+
 def _phase2_cfg(**overrides):
     """Tiny end-to-end MOCA config that still exercises the real phase-2 code path."""
     cfg = {
@@ -260,6 +331,8 @@ def _phase2_cfg(**overrides):
         "CONTRACT_SPACE": "cleanup", "CONTRACT_LOW": 0.0, "CONTRACT_HIGH": 0.2,
         "NUM_CONTRACT_BINS": 11, "PHASE1_FRAC": 0.5, "NULL_CONTRACT_PROB": 0.1,
         "CONTRACT_LR": 0.3, "VOTER_SAMPLE_NU": 2, "CONTRACT_MINIBATCHES": 4,
+        "PHASE2_MODE": "reinforce", "SOLVER_SAMPLES": 12,
+        "SOLVER_DECISION_RULE": "majority",
         "ENV_NAME": "clean_up", "TOTAL_TIMESTEPS": 20 * 8 * 20,
         "EVALUATE": False, "CHECKPOINT_EVERY": 10 ** 9, "PROGRESS_EVERY": 10 ** 9,
         "ENV_KWARGS": {"num_agents": 5, "num_inner_steps": 20, "shared_rewards": False,
@@ -275,39 +348,41 @@ def _phase2_subprocess_main():
     Invoked in a child process by _run_phase2: executing a full jitted make_train
     leaves this JAX/macOS build in a state where subsequent jit work aborts the
     interpreter (`recursive_mutex lock failed`), which predates and is unrelated to
-    what is under test here. Isolating it keeps the rest of the suite runnable.
+    what is under test here. Isolating it keeps the rest of the suite runnable, and
+    lets each PHASE2_MODE get a clean process.
     """
     import json
     import os
+    mode = sys.argv[1]
     os.environ["WANDB_MODE"] = "disabled"
     import wandb
     wandb.init(mode="disabled")
     from algorithms.MOCA.moca_cnn_cleanup import make_train
 
-    cfg = _phase2_cfg()
+    cfg = _phase2_cfg(PHASE2_MODE=mode)
     out = jax.jit(make_train(cfg))(jax.random.PRNGKey(0))
     m = out["metrics_phase2"]
-    payload = {k: np.array(m[k]).tolist() for k in (
-        "stage_2/contract_accept_rate", "stage_2/contract_proposal_entropy")}
+    payload = {k: np.array(v).tolist() for k, v in m.items()}
+    payload["__has_proposal_state__"] = "proposal_state" in out
     print("@@JSON@@" + json.dumps(payload))
 
 
-def _run_phase2():
+def _run_phase2(mode="reinforce"):
     import json
     import subprocess
     proc = subprocess.run(
         [sys.executable, "-c",
          "import sys; sys.path.insert(0, %r); "
          "import tests.test_moca as t; t._phase2_subprocess_main()"
-         % str(Path(__file__).resolve().parents[1])],
+         % str(Path(__file__).resolve().parents[1]), mode],
         capture_output=True, text=True, timeout=1800,
     )
     line = next((l for l in proc.stdout.splitlines() if l.startswith("@@JSON@@")), None)
     assert line is not None, (
-        f"phase-2 subprocess produced no metrics (exit {proc.returncode})\n"
+        f"phase-2 subprocess ({mode}) produced no metrics (exit {proc.returncode})\n"
         f"--- stdout ---\n{proc.stdout[-2000:]}\n--- stderr ---\n{proc.stderr[-2000:]}"
     )
-    return json.loads(line[len("@@JSON@@"):]), _phase2_cfg()
+    return json.loads(line[len("@@JSON@@"):]), _phase2_cfg(PHASE2_MODE=mode)
 
 
 def test_phase2_signs_contracts_and_leaves_uniform():
@@ -325,7 +400,7 @@ def test_phase2_signs_contracts_and_leaves_uniform():
        left a full 7-agent run at exactly maximum entropy, with an argmax that was
        pure tie-breaking noise.
     """
-    m, cfg = _run_phase2()
+    m, cfg = _run_phase2("reinforce")
     num_agents = cfg["ENV_KWARGS"]["num_agents"]
 
     rate = float(np.mean(np.array(m["stage_2/contract_accept_rate"])))
@@ -342,6 +417,38 @@ def test_phase2_signs_contracts_and_leaves_uniform():
         f"proposal policy still at ~maximum entropy ({ent[-1]:.3f} vs log K = {ent_max:.3f}): "
         f"phase 2 learned nothing"
     )
+
+
+def test_solver_phase2_runs_end_to_end():
+    """Solver mode must complete a run, log its own metric set, and store no
+    contracting policies -- there are none to learn."""
+    m, cfg = _run_phase2("solver")
+    assert m["__has_proposal_state__"] is False, \
+        "solver phase 2 must not produce proposal/voting state"
+    for k in ("stage_2/contract_theta_effective", "stage_2/solver_null_rate",
+              "stage_2/solver_accept_count", "stage_2/welfare", "stage_2/equality"):
+        assert k in m, f"missing solver metric {k}; got {sorted(m)}"
+    # Proposal-game metrics must be absent: there is no proposer in this mode.
+    assert "stage_2/contract_accept_rate" not in m
+    theta = np.array(m["stage_2/contract_theta_effective"])
+    lo, hi = cfg["CONTRACT_LOW"], cfg["CONTRACT_HIGH"]
+    assert np.all((theta >= lo) & (theta <= hi)), f"theta out of range: {theta}"
+    null_rate = np.array(m["stage_2/solver_null_rate"])
+    assert np.all((null_rate >= 0.0) & (null_rate <= 1.0))
+
+
+def test_phase2_mode_validated():
+    from algorithms.MOCA.moca_cnn_cleanup import make_train
+    for bad, needle in ((dict(PHASE2_MODE="bogus"), "PHASE2_MODE"),
+                        (dict(PHASE2_MODE="solver", SOLVER_SAMPLES=0), "SOLVER_SAMPLES"),
+                        (dict(PHASE2_MODE="solver", SOLVER_DECISION_RULE="nope"),
+                         "SOLVER_DECISION_RULE")):
+        try:
+            make_train(_phase2_cfg(**bad))
+        except ValueError as e:
+            assert needle in str(e), f"{bad} raised the wrong error: {e}"
+        else:
+            raise AssertionError(f"{bad} should raise ValueError")
 
 
 def test_phase2_budget_configs_validated():

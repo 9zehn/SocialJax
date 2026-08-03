@@ -36,6 +36,29 @@
 # Probability that phase 1 draws the NULL contract instead of a uniform sample, so
 # the policy keeps experience of playing uncontracted (reference impl: null_prob).
 "NULL_CONTRACT_PROB": 0.1
+# Which phase 2 to run.
+#   "solver"    -- the sampling-based NegotiationSolver. This is what the paper's
+#                  Cleanup experiments actually ran: cleanup-contracting.json sets
+#                  "solver": true, and ray_config_utils.py then sets
+#                  negotiate=False, disabling the learned proposal game entirely.
+#                  No proposer, no voting; contracts are scored by the frozen
+#                  critic and chosen by a majority decision rule.
+#   "reinforce" -- this repo's discretised proposal/voting game (VOTER_SAMPLE_NU,
+#                  CONTRACT_* settings below). Kept so the two can be compared.
+"PHASE2_MODE": "solver"
+
+# ---- Solver phase 2 (PHASE2_MODE: solver) ---------------------------------
+# Contracts sampled per negotiation, drawn from the CONTINUOUS contract space --
+# the reference default (NegotiationSolver's contract_samples=50). The null
+# contract is always evaluated in addition to these.
+"SOLVER_SAMPLES": 50
+# "majority": maximise summed agent values subject to at least half the agents
+# preferring the contract to the null contract (the reference default, and the
+# rule behind the published Cleanup numbers). "max": pure welfare maximisation,
+# ignoring whether agents would accept.
+"SOLVER_DECISION_RULE": "majority"
+
+# ---- REINFORCE phase 2 (PHASE2_MODE: reinforce) ---------------------------
 # Number of non-proposing agents polled on a proposal. The paper samples nu agents
 # from the non-proposers and uses only their accept/reject probabilities, reporting
 # nu=2 as strong across all domains. Do NOT set this to num_agents-1 ("poll

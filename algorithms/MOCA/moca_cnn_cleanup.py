@@ -42,6 +42,7 @@ from socialjax.wrappers.baselines import LogWrapper
 import wandb
 
 from algorithms.utils import checkpoint_filename, save_params, save_train_state
+from algorithms.MOCA import solver
 from algorithms.MOCA.contracts import make_contract
 from algorithms.MOCA.networks import ContractActorCritic, ProposalPolicy, VotingPolicy
 
@@ -125,6 +126,19 @@ STAGE2_METRICS = (
     "equality",
 )
 
+# Solver phase 2 has no proposal or acceptance policy to track, so its diagnostics
+# are about what the sampling search settled on instead.
+STAGE2_SOLVER_METRICS = (
+    "contract_theta_effective",
+    "contract_theta_std",       # do the per-env negotiations agree?
+    "solver_null_rate",         # how often nothing beat the null contract
+    "solver_accept_count",      # agents preferring the chosen contract to null
+    "solver_value_gain",        # predicted welfare gain over the null contract
+    "cleaned_by_agent_mean",
+    "welfare",
+    "equality",
+)
+
 
 def _select(metrics: dict, allowed: Tuple[str, ...]) -> dict:
     """Restrict `metrics` to `allowed`, raising if a name in the allowlist is absent.
@@ -190,6 +204,26 @@ def make_train(config):
         config["NUM_UPDATES"] - config["NUM_UPDATES_PHASE1"], 1
     )
 
+    # Which phase 2 to run. "solver" is what the paper's Cleanup experiments used
+    # (see algorithms/MOCA/solver.py); "reinforce" is this repo's discretised
+    # proposal/voting game, kept selectable so both can be compared.
+    phase2_mode = config.get("PHASE2_MODE", "solver")
+    if phase2_mode not in ("solver", "reinforce"):
+        raise ValueError(
+            f"PHASE2_MODE must be 'solver' or 'reinforce', got {phase2_mode!r}"
+        )
+    config["PHASE2_MODE"] = phase2_mode
+    if phase2_mode == "solver":
+        config.setdefault("SOLVER_SAMPLES", 50)
+        config.setdefault("SOLVER_DECISION_RULE", "majority")
+        if config["SOLVER_SAMPLES"] < 1:
+            raise ValueError(f"SOLVER_SAMPLES must be >= 1, got {config['SOLVER_SAMPLES']}")
+        if config["SOLVER_DECISION_RULE"] not in ("majority", "max"):
+            raise ValueError(
+                f"SOLVER_DECISION_RULE must be 'majority' or 'max', got "
+                f"{config['SOLVER_DECISION_RULE']!r}"
+            )
+
     # Number of non-proposers polled on a proposal. The paper does NOT poll every
     # agent: "we sample nu agents from the space of non-proposing agents, and only
     # use these agent's accept-reject probabilities in determining contract
@@ -214,7 +248,7 @@ def make_train(config):
         )
     config["CONTRACT_MINIBATCHES"] = n_contract_mb
     logit_budget = config["NUM_UPDATES_PHASE2"] * n_contract_mb * config["CONTRACT_LR"]
-    if logit_budget < 3.0:
+    if phase2_mode == "reinforce" and logit_budget < 3.0:
         print(
             f"[MOCA warning] phase-2 logit budget is only "
             f"{config['NUM_UPDATES_PHASE2']} updates x {n_contract_mb} minibatches x "
@@ -680,6 +714,60 @@ def make_train(config):
             return (frozen_params, proposal_state, voting_state,
                     env_state, last_obs, update_step, rng), out
 
+        # =================================================================
+        # PHASE 2 (solver) -- no proposal game: sample contracts, score them
+        # with the frozen critic, pick one by the decision rule, play it.
+        # This is what the paper's Cleanup experiments actually ran; see
+        # algorithms/MOCA/solver.py for the provenance.
+        # =================================================================
+        def _update_step_phase2_solver(runner_state, unused):
+            (frozen_params, env_state, last_obs, update_step, rng) = runner_state
+
+            rng, k_neg = jax.random.split(rng)
+            # last_obs is the initial state of the episode about to be played: one
+            # rollout is exactly one episode and the env auto-resets at the end, so
+            # the observation carried out of the previous rollout is s_0 here.
+            obs_batch = jnp.transpose(last_obs, (1, 0, 2, 3, 4))
+            theta_eff, solver_info = solver.negotiate(
+                k_neg, network, frozen_params, obs_batch, contract,
+                config["SOLVER_SAMPLES"], config["SOLVER_DECISION_RULE"],
+            )
+
+            traj_batch, env_state, last_obs, rng = rollout(
+                frozen_params, env_state, last_obs, theta_eff, rng
+            )
+
+            update_step = update_step + 1
+
+            metric = jax.tree.map(
+                lambda x: x.mean(), [dict(traj_batch[i].info) for i in range(num_agents)]
+            )
+            keys = list(metric[0].keys())
+            stacked = {k: jnp.stack([d[k] for d in metric]) for k in keys}
+            out = {}
+            for k, v in stacked.items():
+                out[f"{k}_mean"] = v.mean()
+                out[f"{k}_std"] = v.std()
+            out["contract_theta_effective"] = theta_eff.mean()
+            # Spread across envs: each env negotiates its own episode, so this says
+            # whether the solver converges on one contract or keeps disagreeing.
+            out["contract_theta_std"] = theta_eff.std()
+            out.update(solver_info)
+            stats = episode_stats(traj_batch, num_agents)
+            out["welfare"] = stats["welfare"]
+            out["equality"] = stats["equality"]
+            out["transfer_volume"] = stats["transfer_volume"]
+            out = {f"stage_2/{k}": v for k, v in _select(out, STAGE2_SOLVER_METRICS).items()}
+            out["phase"] = jnp.float32(2.0)
+            out["update_step"] = update_step
+            out["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
+            jax.debug.callback(log_callback, out)
+            jax.debug.callback(
+                progress_callback, update_step, out["stage_2/welfare"], 2
+            )
+
+            return (frozen_params, env_state, last_obs, update_step, rng), out
+
         # ----------------------------------------------------------- callbacks
         def log_callback(metric):
             wandb.log({k: float(v) for k, v in metric.items()})
@@ -745,20 +833,31 @@ def make_train(config):
         train_state, env_state, last_obs, update_step, rng = runner_state
         frozen_params = [ts.params for ts in train_state]
 
-        runner_state2 = (frozen_params, proposal_state, voting_state,
-                         env_state, last_obs, update_step, rng)
-        runner_state2, metric2 = jax.lax.scan(
-            _update_step_phase2, runner_state2, None, config["NUM_UPDATES_PHASE2"]
-        )
-
-        return {
+        out = {
             "runner_state": (train_state,),
-            "proposal_state": runner_state2[1],
-            "voting_state": runner_state2[2],
             "contract_grid": contract_grid,
             "metrics_phase1": metric1,
-            "metrics_phase2": metric2,
         }
+
+        if phase2_mode == "solver":
+            # No contracting policies to carry: the solver reads the frozen critic
+            # and picks a contract, so phase 2 learns nothing and stores nothing.
+            runner_state2 = (frozen_params, env_state, last_obs, update_step, rng)
+            runner_state2, metric2 = jax.lax.scan(
+                _update_step_phase2_solver, runner_state2, None,
+                config["NUM_UPDATES_PHASE2"],
+            )
+        else:
+            runner_state2 = (frozen_params, proposal_state, voting_state,
+                             env_state, last_obs, update_step, rng)
+            runner_state2, metric2 = jax.lax.scan(
+                _update_step_phase2, runner_state2, None, config["NUM_UPDATES_PHASE2"]
+            )
+            out["proposal_state"] = runner_state2[1]
+            out["voting_state"] = runner_state2[2]
+
+        out["metrics_phase2"] = metric2
+        return out
 
     return train
 
