@@ -469,21 +469,26 @@ class Clean_up(MultiAgentEnv):
         s_interest_change_every=30000000,
         cf=False,
         cf_alpha=1,
-        # Upstream (cooperativex/SocialJax) uses 0.05. Lowered so apples are a
-        # scarcer flow: the same cleaning effort now buys less harvest, which widens
-        # the gap between a fouled and a maintained river without touching the
-        # depletion threshold that gates growth entirely.
-        maxAppleGrowthRate=0.04,
+        # Upstream (cooperativex/SocialJax) value, kept. Lowering this was tried and
+        # reverted: because appleDecayProbability defaults to 0.0, apples PERSIST and
+        # accumulate as a stock, so the growth rate only sets how fast the map refills,
+        # not how many apples stand at equilibrium. On a clean river both 0.04 and 0.05
+        # saturate all 122 sites by ~step 100 (105 vs 111 standing at step 50), so the
+        # knob barely moves scarcity. Making apples genuinely scarce means giving them
+        # a decay rate -- equilibrium stock is growth/(growth+decay) -- not slowing
+        # growth.
+        maxAppleGrowthRate=0.05,
         thresholdDepletion=0.4,  # 0.4
         thresholdRestoration=0.0,
         # Upstream value. See dirt_spawn_cells below: the pair sets the dirt rate.
         dirtSpawnProbability=0.5,
-        # Upstream waits 50 steps before any dirt spawns. Starting at 0 means the
-        # river is degrading from the first step, so there is no free window in which
-        # apples grow without anyone having cleaned -- the episode opens already
-        # above the depletion threshold (0.473 dirt fraction at reset against a 0.4
-        # growth gate), and it keeps getting worse until someone acts.
-        delayStartOfDirtSpawning=0,
+        # Upstream waits 50 steps before any dirt spawns, which is long enough for
+        # apples to reach the map before anyone has had to clean, front-loading free
+        # reward and muting the dilemma early in an episode. 25 keeps a short settling
+        # window but halves it. Note the river opens ALREADY fouled -- 0.473 dirt
+        # fraction at reset against a 0.4 growth gate -- so even during the delay
+        # roughly 13 cells must be cleared before a single apple grows.
+        delayStartOfDirtSpawning=25,
         # --- ecology balance -------------------------------------------------
         # How many candidate cells may turn to dirt per step; expected dirt per step
         # is dirt_spawn_cells * dirtSpawnProbability.

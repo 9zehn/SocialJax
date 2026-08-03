@@ -79,10 +79,10 @@ def test_default_dirt_rate_is_raised_but_still_clearable():
     )
 
 
-def test_dirt_spawns_from_the_first_step():
-    """No grace window: upstream's 50-step delay let apples grow before anyone had to
-    clean, which front-loads free reward and mutes the dilemma early in an episode."""
-    assert _env().delayStartOfDirtSpawning == 0
+def test_dirt_spawn_delay_is_halved_from_upstream():
+    """Upstream's 50-step grace window let apples reach the map before anyone had to
+    clean, front-loading free reward and muting the dilemma early in an episode."""
+    assert _env().delayStartOfDirtSpawning == 25
 
 
 def test_upstream_ecology_is_still_reachable():
@@ -93,10 +93,14 @@ def test_upstream_ecology_is_still_reachable():
     assert _env(maxAppleGrowthRate=0.05).maxAppleGrowthRate == 0.05
 
 
-def test_apple_growth_rate_is_below_upstream():
-    """Apples are deliberately scarcer than upstream's 0.05, so a fouled river costs
-    more harvest for the same cleaning effort."""
-    assert _env().maxAppleGrowthRate < 0.05
+def test_apple_growth_matches_upstream():
+    """Apple growth is left at upstream's rate on purpose. Lowering it was tried and
+    reverted: with appleDecayProbability at 0.0 apples persist and accumulate as a
+    stock, so growth sets the refill speed, not the standing quantity -- both 0.04
+    and 0.05 saturate every site within ~100 steps of a clean river. Scarcity has to
+    come from decay, which test_decay_reaches_a_nonzero_equilibrium_while_clean
+    covers."""
+    assert _env().maxAppleGrowthRate == 0.05
 
 
 def test_dirt_spawn_cells_scales_the_rate():
