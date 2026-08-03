@@ -240,10 +240,19 @@ def make_train(config):
                 f"NEGOTIATE_NU must be in [1, {num_agents - 1}], "
                 f"got {config['NEGOTIATE_NU']}"
             )
-        if config.get("NEGOTIATE_LR") is None:
-            config["NEGOTIATE_LR"] = 5e-4
-        if config.get("NEGOTIATE_UPDATE_EPOCHS") is None:
-            config["NEGOTIATE_UPDATE_EPOCHS"] = 4
+        # Appendix D of the extended paper. Its PPO settings are stated "for all
+        # experiments in all domains", but they are applied to the negotiation
+        # stage only: phase 1 here is this repo's existing CNN/Adam PPO setup,
+        # shared with the IPPO arms, and retuning it to the paper's SGD/MLP
+        # configuration would make the phase-1 policy incomparable to them.
+        for key, value in (
+            ("NEGOTIATE_LR", 1e-4),            # D.1: "a learning rate of 1e-4"
+            ("NEGOTIATE_UPDATE_EPOCHS", 30),   # D.1: "30 SGD updates per iteration"
+            ("NEGOTIATE_CLIP_EPS", 0.3),       # D.4: "clip parameter of 0.3"
+            ("NEGOTIATE_VF_COEF", 1.0),        # D.4: "value function coefficient of 1.0"
+        ):
+            if config.get(key) is None:
+                config[key] = value
     nu_neg = config.get("NEGOTIATE_NU") or negotiate.default_nu(num_agents)
     if phase2_mode == "solver":
         config.setdefault("SOLVER_SAMPLES", 50)
@@ -384,7 +393,7 @@ def make_train(config):
         ]
         negotiate_tx = optax.chain(
             optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-            optax.adam(config.get("NEGOTIATE_LR", 5e-4), eps=1e-5),
+            optax.adam(config.get("NEGOTIATE_LR") or 1e-4, eps=1e-5),
         )
         negotiate_state = [
             TrainState.create(
@@ -893,12 +902,16 @@ def make_train(config):
                     logp = pi.log_prob(raws[t, i])
                     ratio = jnp.exp(logp - logps[t, i])
                     a = adv_i[t]
+                    clip_eps = config["NEGOTIATE_CLIP_EPS"]
                     actor = -jnp.minimum(
                         ratio * a,
-                        jnp.clip(ratio, 1.0 - config["CLIP_EPS"], 1.0 + config["CLIP_EPS"]) * a,
+                        jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * a,
                     ).mean()
                     v_loss = jnp.square(value - targets[t, i]).mean()
-                    loss = loss + actor + config["VF_COEF"] * v_loss
+                    # No entropy bonus: Appendix D.4 gives an entropy coefficient of
+                    # 0.0, so exploration in the contract space comes from the
+                    # Gaussian's own learned scale rather than an added term.
+                    loss = loss + actor + config["NEGOTIATE_VF_COEF"] * v_loss
                 return loss
 
             def _epoch(state, unused):
