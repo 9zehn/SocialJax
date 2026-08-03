@@ -31,7 +31,7 @@ and voting policy, and the specialisation this environment is studied for (some
 agents cleaning, others harvesting) requires distinct gameplay policies too.
 """
 import time
-from typing import NamedTuple
+from typing import NamedTuple, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -85,6 +85,62 @@ def episode_stats(traj_batch, num_agents):
     }
 
 
+# Metrics forwarded to wandb, one namespaced set per phase. Deliberately short:
+# logging the whole info dict crossed with _mean/_std produces 30+ stage-1 and 49
+# stage-2 series, which buries the handful that decide whether a run worked.
+# Anything dropped here is still recoverable from the saved checkpoints.
+STAGE1_METRICS = (
+    # Learning curve and the emergent division of labour it produces.
+    "returned_episode_returns_mean",   # per-agent episode return
+    "returned_episode_returns_std",    # spread ACROSS agents = specialisation
+    "shaped_rewards_mean",             # read by progress_callback
+    "cleaned_by_agent_mean",           # public-good provision
+    "cleaned_by_agent_std",            # is cleaning concentrated in a few agents?
+    # Outcome measures the contracting results are stated in.
+    "welfare",
+    "equality",
+    "transfer_volume",
+    # PPO health.
+    "loss_mean",
+    "value_loss_mean",
+    "entropy_mean",
+    # Sanity check on P(Theta): phase 1 must see the whole contract space.
+    "contract_theta_sampled",
+)
+
+STAGE2_METRICS = (
+    # What is offered, what ends up in force, and whether it is signed at all.
+    "contract_theta_proposed",
+    "contract_theta_effective",
+    "contract_accept_rate",
+    # Convergence diagnostic. Starts at log(NUM_CONTRACT_BINS) and MUST fall: a run
+    # that ends at the maximum has learned nothing, whatever its argmax says.
+    "contract_proposal_entropy",
+    # Did the contract change behaviour? Transfers are zero-sum, so welfare can
+    # only move if cleaning does.
+    "cleaned_by_agent_mean",
+    "transfer_volume",
+    # Headline outcomes.
+    "welfare",
+    "equality",
+)
+
+
+def _select(metrics: dict, allowed: Tuple[str, ...]) -> dict:
+    """Restrict `metrics` to `allowed`, raising if a name in the allowlist is absent.
+
+    A silent miss would drop the series from wandb with no error anywhere, which is
+    exactly how a broken run looks identical to a working one.
+    """
+    missing = [k for k in allowed if k not in metrics]
+    if missing:
+        raise KeyError(
+            f"metric allowlist names not produced by this phase: {missing}. "
+            f"Available: {sorted(metrics)}"
+        )
+    return {k: metrics[k] for k in allowed}
+
+
 class MOCATransition(NamedTuple):
     """PPO transition, plus the contract features the policy was conditioned on."""
     done: jnp.ndarray
@@ -133,6 +189,41 @@ def make_train(config):
     config["NUM_UPDATES_PHASE2"] = max(
         config["NUM_UPDATES"] - config["NUM_UPDATES_PHASE1"], 1
     )
+
+    # Number of non-proposers polled on a proposal. The paper does NOT poll every
+    # agent: "we sample nu agents from the space of non-proposing agents, and only
+    # use these agent's accept-reject probabilities in determining contract
+    # acceptance", with nu=2 reported as strong across all domains.
+    nu = int(config.get("VOTER_SAMPLE_NU", 2))
+    if not 1 <= nu <= num_agents - 1:
+        raise ValueError(
+            f"VOTER_SAMPLE_NU must be in [1, num_agents-1] = [1, {num_agents - 1}], got {nu}"
+        )
+    config["VOTER_SAMPLE_NU"] = nu
+
+    # Algorithm 1 takes one gradient step per EPISODE. A phase-2 update here plays
+    # NUM_ENVS episodes in parallel, so folding them into a single step costs a
+    # factor of NUM_ENVS in gradient steps -- and Adam displaces each logit by at
+    # most CONTRACT_LR per step, capping total movement at
+    # NUM_UPDATES_PHASE2 * CONTRACT_LR. Splitting each batch into sequential
+    # minibatch updates restores the granularity Algorithm 1 assumes.
+    n_contract_mb = int(config.get("CONTRACT_MINIBATCHES", 1))
+    if config["NUM_ENVS"] % n_contract_mb != 0:
+        raise ValueError(
+            f"CONTRACT_MINIBATCHES={n_contract_mb} must divide NUM_ENVS={config['NUM_ENVS']}"
+        )
+    config["CONTRACT_MINIBATCHES"] = n_contract_mb
+    logit_budget = config["NUM_UPDATES_PHASE2"] * n_contract_mb * config["CONTRACT_LR"]
+    if logit_budget < 3.0:
+        print(
+            f"[MOCA warning] phase-2 logit budget is only "
+            f"{config['NUM_UPDATES_PHASE2']} updates x {n_contract_mb} minibatches x "
+            f"CONTRACT_LR={config['CONTRACT_LR']} = {logit_budget:.2f}. Adam moves a "
+            f"logit by at most CONTRACT_LR per step, and a categorical needs logit "
+            f"gaps of ~3-5 to depart from uniform, so the proposal policy cannot "
+            f"converge. Raise CONTRACT_LR, CONTRACT_MINIBATCHES, or the phase-2 share.",
+            flush=True,
+        )
 
     contract = make_contract(
         config.get("CONTRACT_SPACE", "cleanup"),
@@ -407,7 +498,7 @@ def make_train(config):
             # Namespaced by stage, as the reference logger does (stage_1/..., stage_2/...):
             # the two phases measure different things, so sharing a key would splice a
             # subgame-learning curve onto a contract-negotiation curve.
-            out = {f"stage_1/{k}": v for k, v in out.items()}
+            out = {f"stage_1/{k}": v for k, v in _select(out, STAGE1_METRICS).items()}
             out["phase"] = jnp.float32(1.0)
             out["update_step"] = update_step
             out["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
@@ -426,7 +517,7 @@ def make_train(config):
              env_state, last_obs, update_step, rng) = runner_state
 
             # -- contracting stage: propose, then vote --
-            rng, k_prop, k_idx, k_vote = jax.random.split(rng, 4)
+            rng, k_prop, k_idx, k_vote, k_sel = jax.random.split(rng, 5)
             proposer = jax.random.randint(k_prop, (config["NUM_ENVS"],), 0, num_agents)
             proposer_onehot = jax.nn.one_hot(proposer, num_agents)
 
@@ -439,10 +530,19 @@ def make_train(config):
             theta_prop = contract_grid[idx]
             theta_norm = (theta_prop - contract.low) / (contract.high - contract.low)
 
-            # Unanimous consent: every non-proposer must accept. (The paper also
-            # explores sampling nu voters to cut exploration variance; with only a
-            # handful of agents we poll all of them, which is the rule the theory
-            # is stated for.)
+            # Sample nu voters uniformly WITHOUT replacement from the non-proposers;
+            # only their accept/reject probabilities bind. Polling all N-1 agents
+            # instead makes acceptance a product of N-1 roughly-even probabilities --
+            # 0.5**6 = 1.6% at N=7, since VotingPolicy initialises near 50/50 -- so
+            # almost every episode falls back to the null contract and the proposal
+            # gradient is dominated by rollouts in which theta had no effect at all.
+            u = jax.random.uniform(k_sel, (num_agents, config["NUM_ENVS"]))
+            u = jnp.where(
+                jnp.arange(num_agents)[:, None] == proposer[None, :], 2.0, u
+            )                                            # proposer is never sampled
+            rank = jnp.argsort(jnp.argsort(u, axis=0), axis=0)
+            voter_mask = rank < nu                       # (N, NUM_ENVS)
+
             vote_keys = jax.random.split(k_vote, num_agents)
             votes = []
             accept_all = jnp.ones((config["NUM_ENVS"],), dtype=bool)
@@ -450,9 +550,8 @@ def make_train(config):
                 pi_j = voting_net[j].apply(voting_state[j].params, proposer_onehot, theta_norm)
                 v_j = pi_j.sample(seed=vote_keys[j])     # 0 = reject, 1 = accept
                 votes.append(v_j)
-                is_proposer = proposer == j
-                accept_j = jnp.where(is_proposer, 1, v_j)   # a proposer backs its own offer
-                accept_all = accept_all & (accept_j == 1)
+                # Unsampled agents and the proposer do not get a veto.
+                accept_all = accept_all & jnp.where(voter_mask[j], v_j == 1, True)
             votes = jnp.stack(votes)                        # (N, NUM_ENVS)
 
             # Rejected proposals fall back to the null contract (no transfers).
@@ -473,26 +572,48 @@ def make_train(config):
             baseline = returns.mean(axis=1, keepdims=True)
             adv = returns - baseline                          # (N, NUM_ENVS)
 
-            def proposal_loss(params, i):
+            def proposal_loss(params, i, b):
                 pi = proposal_net[i].apply(params)
-                logp = pi.log_prob(idx)                       # (NUM_ENVS,)
+                logp = pi.log_prob(b["idx"])
                 # only envs where agent i actually proposed contribute
-                mask = (proposer == i).astype(jnp.float32)
+                mask = (b["proposer"] == i).astype(jnp.float32)
                 n = jnp.maximum(mask.sum(), 1.0)
-                return -(logp * adv[i] * mask).sum() / n
+                return -(logp * b["adv"][:, i] * mask).sum() / n
 
-            def voting_loss(params, j):
-                pi = voting_net[j].apply(params, proposer_onehot, theta_norm)
-                logp = pi.log_prob(votes[j])
-                mask = (proposer != j).astype(jnp.float32)    # proposers don't vote
+            def voting_loss(params, j, b):
+                pi = voting_net[j].apply(params, b["proposer_onehot"], b["theta_norm"])
+                logp = pi.log_prob(b["votes"][:, j])
+                # Only envs where j was one of the nu sampled voters: elsewhere its
+                # vote was discarded, so it cannot be credited or blamed for it.
+                mask = b["voter_mask"][:, j].astype(jnp.float32)
                 n = jnp.maximum(mask.sum(), 1.0)
-                return -(logp * adv[j] * mask).sum() / n
+                return -(logp * b["adv"][:, j] * mask).sum() / n
 
-            for i in range(num_agents):
-                g = jax.grad(proposal_loss)(proposal_state[i].params, i)
-                proposal_state[i] = proposal_state[i].apply_gradients(grads=g)
-                gv = jax.grad(voting_loss)(voting_state[i].params, i)
-                voting_state[i] = voting_state[i].apply_gradients(grads=gv)
+            # Sequential minibatch updates, recovering the per-episode gradient
+            # granularity of Algorithm 1 (see CONTRACT_MINIBATCHES in make_train).
+            n_mb, mb = config["CONTRACT_MINIBATCHES"], config["NUM_ENVS"] // config["CONTRACT_MINIBATCHES"]
+            mb_batch = {
+                "idx": idx.reshape(n_mb, mb),
+                "proposer": proposer.reshape(n_mb, mb),
+                "proposer_onehot": proposer_onehot.reshape(n_mb, mb, num_agents),
+                "theta_norm": theta_norm.reshape(n_mb, mb),
+                "votes": votes.T.reshape(n_mb, mb, num_agents),
+                "voter_mask": voter_mask.T.reshape(n_mb, mb, num_agents),
+                "adv": adv.T.reshape(n_mb, mb, num_agents),
+            }
+
+            def _contract_minibatch(states, b):
+                proposal_state, voting_state = states
+                for i in range(num_agents):
+                    g = jax.grad(proposal_loss)(proposal_state[i].params, i, b)
+                    proposal_state[i] = proposal_state[i].apply_gradients(grads=g)
+                    gv = jax.grad(voting_loss)(voting_state[i].params, i, b)
+                    voting_state[i] = voting_state[i].apply_gradients(grads=gv)
+                return (proposal_state, voting_state), None
+
+            (proposal_state, voting_state), _ = jax.lax.scan(
+                _contract_minibatch, (proposal_state, voting_state), mb_batch
+            )
 
             update_step = update_step + 1
             jax.debug.callback(
@@ -520,19 +641,40 @@ def make_train(config):
             # same the contracting policies get an exactly zero gradient.
             out["contract_returns_std"] = returns.std()
             out["contract_adv_absmean"] = jnp.abs(adv).mean()
-            probs = jax.nn.softmax(all_logits, axis=-1).mean(axis=0)  # (K,)
+            # Recomputed POST-update so the logged distribution is the current one.
+            post_logits = jnp.stack(
+                [proposal_net[i].apply(proposal_state[i].params).logits for i in range(num_agents)]
+            )                                                # (N, K)
+            per_agent_probs = jax.nn.softmax(post_logits, axis=-1)
+            probs = per_agent_probs.mean(axis=0)              # (K,)
             out["contract_proposal_argmax"] = contract_grid[jnp.argmax(probs)]
-            # Per-bin proposal mass: the shape of this distribution over training is
-            # the actual result of a MOCA run -- which contract the agents converge on.
+            # Entropy is the convergence diagnostic for phase 2: it starts at log(K)
+            # and must FALL for the proposal policy to have learned anything. A run
+            # that ends at log(K) has learned nothing, whatever its argmax says.
+            out["contract_proposal_entropy"] = -(
+                per_agent_probs * jnp.log(per_agent_probs + 1e-12)
+            ).sum(axis=-1).mean()
+            out["contract_proposal_entropy_max"] = jnp.log(
+                jnp.float32(config["NUM_CONTRACT_BINS"])
+            )
+            # Share of sampled voters that accepted, independent of whether the
+            # proposal cleared unanimity among them.
+            out["contract_voter_accept_rate"] = (
+                (votes * voter_mask).sum() / jnp.maximum(voter_mask.sum(), 1)
+            )
+            # Per-bin proposal mass. NOT logged per step -- it is NUM_CONTRACT_BINS
+            # series on its own, and contract_proposal_entropy summarises the same
+            # thing in one number. _runner.single_run prints the full converged
+            # distribution from the saved proposal checkpoints at the end of a run.
             for k in range(config["NUM_CONTRACT_BINS"]):
                 out[f"proposal_p_theta{contract_grid_labels[k]:.3f}"] = probs[k]
-            out = {f"stage_2/{k}": v for k, v in out.items()}
+            out = {f"stage_2/{k}": v for k, v in _select(out, STAGE2_METRICS).items()}
             out["phase"] = jnp.float32(2.0)
             out["update_step"] = update_step
             out["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
             jax.debug.callback(log_callback, out)
             jax.debug.callback(
-                progress_callback, update_step, out["stage_2/contract_returns_mean"], 2
+                progress_callback, update_step, out["stage_2/welfare"], 2
             )
 
             return (frozen_params, proposal_state, voting_state,

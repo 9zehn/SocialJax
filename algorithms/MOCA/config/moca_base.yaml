@@ -36,9 +36,25 @@
 # Probability that phase 1 draws the NULL contract instead of a uniform sample, so
 # the policy keeps experience of playing uncontracted (reference impl: null_prob).
 "NULL_CONTRACT_PROB": 0.1
+# Number of non-proposing agents polled on a proposal. The paper samples nu agents
+# from the non-proposers and uses only their accept/reject probabilities, reporting
+# nu=2 as strong across all domains. Do NOT set this to num_agents-1 ("poll
+# everyone"): acceptance is then a product of N-1 near-even probabilities, which at
+# N=7 is 0.5**6 = 1.6%, so nearly every phase-2 episode falls back to the null
+# contract and the proposal policy never sees a contract in force.
+"VOTER_SAMPLE_NU": 2
+# Sequential REINFORCE updates per phase-2 batch. Algorithm 1 takes one gradient
+# step per episode; a phase-2 update here plays NUM_ENVS episodes at once, so
+# without minibatching the run gets NUM_UPDATES_PHASE2 gradient steps in total.
+# Must divide NUM_ENVS.
+"CONTRACT_MINIBATCHES": 8
 # Learning rate for the phase-2 proposal/voting policies (episode-level REINFORCE,
-# so far fewer gradient steps than phase 1 -- needs a larger step size).
-"CONTRACT_LR": 0.003
+# so far fewer gradient steps than phase 1 -- needs a larger step size). Adam moves
+# a logit by at most CONTRACT_LR per step, so the total displacement available is
+# NUM_UPDATES_PHASE2 * CONTRACT_MINIBATCHES * CONTRACT_LR; a categorical needs logit
+# gaps of ~3-5 to leave uniform. At the defaults here that is 78 * 8 * 0.01 = 6.2.
+# make_train prints a warning if the budget drops below 3.
+"CONTRACT_LR": 0.01
 
 # Environment defaults
 "ENV_KWARGS":

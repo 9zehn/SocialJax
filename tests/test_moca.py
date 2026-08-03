@@ -250,6 +250,115 @@ def test_phase_split_follows_algorithm_1():
     assert cfg["NUM_UPDATES_PHASE1"] == 90 and cfg["NUM_UPDATES_PHASE2"] == 10
 
 
+def _phase2_cfg(**overrides):
+    """Tiny end-to-end MOCA config that still exercises the real phase-2 code path."""
+    cfg = {
+        "LR": 5e-4, "NUM_ENVS": 8, "NUM_STEPS": 20, "UPDATE_EPOCHS": 1,
+        "NUM_MINIBATCHES": 1, "GAMMA": 0.99, "GAE_LAMBDA": 0.95, "CLIP_EPS": 0.2,
+        "ENT_COEF": 0.01, "VF_COEF": 0.5, "MAX_GRAD_NORM": 0.5, "ACTIVATION": "relu",
+        "ANNEAL_LR": True, "PARAMETER_SHARING": False, "SEED": 0,
+        "CONTRACT_SPACE": "cleanup", "CONTRACT_LOW": 0.0, "CONTRACT_HIGH": 0.2,
+        "NUM_CONTRACT_BINS": 11, "PHASE1_FRAC": 0.5, "NULL_CONTRACT_PROB": 0.1,
+        "CONTRACT_LR": 0.3, "VOTER_SAMPLE_NU": 2, "CONTRACT_MINIBATCHES": 4,
+        "ENV_NAME": "clean_up", "TOTAL_TIMESTEPS": 20 * 8 * 20,
+        "EVALUATE": False, "CHECKPOINT_EVERY": 10 ** 9, "PROGRESS_EVERY": 10 ** 9,
+        "ENV_KWARGS": {"num_agents": 5, "num_inner_steps": 20, "shared_rewards": False,
+                       "cnn": True, "jit": True, "apple_reward": 1.0},
+    }
+    cfg.update(overrides)
+    return cfg
+
+
+def _phase2_subprocess_main():
+    """Run one tiny MOCA training and print the phase-2 metrics as JSON on stdout.
+
+    Invoked in a child process by _run_phase2: executing a full jitted make_train
+    leaves this JAX/macOS build in a state where subsequent jit work aborts the
+    interpreter (`recursive_mutex lock failed`), which predates and is unrelated to
+    what is under test here. Isolating it keeps the rest of the suite runnable.
+    """
+    import json
+    import os
+    os.environ["WANDB_MODE"] = "disabled"
+    import wandb
+    wandb.init(mode="disabled")
+    from algorithms.MOCA.moca_cnn_cleanup import make_train
+
+    cfg = _phase2_cfg()
+    out = jax.jit(make_train(cfg))(jax.random.PRNGKey(0))
+    m = out["metrics_phase2"]
+    payload = {k: np.array(m[k]).tolist() for k in (
+        "stage_2/contract_accept_rate", "stage_2/contract_proposal_entropy")}
+    print("@@JSON@@" + json.dumps(payload))
+
+
+def _run_phase2():
+    import json
+    import subprocess
+    proc = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; sys.path.insert(0, %r); "
+         "import tests.test_moca as t; t._phase2_subprocess_main()"
+         % str(Path(__file__).resolve().parents[1])],
+        capture_output=True, text=True, timeout=1800,
+    )
+    line = next((l for l in proc.stdout.splitlines() if l.startswith("@@JSON@@")), None)
+    assert line is not None, (
+        f"phase-2 subprocess produced no metrics (exit {proc.returncode})\n"
+        f"--- stdout ---\n{proc.stdout[-2000:]}\n--- stderr ---\n{proc.stderr[-2000:]}"
+    )
+    return json.loads(line[len("@@JSON@@"):]), _phase2_cfg()
+
+
+def test_phase2_signs_contracts_and_leaves_uniform():
+    """The two properties that a usable MOCA phase 2 must have, on one run.
+
+    Only ONE make_train execution is possible per process (two jitted training
+    functions abort the interpreter on macOS), so both assertions share a run.
+
+    1. Contracts get signed. The paper samples nu non-proposers and uses only
+       their accept/reject probabilities; polling all N-1 instead makes acceptance
+       a product of N-1 near-even probabilities. VotingPolicy initialises at ~50/50,
+       so the expected accept rate is 0.5**nu = 0.25 here, against 0.5**(N-1) =
+       0.0625 if the nu sampling regresses to polling everyone.
+    2. The proposal policy departs from uniform. This is the silent failure that
+       left a full 7-agent run at exactly maximum entropy, with an argmax that was
+       pure tie-breaking noise.
+    """
+    m, cfg = _run_phase2()
+    num_agents = cfg["ENV_KWARGS"]["num_agents"]
+
+    rate = float(np.mean(np.array(m["stage_2/contract_accept_rate"])))
+    poll_everyone = 0.5 ** (num_agents - 1)
+    assert rate > 3 * poll_everyone, (
+        f"accept rate {rate:.3f} is near the {poll_everyone:.3f} expected when every "
+        f"non-proposer is polled -- nu voter sampling is not in effect"
+    )
+
+    ent = np.array(m["stage_2/contract_proposal_entropy"])
+    ent_max = float(np.log(cfg["NUM_CONTRACT_BINS"]))
+    assert ent[-1] < ent[0], f"proposal entropy did not fall: {ent[0]:.3f} -> {ent[-1]:.3f}"
+    assert ent[-1] < ent_max - 0.2, (
+        f"proposal policy still at ~maximum entropy ({ent[-1]:.3f} vs log K = {ent_max:.3f}): "
+        f"phase 2 learned nothing"
+    )
+
+
+def test_phase2_budget_configs_validated():
+    """nu out of range and a minibatch count that does not divide NUM_ENVS are
+    configuration errors, not silently-degraded runs."""
+    from algorithms.MOCA.moca_cnn_cleanup import make_train
+    for bad, needle in ((dict(VOTER_SAMPLE_NU=0), "VOTER_SAMPLE_NU"),
+                        (dict(VOTER_SAMPLE_NU=5), "VOTER_SAMPLE_NU"),   # == num_agents
+                        (dict(CONTRACT_MINIBATCHES=3), "CONTRACT_MINIBATCHES")):
+        try:
+            make_train(_phase2_cfg(**bad))
+        except ValueError as e:
+            assert needle in str(e), f"{bad} raised the wrong error: {e}"
+        else:
+            raise AssertionError(f"{bad} should raise ValueError")
+
+
 def test_rollout_must_be_one_episode():
     """A contract is agreed per episode, so NUM_STEPS != num_inner_steps is rejected
     rather than silently spanning a reset."""

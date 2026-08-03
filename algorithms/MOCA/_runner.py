@@ -72,7 +72,11 @@ def tune(default_config, make_train, *, sweep_name):
         "metric": {"name": "contract_returns_mean", "goal": "maximize"},
         "parameters": {
             "LR": {"values": [1e-3, 5e-4, 1e-4]},
-            "CONTRACT_LR": {"values": [1e-2, 3e-3, 1e-3]},
+            # Kept at/above 1e-2: total logit displacement is bounded by
+            # NUM_UPDATES_PHASE2 * CONTRACT_MINIBATCHES * CONTRACT_LR, and below
+            # ~1e-2 that budget is too small for the proposal policy to leave
+            # uniform, so lower values sweep only degenerate runs.
+            "CONTRACT_LR": {"values": [5e-2, 3e-2, 1e-2]},
             "ENT_COEF": {"values": [0.0001, 0.01, 0.1]},
         },
     }
