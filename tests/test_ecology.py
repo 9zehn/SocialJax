@@ -50,10 +50,43 @@ def _dirt_rate(steps=12, **kw):
     return (counts[-1] - counts[0]) / (len(counts) - 1)
 
 
-def test_default_dirt_rate_matches_upstream_single_cell_cap():
-    """Untouched defaults must still spawn <= 1 cell/step, or old runs aren't comparable."""
+# A clean beam covers exactly 4 tiles (see cleaned_count in step_env), so this is
+# the hard per-cleaner ceiling: 4 cells/step, firing every step, beam perfectly
+# placed. It is what makes "how many cleaners are needed" answerable from the
+# spawn rate alone, without simulating a navigating cleaner.
+BEAM_TILES = 4
+
+
+def test_default_dirt_rate_needs_at_least_two_cleaners():
+    """The premise the experiments rest on: one cleaner must be unable to keep up.
+
+    Bounding against the beam ceiling rather than a measured duty cycle makes this a
+    statement about what is POSSIBLE -- above 4/step no single agent can hold the
+    river however well it plays, and below 8/step two can.
+    """
     r = _dirt_rate()
-    assert r <= 1.0, f"default dirt rate {r} exceeds the upstream 1 cell/step cap"
+    assert r > BEAM_TILES, (
+        f"dirt rate {r}/step is within one cleaner's {BEAM_TILES}-tile beam capacity, "
+        f"so a single cleaner can sustain the commons alone"
+    )
+    assert r <= 2 * BEAM_TILES, (
+        f"dirt rate {r}/step exceeds what even two cleaners can clear "
+        f"({2 * BEAM_TILES}/step), so cooperation between two is not enough"
+    )
+
+
+def test_upstream_ecology_is_still_reachable():
+    """Diverging from cooperativex/SocialJax is a choice, not a one-way door: the
+    original rates must stay recoverable for a comparison against the paper's setup."""
+    r = _dirt_rate(dirt_spawn_cells=1, dirtSpawnProbability=0.5)
+    assert abs(r - 0.5) < 0.2, f"upstream config should give ~0.5 dirt/step, got {r}"
+    assert _env(maxAppleGrowthRate=0.05).maxAppleGrowthRate == 0.05
+
+
+def test_apple_growth_rate_is_below_upstream():
+    """Apples are deliberately scarcer than upstream's 0.05, so a fouled river costs
+    more harvest for the same cleaning effort."""
+    assert _env().maxAppleGrowthRate < 0.05
 
 
 def test_dirt_spawn_cells_scales_the_rate():
