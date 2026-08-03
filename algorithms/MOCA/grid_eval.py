@@ -184,6 +184,9 @@ def main():
     p.add_argument("--env-kwarg", action="append", default=[], metavar="KEY=VALUE",
                    help="env kwargs; set these to the ECOLOGY THE POLICY WAS TRAINED "
                         "ON, otherwise the policy is measured out of distribution")
+    p.add_argument("--save", default=None, metavar="PATH",
+                   help="write the table to a .npz so protocols.py can search over it "
+                        "without re-running the sweep")
     args = p.parse_args()
 
     from viz.interactive_viewer import _gameplay_checkpoints, _parse_env_kwarg_value
@@ -214,6 +217,16 @@ def main():
     rows = evaluate_grid(env, params, contract, thetas, args.num_envs,
                          args.num_steps, args.seed)
     report(thetas, rows, args.num_agents)
+
+    if args.save:
+        np.savez(
+            args.save,
+            thetas=thetas,
+            returns=np.stack([r["return"] for r in rows]),
+            base_returns=np.stack([r["base_return"] for r in rows]),
+            cleaned=np.stack([r["cleaned_per_step"] for r in rows]),
+        )
+        print(f"\nTable written to {args.save}")
 
 
 if __name__ == "__main__":
