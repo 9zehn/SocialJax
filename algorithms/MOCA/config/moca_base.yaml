@@ -25,12 +25,25 @@
 # Contract space. "cleanup" = pay theta per waste cell cleaned, funded evenly by
 # the other agents (the paper's Cleanup contract space).
 "CONTRACT_SPACE": "cleanup"
-# theta range. The paper uses [0, 0.2] with an apple worth 1, so this pairs with
-# ENV_KWARGS.apple_reward=1.0 below to reproduce their economics.
+# theta range, in reward per waste cell cleaned. The paper uses [0, 0.2] against an
+# apple worth 1, but that was calibrated to upstream's 0.5 dirt/step. Under this
+# repo's ecology (5 dirt/step, so cleaning is ~10x the job) the negotiated contract
+# pinned to the 0.2 ceiling -- a boundary solution, meaning the space was binding
+# and the true optimum lay outside it, so the reported theta measured the limit of
+# the range rather than what the agents wanted.
+#
+# Raising the ceiling costs nothing but grid resolution: a contract that overpays
+# cleaners makes the harvesters who fund it worse off than the null contract, and
+# they reject it. The range only needs to be wide enough to CONTAIN the optimum;
+# the acceptance rule discards the rest.
+#
+# Set CONTRACT_HIGH=0.2 to recover the paper's exact contract space.
 "CONTRACT_LOW": 0.0
-"CONTRACT_HIGH": 0.2
+"CONTRACT_HIGH": 0.5
 # Phase 2 proposes from a discretised grid over [CONTRACT_LOW, CONTRACT_HIGH].
-"NUM_CONTRACT_BINS": 11
+# Only used by PHASE2_MODE=reinforce; solver and negotiate are continuous. Raised
+# with the range to keep the step at 0.025 (21 bins over [0, 0.5]).
+"NUM_CONTRACT_BINS": 21
 # Fraction of the update budget spent in phase 1 (Algorithm 1 uses 9/10).
 "PHASE1_FRAC": 0.9
 # Probability that phase 1 draws the NULL contract instead of a uniform sample, so

@@ -476,32 +476,37 @@ class Clean_up(MultiAgentEnv):
         maxAppleGrowthRate=0.04,
         thresholdDepletion=0.4,  # 0.4
         thresholdRestoration=0.0,
-        # Upstream uses 0.5. See dirt_spawn_cells below: the pair sets the dirt rate.
-        dirtSpawnProbability=1.0,
-        delayStartOfDirtSpawning=50, # 50
+        # Upstream value. See dirt_spawn_cells below: the pair sets the dirt rate.
+        dirtSpawnProbability=0.5,
+        # Upstream waits 50 steps before any dirt spawns. Starting at 0 means the
+        # river is degrading from the first step, so there is no free window in which
+        # apples grow without anyone having cleaned -- the episode opens already
+        # above the depletion threshold (0.473 dirt fraction at reset against a 0.4
+        # growth gate), and it keeps getting worse until someone acts.
+        delayStartOfDirtSpawning=0,
         # --- ecology balance -------------------------------------------------
         # How many candidate cells may turn to dirt per step; expected dirt per step
         # is dirt_spawn_cells * dirtSpawnProbability.
         #
-        # Upstream hard-codes 1 cell and p=0.5, i.e. 0.5 dirt/step. A clean beam
-        # covers exactly 4 tiles (see cleaned_count in step_env), so ONE cleaner can
-        # clear up to 4 cells/step -- an 8x surplus. One part-time cleaner sustained
-        # the whole river, and no amount of tuning made cooperation necessary.
+        # Upstream hard-codes 1 cell at p=0.5, i.e. 0.5 dirt/step. One part-time
+        # cleaner sustained the whole river at that rate, so cooperation was never
+        # necessary. 3 cells at p=0.5 gives 1.5 dirt/step, tripling it.
         #
-        # 5 cells at p=1.0 gives 5.0 dirt/step, which is chosen against the beam
-        # geometry rather than by feel:
-        #   * 5 > 4  -> a single cleaner CANNOT keep up even firing every step with a
-        #              perfectly placed beam. This is a hard ceiling, not a guess
-        #              about duty cycle, so "one cleaner suffices" is ruled out by
-        #              construction.
-        #   * 5 < 8  -> two cleaners can hold the river at ~63% duty each, leaving
-        #              room to reposition. Demanding but reachable, so the second
-        #              cleaner is genuinely pivotal rather than the third or fourth.
-        # p=1.0 fixes the COUNT per step; which cells foul is still random (the
-        # candidate ordering is noise-perturbed before sorting).
+        # On the ceiling: a clean beam covers 4 tiles, so 4 cells/step is a single
+        # cleaner's theoretical maximum -- firing every step with every tile on dirt.
+        # 1.5 sits below that, so "two cleaners are required" is NOT guaranteed by
+        # geometry here; it rests on realised throughput being far under the ceiling,
+        # since a cleaner spends most steps repositioning and rarely lands all four
+        # tiles on dirt. Rates at or above 4/step were tried and left the river
+        # permanently fouled, which collapses the dilemma from the other side: with
+        # no reachable clean state, cleaning stops paying for anyone.
         #
-        # Pass dirt_spawn_cells=1, dirtSpawnProbability=0.5 to recover upstream.
-        dirt_spawn_cells=5,
+        # Check the premise on a trained run rather than assuming it: stage_1
+        # cleaned_by_agent_mean is per-agent cells/step, so the number of cleaners
+        # actually needed is 1.5 divided by it.
+        #
+        # Pass dirt_spawn_cells=1 to recover upstream.
+        dirt_spawn_cells=3,
         # Add payment-state channels to the observation (see _get_obs). OFF by default:
         # turning it on changes the observation SHAPE, so a policy trained with it is
         # not loadable by, or comparable to, a baseline trained without it.

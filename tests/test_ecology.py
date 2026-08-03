@@ -57,22 +57,32 @@ def _dirt_rate(steps=12, **kw):
 BEAM_TILES = 4
 
 
-def test_default_dirt_rate_needs_at_least_two_cleaners():
-    """The premise the experiments rest on: one cleaner must be unable to keep up.
+def test_default_dirt_rate_is_tripled_but_still_clearable():
+    """1.5 dirt/step: 3x upstream, and under the beam ceiling.
 
-    Bounding against the beam ceiling rather than a measured duty cycle makes this a
-    statement about what is POSSIBLE -- above 4/step no single agent can hold the
-    river however well it plays, and below 8/step two can.
+    Being under 4/step is deliberate. Rates at or above it leave the river
+    permanently fouled no matter how many agents clean, which collapses the dilemma
+    from the other side -- with no reachable clean state, cleaning stops paying for
+    anyone. So the requirement for two cleaners rests on realised throughput being
+    well below the ceiling, not on geometry, and is checked on trained runs via
+    stage_1 cleaned_by_agent_mean rather than asserted here.
     """
-    r = _dirt_rate()
-    assert r > BEAM_TILES, (
-        f"dirt rate {r}/step is within one cleaner's {BEAM_TILES}-tile beam capacity, "
-        f"so a single cleaner can sustain the commons alone"
+    # Measured over a long window: spawning is self-limiting, since each step only
+    # considers the `dirt_spawn_cells` cleanest candidates and the eligible pool
+    # shrinks as the river fouls. Short windows overshoot the nominal k*p (1.9 over
+    # 12 steps), very long ones undershoot as the river saturates (0.7 over 200).
+    r = _dirt_rate(steps=100)
+    assert 1.3 < r < 1.7, f"expected ~1.5 dirt/step, got {r}"
+    assert r < BEAM_TILES, (
+        f"dirt rate {r}/step is at or above one cleaner's {BEAM_TILES}-tile ceiling, "
+        f"so the river can never be cleared and the commons is unrecoverable"
     )
-    assert r <= 2 * BEAM_TILES, (
-        f"dirt rate {r}/step exceeds what even two cleaners can clear "
-        f"({2 * BEAM_TILES}/step), so cooperation between two is not enough"
-    )
+
+
+def test_dirt_spawns_from_the_first_step():
+    """No grace window: upstream's 50-step delay let apples grow before anyone had to
+    clean, which front-loads free reward and mutes the dilemma early in an episode."""
+    assert _env().delayStartOfDirtSpawning == 0
 
 
 def test_upstream_ecology_is_still_reachable():

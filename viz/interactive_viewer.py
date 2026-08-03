@@ -974,8 +974,11 @@ def main():
                              "frozen critics at reset (training default: 50)")
     parser.add_argument("--solver-rule", default="majority", choices=("majority", "max"),
                         help="PHASE2_MODE=solver: decision rule (training default: majority)")
-    parser.add_argument("--contract-high", type=float, default=0.2,
-                        help="MOCA only: upper bound of the contract space (must match CONTRACT_HIGH)")
+    parser.add_argument("--contract-high", type=float, default=0.5,
+                        help="MOCA only: upper bound of the contract space (must match the run's "
+                             "CONTRACT_HIGH; the bounds are not encoded in the filename, and a "
+                             "mismatch silently rescales theta). Default tracks moca_base.yaml; "
+                             "pass 0.2 for runs on the paper's original range")
     parser.add_argument("--record", default=None, metavar="PATH",
                         help="save the rollout to PATH (.npz) so it can be reopened later "
                              "with --replay, without re-running the simulation")
