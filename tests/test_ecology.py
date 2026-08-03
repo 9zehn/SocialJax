@@ -57,8 +57,8 @@ def _dirt_rate(steps=12, **kw):
 BEAM_TILES = 4
 
 
-def test_default_dirt_rate_is_tripled_but_still_clearable():
-    """1.5 dirt/step: 3x upstream, and under the beam ceiling.
+def test_default_dirt_rate_is_raised_but_still_clearable():
+    """1.0 dirt/step: 2x upstream, and under the beam ceiling.
 
     Being under 4/step is deliberate. Rates at or above it leave the river
     permanently fouled no matter how many agents clean, which collapses the dilemma
@@ -69,10 +69,10 @@ def test_default_dirt_rate_is_tripled_but_still_clearable():
     """
     # Measured over a long window: spawning is self-limiting, since each step only
     # considers the `dirt_spawn_cells` cleanest candidates and the eligible pool
-    # shrinks as the river fouls. Short windows overshoot the nominal k*p (1.9 over
-    # 12 steps), very long ones undershoot as the river saturates (0.7 over 200).
+    # shrinks as the river fouls. Short windows overshoot the nominal k*p, very long
+    # ones undershoot it as the river saturates.
     r = _dirt_rate(steps=100)
-    assert 1.3 < r < 1.7, f"expected ~1.5 dirt/step, got {r}"
+    assert 0.8 < r < 1.2, f"expected ~1.0 dirt/step, got {r}"
     assert r < BEAM_TILES, (
         f"dirt rate {r}/step is at or above one cleaner's {BEAM_TILES}-tile ceiling, "
         f"so the river can never be cleared and the commons is unrecoverable"

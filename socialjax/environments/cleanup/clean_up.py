@@ -490,7 +490,7 @@ class Clean_up(MultiAgentEnv):
         #
         # Upstream hard-codes 1 cell at p=0.5, i.e. 0.5 dirt/step. One part-time
         # cleaner sustained the whole river at that rate, so cooperation was never
-        # necessary. 3 cells at p=0.5 gives 1.5 dirt/step, tripling it.
+        # necessary. 2 cells at p=0.5 gives 1.0 dirt/step, doubling it.
         #
         # On the ceiling: a clean beam covers 4 tiles, so 4 cells/step is a single
         # cleaner's theoretical maximum -- firing every step with every tile on dirt.
@@ -503,10 +503,10 @@ class Clean_up(MultiAgentEnv):
         #
         # Check the premise on a trained run rather than assuming it: stage_1
         # cleaned_by_agent_mean is per-agent cells/step, so the number of cleaners
-        # actually needed is 1.5 divided by it.
+        # actually needed is 1.0 divided by it.
         #
         # Pass dirt_spawn_cells=1 to recover upstream.
-        dirt_spawn_cells=3,
+        dirt_spawn_cells=2,
         # Add payment-state channels to the observation (see _get_obs). OFF by default:
         # turning it on changes the observation SHAPE, so a policy trained with it is
         # not loadable by, or comparable to, a baseline trained without it.
