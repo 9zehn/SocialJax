@@ -604,6 +604,89 @@ def _write_fake_moca_run(tmp, n=3, k=11, modal=7):
     return f"{stem}*.pkl"
 
 
+def _write_fake_negotiate_run(tmp, n=3, theta=0.15, low=0.0, high=0.2):
+    """A PHASE2_MODE=negotiate checkpoint set: gameplay + real NegotiationActorCritic
+    weights, whose stem ends in the mode token exactly as training writes it."""
+    from algorithms.utils.io_utils import save_params
+    from algorithms.MOCA.networks import NegotiationActorCritic
+    import pickle
+    from flax.training.train_state import TrainState
+
+    obs_shape = (1, 11, 11, 19)
+    net = NegotiationActorCritic(2)
+    # Real gameplay weights too, so the fixture can be replayed end to end rather
+    # than only inspected.
+    play = ContractActorCritic(9)
+    stem = Path(tmp) / f"clean_up_seed42_reward_individual_agents{n}_negotiate"
+    for i in range(n):
+        p = net.init(jax.random.PRNGKey(i), jnp.zeros(obs_shape), jnp.zeros((1, 2)))
+        # Bias the proposal head so agent 0's mean maps to a known theta, letting the
+        # test assert the exact value the viewer should recover.
+        target_raw = 2.0 * (theta - low) / (high - low) - 1.0
+        p["params"]["Dense_1"]["bias"] = jnp.array([target_raw, 0.0])
+        save_params(TrainState.create(apply_fn=net.apply, params=p, tx=optax.adam(1e-3)),
+                    f"{stem}_contract_{i}.pkl")
+        gp = play.init(jax.random.PRNGKey(100 + i), jnp.zeros(obs_shape), jnp.zeros((1, 2)))
+        save_params(TrainState.create(apply_fn=play.apply, params=gp, tx=optax.adam(1e-3)),
+                    f"{stem}_{i}.pkl")
+    return f"{stem}*.pkl"
+
+
+def test_glob_separates_gameplay_from_negotiation_checkpoints():
+    """The negotiate stem ENDS in "_negotiate", so a "_negotiate_" role suffix would
+    make gameplay and contracting files indistinguishable by substring. Both sets must
+    still come apart cleanly."""
+    import tempfile
+    import glob
+    from viz.interactive_viewer import _gameplay_checkpoints, detect_moca
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pattern = _write_fake_negotiate_run(tmp, n=4)
+        assert len(glob.glob(pattern)) == 8, "fixture should have 2N files"
+        gameplay = _gameplay_checkpoints(pattern)
+        assert len(gameplay) == 4, f"expected 4 gameplay policies, got {gameplay}"
+        assert all("_contract_" not in g for g in gameplay)
+        moca = detect_moca(pattern)
+        assert moca is not None and moca["mode"] == "negotiate", moca
+        assert len(moca["contract_paths"]) == 4
+
+
+def test_viewer_recovers_the_proposed_theta_from_a_negotiate_run():
+    """theta is a Gaussian mean conditioned on s_0, not a stored logit, so the viewer
+    has to evaluate the policy. It must use agent 0 -- the fixed proposer."""
+    import tempfile
+    from viz.interactive_viewer import detect_moca, solve_negotiate_theta
+    import socialjax
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pattern = _write_fake_negotiate_run(tmp, n=3, theta=0.15)
+        moca = detect_moca(pattern)
+        env = socialjax.make("clean_up", num_agents=3, num_inner_steps=20,
+                             cnn=True, jit=True, apple_reward=1.0)
+        c = CleanupContract(3, 0.0, 0.2)
+        info = solve_negotiate_theta(moca, c, env, seed=0)
+        assert abs(info["theta"] - 0.15) < 1e-3, info["theta"]
+        assert len(info["accept_probs"]) == 2, "one accept prob per non-proposer"
+        assert np.all((info["accept_probs"] >= 0.0) & (info["accept_probs"] <= 1.0))
+
+
+def test_detect_moca_recognises_a_solver_run_with_no_contract_policies():
+    """Solver phase 2 saves nothing, so detection has to fall back to the stem -- and
+    it must still be detected, or the viewer replays it at the wrong apple_reward."""
+    import tempfile
+    import pickle
+    from viz.interactive_viewer import detect_moca
+
+    with tempfile.TemporaryDirectory() as tmp:
+        stem = Path(tmp) / "clean_up_seed42_reward_individual_agents3_solver"
+        for i in range(3):
+            with open(f"{stem}_{i}.pkl", "wb") as f:
+                pickle.dump({"params": {"Dense_0": {"kernel": np.zeros((66, 64))}}}, f)
+        moca = detect_moca(f"{stem}*.pkl")
+        assert moca is not None and moca["mode"] == "solver", moca
+        assert len(moca["gameplay"]) == 3
+
+
 def test_glob_excludes_proposal_and_voting_checkpoints():
     """The obvious glob matches 3N files for a MOCA run; only the N gameplay policies
     may be zipped onto agents 0..N-1."""

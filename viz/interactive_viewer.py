@@ -638,7 +638,12 @@ def _parse_env_kwarg_value(raw):
 # Suffixes of the auxiliary policies a MOCA run saves next to its gameplay policies.
 # A plain `..._reward_individual*.pkl` glob matches these too, so they must be
 # filtered out before the remaining files are zipped onto agents 0..N-1.
-_AUX_CKPT_MARKERS = ("_proposal_", "_voting_", "_resume")
+_AUX_CKPT_MARKERS = (
+    "_proposal_", "_voting_",   # PHASE2_MODE=reinforce
+    "_contract_",               # PHASE2_MODE=negotiate
+    "_negotiate_negotiate_",    # legacy name for the same, before it was disambiguated
+    "_resume",
+)
 
 
 def _gameplay_checkpoints(arg):
@@ -678,35 +683,53 @@ def _load_checkpoint(arg):
 # ---------------------------------------------------------------------------
 
 def detect_moca(checkpoint_arg):
-    """Detect a MOCA run and load its contracting policies.
+    """Detect a MOCA run and locate its contracting policies, whichever phase 2 ran.
 
-    A MOCA checkpoint set is recognised by the `_proposal_<i>.pkl` files saved
-    alongside the gameplay policies. Returns None for non-MOCA runs, else a dict:
+    The three PHASE2_MODEs leave different things on disk, so detection is by which
+    sibling checkpoints exist next to the gameplay policies:
 
-        theta_grid : (K,) the discretised contract space the run proposed over,
-                     recovered from the proposal-logit width (K) -- the contract
-                     BOUNDS are not encoded in the filename, so they come from
-                     --contract-low/--contract-high (defaults match the paper).
-        probs      : (N, K) each agent's learned proposal distribution.
-        modal_theta: the contract the population most wants to propose -- the
-                     headline result of a MOCA run, and the natural one to replay.
+        reinforce  `_proposal_<i>.pkl` + `_voting_<i>.pkl` -- a categorical over a
+                   contract grid, readable straight off the weights.
+        negotiate  `_contract_<i>.pkl` -- one Box policy per agent emitting
+                   [theta, accept_prob]. Continuous, and a function of the initial
+                   observation, so recovering theta needs a forward pass.
+        solver     nothing at all: phase 2 learns no policy, it searches the frozen
+                   critics at reset. Recognised from the `_solver` stem token.
+
+    Returns None for non-MOCA runs, else a dict with "mode", "gameplay", and the
+    mode's policy paths.
     """
     import glob
 
     gameplay = _gameplay_checkpoints(checkpoint_arg)
     if not gameplay:
         return None
-    # Proposal files sit next to the gameplay ones, sharing the run stem.
+    # Contracting policies sit next to the gameplay ones, sharing the run stem.
     stem = re.sub(r"_\d+\.pkl$", "", gameplay[0])
+
     proposals = sorted(glob.glob(f"{stem}_proposal_*.pkl"))
-    if not proposals:
-        return None
-    votings = sorted(glob.glob(f"{stem}_voting_*.pkl"))
-    return {"proposal_paths": proposals, "voting_paths": votings, "gameplay": gameplay}
+    if proposals:
+        return {
+            "mode": "reinforce",
+            "proposal_paths": proposals,
+            "voting_paths": sorted(glob.glob(f"{stem}_voting_*.pkl")),
+            "gameplay": gameplay,
+        }
+
+    contracts = sorted(glob.glob(f"{stem}_contract_*.pkl"))
+    if not contracts:  # runs written before the role suffix was disambiguated
+        contracts = sorted(glob.glob(f"{stem}_negotiate_*.pkl"))
+    if contracts:
+        return {"mode": "negotiate", "contract_paths": contracts, "gameplay": gameplay}
+
+    # Solver runs save no contracting policy, so the stem is the only evidence.
+    if "_solver" in os.path.basename(stem):
+        return {"mode": "solver", "gameplay": gameplay}
+    return None
 
 
 def load_contract_policies(moca, low, high):
-    """Read the learned proposal distributions and the contract grid they span."""
+    """Read the learned proposal distribution of a PHASE2_MODE=reinforce run."""
     logits = np.stack([
         np.asarray(load_params(p)["params"]["proposal_logits"]) for p in moca["proposal_paths"]
     ])                                                     # (N, K)
@@ -716,6 +739,58 @@ def load_contract_policies(moca, low, high):
     theta_grid = np.linspace(low, high, k)
     modal_theta = float(theta_grid[int(probs.mean(axis=0).argmax())])
     return {"theta_grid": theta_grid, "probs": probs, "modal_theta": modal_theta}
+
+
+def _initial_obs_batch(env, seed):
+    """(N, ...) observations at s_0 -- the state both phase-2 modes negotiate from."""
+    obs, _ = env.reset(jax.random.PRNGKey(seed))
+    return jnp.stack([obs[a] for a in env.agents])
+
+
+def solve_negotiate_theta(moca, contract, env, seed):
+    """Agent 0's proposal, and what the others would sign, from a negotiate run.
+
+    Unlike the reinforce mode's logits, the proposal is a Gaussian conditioned on the
+    initial observation, so it has to be evaluated rather than read. The MEAN is used
+    rather than a sample: it is the policy's actual choice, not one draw from its
+    exploration noise.
+    """
+    from algorithms.MOCA import negotiate as neg
+    from algorithms.MOCA.contracts import AGREE, PROPOSE
+    from algorithms.MOCA.networks import NegotiationActorCritic
+
+    params = [load_params(p) for p in moca["contract_paths"]]
+    net = NegotiationActorCritic(2, activation="relu")
+    obs = _initial_obs_batch(env, seed)
+    n = len(params)
+
+    # Agent 0 always proposes -- the paper's single-proposer assumption.
+    pi0, _ = net.apply(params[0], obs[0][None, ...],
+                       contract.to_obs(jnp.zeros((1,)), stage=PROPOSE))
+    theta = float(neg.unsquash(pi0.mean()[0, 0], contract.low, contract.high))
+
+    # What every other agent would offer as its accept probability for that theta.
+    agree_obs = contract.to_obs(jnp.full((1,), theta), stage=AGREE)
+    accept = []
+    for i in range(1, n):
+        pi, _ = net.apply(params[i], obs[i][None, ...], agree_obs)
+        accept.append(float(neg.unsquash(pi.mean()[0, 1], 0.0, 1.0)))
+    return {"theta": theta, "accept_probs": np.array(accept), "nu": neg.default_nu(n)}
+
+
+def solve_solver_theta(params, contract, env, seed, num_samples, rule):
+    """Re-run the sampling solver from the frozen critics, as phase 2 did each episode."""
+    from algorithms.MOCA import solver as moca_solver
+    from algorithms.MOCA.networks import ContractActorCritic
+
+    nets = [ContractActorCritic(action_dim=env.action_space().n, activation="relu")
+            for _ in range(env.num_agents)]
+    obs = _initial_obs_batch(env, seed)[:, None, ...]      # (N, 1, ...) one "env"
+    theta, info = moca_solver.negotiate(
+        jax.random.PRNGKey(seed), nets, params, obs, contract, num_samples, rule
+    )
+    return {"theta": float(theta[0]),
+            "null": bool(np.asarray(info["solver_null_rate"]) > 0.5)}
 
 
 def _infer_env_kwargs_from_checkpoint(checkpoint_arg):
@@ -894,6 +969,11 @@ def main():
     parser.add_argument("--contract-low", type=float, default=0.0,
                         help="MOCA only: lower bound of the contract space the run was trained on "
                              "(not encoded in the filename; must match CONTRACT_LOW)")
+    parser.add_argument("--solver-samples", type=int, default=50,
+                        help="PHASE2_MODE=solver: contracts sampled and scored by the "
+                             "frozen critics at reset (training default: 50)")
+    parser.add_argument("--solver-rule", default="majority", choices=("majority", "max"),
+                        help="PHASE2_MODE=solver: decision rule (training default: majority)")
     parser.add_argument("--contract-high", type=float, default=0.2,
                         help="MOCA only: upper bound of the contract space (must match CONTRACT_HIGH)")
     parser.add_argument("--record", default=None, metavar="PATH",
@@ -971,22 +1051,53 @@ def main():
     if moca is not None:
         from algorithms.MOCA.contracts import CleanupContract
 
-        info = load_contract_policies(moca, args.contract_low, args.contract_high)
+        contract = CleanupContract(env.num_agents, args.contract_low, args.contract_high)
+        mode = moca["mode"]
+        print(f"MOCA run detected (PHASE2_MODE={mode})")
+        print(f"  contract space: theta in [{args.contract_low}, {args.contract_high}]"
+              + (" (continuous)" if mode != "reinforce" else ""))
+
+        learned = None
+        if mode == "reinforce":
+            info = load_contract_policies(moca, args.contract_low, args.contract_high)
+            learned = info["modal_theta"]
+            print(f"  {len(moca['proposal_paths'])} proposal + "
+                  f"{len(moca['voting_paths'])} voting policies, "
+                  f"{len(info['theta_grid'])} bins")
+            print("  learned proposal distribution (mean over agents):")
+            for th, p in zip(info["theta_grid"], info["probs"].mean(axis=0)):
+                print(f"    theta={th:.3f}  p={p:.3f}  {'#' * int(round(p * 40))}")
+        elif mode == "negotiate":
+            info = solve_negotiate_theta(moca, contract, env, args.seed)
+            learned = info["theta"]
+            print(f"  {len(moca['contract_paths'])} negotiation policies "
+                  f"(each emits [theta, accept_prob]; agent 0 proposes, "
+                  f"nu={info['nu']} of the rest are polled)")
+            print(f"  agent 0 proposes theta={info['theta']:.4f}")
+            probs = info["accept_probs"]
+            print("  accept probability at that theta, per non-proposer:")
+            for i, p in enumerate(probs, start=1):
+                print(f"    agent {i}: {p:.3f}  {'#' * int(round(p * 40))}")
+            # Signing needs nu of them to agree jointly, so the typical pair product
+            # is the number that decides whether the contract ever takes force.
+            if len(probs):
+                print(f"  mean accept prob {probs.mean():.3f} -> a nu={info['nu']} draw "
+                      f"signs with probability ~{probs.mean() ** info['nu']:.3f}")
+        elif mode == "solver":
+            if params is None:
+                raise SystemExit("solver runs need --checkpoint to score contracts")
+            info = solve_solver_theta(params, contract, env, args.seed,
+                                      args.solver_samples, args.solver_rule)
+            learned = info["theta"]
+            print(f"  solver ({args.solver_rule} rule, {args.solver_samples} samples) "
+                  f"chose theta={info['theta']:.4f}"
+                  + ("  [the NULL contract -- nothing beat it]" if info["null"] else ""))
+
         if args.contract_theta is not None:
             theta, source = float(args.contract_theta), "(manual)"
         else:
-            theta, source = info["modal_theta"], "(learned)"
-        contract = CleanupContract(env.num_agents, args.contract_low, args.contract_high)
+            theta, source = learned, "(learned)"
         contract_info = {"theta": theta, "source": source}
-        print(f"MOCA run detected: {len(moca['proposal_paths'])} proposal + "
-              f"{len(moca['voting_paths'])} voting policies")
-        print(f"  contract space: theta in [{args.contract_low}, {args.contract_high}], "
-              f"{len(info['theta_grid'])} bins")
-        print("  learned proposal distribution (mean over agents):")
-        mean_p = info["probs"].mean(axis=0)
-        for th, p in zip(info["theta_grid"], mean_p):
-            bar = "#" * int(round(p * 40))
-            print(f"    theta={th:.3f}  p={p:.3f}  {bar}")
         print(f"  replaying under theta={theta:g} {source}")
 
     states, extras = rollout(

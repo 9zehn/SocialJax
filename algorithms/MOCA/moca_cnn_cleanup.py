@@ -1001,7 +1001,12 @@ def make_train(config):
                 return
             filename = checkpoint_filename(config, latest=True)
             for i in range(num_agents):
-                save_params(negotiate_state[i], f"./checkpoints/moca/{filename}_negotiate_{i}.pkl")
+                # "_contract_", not "_negotiate_": the run stem already ends in the
+                # PHASE2_MODE token, so a "_negotiate_" role suffix would make
+                # ..._negotiate_0.pkl (gameplay) and ..._negotiate_negotiate_0.pkl
+                # (contracting) indistinguishable by substring, which is how the
+                # viewer separates the two sets.
+                save_params(negotiate_state[i], f"./checkpoints/moca/{filename}_contract_{i}.pkl")
             print(f"[checkpoint] MOCA negotiation policies at update {update_step}")
 
         def progress_callback(update_step, mean_val, phase):

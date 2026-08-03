@@ -37,7 +37,7 @@ def single_run(config, make_train, *, wandb_name):
     if "negotiate_state" in out:
         for i in range(num_agents):
             save_params(out["negotiate_state"][i],
-                        f"./checkpoints/moca/{filename}_negotiate_{i}.pkl")
+                        f"./checkpoints/moca/{filename}_contract_{i}.pkl")
         m = out["metrics_phase2"]
         theta = np.array(m["stage_2/contract_theta_proposed"])
         eff = np.array(m["stage_2/contract_theta_effective"])
