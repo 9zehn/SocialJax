@@ -121,6 +121,27 @@ def test_missing_reward_key_does_not_crash():
     assert name == "clean_up_seed42_agents4"
 
 
+def test_moca_phase2_modes_do_not_collide():
+    """The three phase-2 modes are meant to be compared at one seed and reward,
+    so they must not resolve to the same checkpoint path."""
+    names = set()
+    for mode in ("negotiate", "solver", "reinforce"):
+        cfg = _config()
+        cfg["PHASE2_MODE"] = mode
+        name = checkpoint_filename(cfg)
+        assert mode in name, f"{mode} not marked in {name}"
+        names.add(name)
+    assert len(names) == 3, f"phase-2 modes collided: {names}"
+
+
+def test_non_moca_configs_are_unaffected_by_the_phase2_marker():
+    """PHASE2_MODE exists only in MOCA configs; every other algorithm's filenames
+    must be byte-identical to before it was introduced."""
+    cfg = _config()
+    assert "PHASE2_MODE" not in cfg
+    assert checkpoint_filename(cfg) == "clean_up_seed42_reward_individual_agents4"
+
+
 ALL_TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 if __name__ == "__main__":

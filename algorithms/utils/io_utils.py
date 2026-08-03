@@ -67,6 +67,16 @@ def checkpoint_filename(config: Dict[str, Any], latest: bool = False) -> str:
     if num_agents:
         suffix += f"_agents{num_agents}"
 
+    # MOCA's phase-2 mode. The three modes are meant to be run against each other
+    # at the same seed and reward -- the controlled comparison this function's
+    # whole purpose is to keep from colliding -- and without this every one of
+    # them resolves to the same path. Marked for all modes rather than only
+    # off-default ones, so no MOCA run can overwrite another. Absent from every
+    # other algorithm's config, so nothing outside MOCA is affected.
+    phase2_mode = config.get("PHASE2_MODE")
+    if phase2_mode:
+        suffix += f"_{phase2_mode}"
+
     name = f'{config["ENV_NAME"]}_seed{config["SEED"]}{suffix}'
     return f"{name}_latest" if latest else name
 
