@@ -42,9 +42,11 @@ from socialjax.wrappers.baselines import LogWrapper
 import wandb
 
 from algorithms.utils import checkpoint_filename, save_params, save_train_state
-from algorithms.MOCA import solver
-from algorithms.MOCA.contracts import make_contract
-from algorithms.MOCA.networks import ContractActorCritic, ProposalPolicy, VotingPolicy
+from algorithms.MOCA import negotiate, solver
+from algorithms.MOCA.contracts import AGREE, PROPOSE, make_contract
+from algorithms.MOCA.networks import (
+    ContractActorCritic, NegotiationActorCritic, ProposalPolicy, VotingPolicy,
+)
 
 
 def episode_stats(traj_batch, num_agents):
@@ -139,6 +141,19 @@ STAGE2_SOLVER_METRICS = (
     "equality",
 )
 
+# Learned negotiation stage: a proposal game again, so the diagnostics are what
+# agent 0 offers and whether the polled agents sign it.
+STAGE2_NEGOTIATE_METRICS = (
+    "contract_theta_proposed",
+    "contract_theta_effective",
+    "contract_accept_rate",      # realised signings
+    "contract_accept_prob",      # the product of the polled agents' probabilities
+    "negotiate_policy_entropy",  # falling entropy = the proposal is converging
+    "cleaned_by_agent_mean",
+    "welfare",
+    "equality",
+)
+
 
 def _select(metrics: dict, allowed: Tuple[str, ...]) -> dict:
     """Restrict `metrics` to `allowed`, raising if a name in the allowlist is absent.
@@ -208,11 +223,28 @@ def make_train(config):
     # (see algorithms/MOCA/solver.py); "reinforce" is this repo's discretised
     # proposal/voting game, kept selectable so both can be compared.
     phase2_mode = config.get("PHASE2_MODE", "solver")
-    if phase2_mode not in ("solver", "reinforce"):
+    if phase2_mode not in ("solver", "reinforce", "negotiate"):
         raise ValueError(
-            f"PHASE2_MODE must be 'solver' or 'reinforce', got {phase2_mode!r}"
+            f"PHASE2_MODE must be 'solver', 'negotiate' or 'reinforce', "
+            f"got {phase2_mode!r}"
         )
     config["PHASE2_MODE"] = phase2_mode
+    if phase2_mode == "negotiate":
+        # Reference branch: 2 sampled non-proposers above 3 agents, all of them
+        # below. Overridable, but the default is the rule as coded.
+        # null in the config means "use the reference's rule for this num_agents".
+        if config.get("NEGOTIATE_NU") is None:
+            config["NEGOTIATE_NU"] = negotiate.default_nu(num_agents)
+        if not 1 <= config["NEGOTIATE_NU"] <= num_agents - 1:
+            raise ValueError(
+                f"NEGOTIATE_NU must be in [1, {num_agents - 1}], "
+                f"got {config['NEGOTIATE_NU']}"
+            )
+        if config.get("NEGOTIATE_LR") is None:
+            config["NEGOTIATE_LR"] = 5e-4
+        if config.get("NEGOTIATE_UPDATE_EPOCHS") is None:
+            config["NEGOTIATE_UPDATE_EPOCHS"] = 4
+    nu_neg = config.get("NEGOTIATE_NU") or negotiate.default_nu(num_agents)
     if phase2_mode == "solver":
         config.setdefault("SOLVER_SAMPLES", 50)
         config.setdefault("SOLVER_DECISION_RULE", "majority")
@@ -335,6 +367,28 @@ def make_train(config):
         voting_state = [
             TrainState.create(
                 apply_fn=voting_net[i].apply, params=voting_params[i], tx=contract_tx
+            )
+            for i in range(num_agents)
+        ]
+
+        # Learned negotiation stage. A separate network per agent over the Box
+        # action [contract params..., accept_prob], trained by its own PPO -- the
+        # reference builds a second RLlib trainer for the negotiation env rather
+        # than reusing the gameplay policy.
+        negotiate_net = [
+            NegotiationActorCritic(2, activation=config["ACTIVATION"])
+            for _ in range(num_agents)
+        ]
+        negotiate_params = [
+            negotiate_net[i].init(_rng, init_x, init_c) for i in range(num_agents)
+        ]
+        negotiate_tx = optax.chain(
+            optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+            optax.adam(config.get("NEGOTIATE_LR", 5e-4), eps=1e-5),
+        )
+        negotiate_state = [
+            TrainState.create(
+                apply_fn=negotiate_net[i].apply, params=negotiate_params[i], tx=negotiate_tx
             )
             for i in range(num_agents)
         ]
@@ -768,6 +822,137 @@ def make_train(config):
 
             return (frozen_params, env_state, last_obs, update_step, rng), out
 
+        # =================================================================
+        # PHASE 2 (negotiate) -- Algorithm 1's contracting game: agent 0
+        # proposes, nu sampled agents accept with some probability, then the
+        # frozen policy plays the episode. See algorithms/MOCA/negotiate.py.
+        # =================================================================
+        def _update_step_phase2_negotiate(runner_state, unused):
+            (frozen_params, negotiate_state, env_state, last_obs,
+             update_step, rng) = runner_state
+
+            low, high = contract.low, contract.high
+            obs_batch = jnp.transpose(last_obs, (1, 0, 2, 3, 4))   # (N, E, ...)
+            n_envs = config["NUM_ENVS"]
+
+            def act(params_list, contract_obs, keys):
+                """Every agent's action, log-prob and value at one negotiation step."""
+                raws, logps, vals = [], [], []
+                for i in range(num_agents):
+                    pi, v = negotiate_net[i].apply(
+                        params_list[i], obs_batch[i], contract_obs
+                    )
+                    raw = pi.sample(seed=keys[i])
+                    raws.append(raw)
+                    logps.append(pi.log_prob(raw))
+                    vals.append(v)
+                return jnp.stack(raws), jnp.stack(logps), jnp.stack(vals)
+
+            params_list = [ts.params for ts in negotiate_state]
+            rng, k0, k1, k_sel, k_acc = jax.random.split(rng, 5)
+
+            # -- step 0: PROPOSE. Only agent 0's contract component is read.
+            obs_propose = contract.to_obs(jnp.zeros((n_envs,)), stage=PROPOSE)
+            raw0, logp0, val0 = act(params_list, obs_propose, jax.random.split(k0, num_agents))
+            theta_prop = negotiate.unsquash(raw0[0, :, 0], low, high)
+
+            # -- step 1: AGREE. nu sampled non-proposers gate the contract.
+            obs_agree = contract.to_obs(theta_prop, stage=AGREE)
+            raw1, logp1, val1 = act(params_list, obs_agree, jax.random.split(k1, num_agents))
+            accept_probs = negotiate.unsquash(raw1[:, :, 1], 0.0, 1.0)   # (N, E)
+            voter_mask = negotiate.sample_voters(k_sel, num_agents, nu_neg, n_envs)
+            accepted, prod_prob = negotiate.acceptance(k_acc, accept_probs, voter_mask)
+            theta_eff = jnp.where(accepted, theta_prop, jnp.float32(low))
+
+            # -- play the episode with the FROZEN gameplay policy --
+            traj_batch, env_state, last_obs, rng = rollout(
+                frozen_params, env_state, last_obs, theta_eff, rng
+            )
+            returns = jnp.stack(
+                [traj_batch[i].reward.sum(axis=0) for i in range(num_agents)]
+            )                                                    # (N, E)
+
+            # Reward lands only on the agreement step, as in the reference: the
+            # proposal step returns zeros and the agreement step returns the
+            # accumulated episode reward.
+            rewards = jnp.stack([jnp.zeros_like(returns), returns])   # (2, N, E)
+            values = jnp.stack([val0, val1])                          # (2, N, E)
+            advantages, targets = negotiate.two_step_gae(
+                rewards, values, config["GAMMA"], config["GAE_LAMBDA"]
+            )
+            raws = jnp.stack([raw0, raw1])                            # (2, N, E, A)
+            logps = jnp.stack([logp0, logp1])                         # (2, N, E)
+
+            # -- PPO on the two-step negotiation episode --
+            def ppo_loss(params, i):
+                adv_i = advantages[:, i]
+                adv_i = (adv_i - adv_i.mean()) / (adv_i.std() + 1e-8)
+                loss = 0.0
+                for t, cobs in enumerate((obs_propose, obs_agree)):
+                    pi, value = negotiate_net[i].apply(params, obs_batch[i], cobs)
+                    logp = pi.log_prob(raws[t, i])
+                    ratio = jnp.exp(logp - logps[t, i])
+                    a = adv_i[t]
+                    actor = -jnp.minimum(
+                        ratio * a,
+                        jnp.clip(ratio, 1.0 - config["CLIP_EPS"], 1.0 + config["CLIP_EPS"]) * a,
+                    ).mean()
+                    v_loss = jnp.square(value - targets[t, i]).mean()
+                    loss = loss + actor + config["VF_COEF"] * v_loss
+                return loss
+
+            def _epoch(state, unused):
+                for i in range(num_agents):
+                    g = jax.grad(ppo_loss)(state[i].params, i)
+                    state[i] = state[i].apply_gradients(grads=g)
+                return state, None
+
+            negotiate_state, _ = jax.lax.scan(
+                _epoch, negotiate_state, None, config["NEGOTIATE_UPDATE_EPOCHS"]
+            )
+
+            update_step = update_step + 1
+            jax.debug.callback(
+                negotiate_checkpoint_callback, negotiate_state, update_step
+            )
+
+            metric = jax.tree.map(
+                lambda x: x.mean(), [dict(traj_batch[i].info) for i in range(num_agents)]
+            )
+            keys = list(metric[0].keys())
+            stacked = {k: jnp.stack([d[k] for d in metric]) for k in keys}
+            out = {}
+            for k, v in stacked.items():
+                out[f"{k}_mean"] = v.mean()
+                out[f"{k}_std"] = v.std()
+            out["contract_theta_proposed"] = theta_prop.mean()
+            out["contract_theta_effective"] = theta_eff.mean()
+            out["contract_accept_rate"] = accepted.mean()
+            out["contract_accept_prob"] = prod_prob.mean()
+            # Gaussian entropy of the proposer's policy, recomputed post-update:
+            # the analogue of the categorical entropy the REINFORCE mode tracks,
+            # and the same convergence question -- is the proposal narrowing?
+            post_pi, _ = negotiate_net[0].apply(
+                negotiate_state[0].params, obs_batch[0], obs_propose
+            )
+            out["negotiate_policy_entropy"] = post_pi.entropy().mean()
+            stats = episode_stats(traj_batch, num_agents)
+            out["welfare"] = stats["welfare"]
+            out["equality"] = stats["equality"]
+            out["transfer_volume"] = stats["transfer_volume"]
+            out = {f"stage_2/{k}": v
+                   for k, v in _select(out, STAGE2_NEGOTIATE_METRICS).items()}
+            out["phase"] = jnp.float32(2.0)
+            out["update_step"] = update_step
+            out["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
+            jax.debug.callback(log_callback, out)
+            jax.debug.callback(
+                progress_callback, update_step, out["stage_2/welfare"], 2
+            )
+
+            return (frozen_params, negotiate_state, env_state, last_obs,
+                    update_step, rng), out
+
         # ----------------------------------------------------------- callbacks
         def log_callback(metric):
             wandb.log({k: float(v) for k, v in metric.items()})
@@ -795,6 +980,16 @@ def make_train(config):
                 save_params(proposal_state[i], f"./checkpoints/moca/{filename}_proposal_{i}.pkl")
                 save_params(voting_state[i], f"./checkpoints/moca/{filename}_voting_{i}.pkl")
             print(f"[checkpoint] MOCA phase-2 contracting policies at update {update_step}")
+
+        def negotiate_checkpoint_callback(negotiate_state, update_step):
+            update_step = int(update_step)
+            every = config.get("CHECKPOINT_EVERY", 20)
+            if every <= 0 or update_step % every != 0:
+                return
+            filename = checkpoint_filename(config, latest=True)
+            for i in range(num_agents):
+                save_params(negotiate_state[i], f"./checkpoints/moca/{filename}_negotiate_{i}.pkl")
+            print(f"[checkpoint] MOCA negotiation policies at update {update_step}")
 
         def progress_callback(update_step, mean_val, phase):
             update_step = int(update_step)
@@ -847,6 +1042,14 @@ def make_train(config):
                 _update_step_phase2_solver, runner_state2, None,
                 config["NUM_UPDATES_PHASE2"],
             )
+        elif phase2_mode == "negotiate":
+            runner_state2 = (frozen_params, negotiate_state, env_state, last_obs,
+                             update_step, rng)
+            runner_state2, metric2 = jax.lax.scan(
+                _update_step_phase2_negotiate, runner_state2, None,
+                config["NUM_UPDATES_PHASE2"],
+            )
+            out["negotiate_state"] = runner_state2[1]
         else:
             runner_state2 = (frozen_params, proposal_state, voting_state,
                              env_state, last_obs, update_step, rng)

@@ -20,6 +20,14 @@ from typing import Tuple
 import jax
 import jax.numpy as jnp
 
+# Contract-state indicators, matching the reference implementation's
+# `self.contract_state` values (two_stage_train.py). They ride along in the
+# contract observation so a single policy can distinguish the negotiation stages
+# from ordinary play.
+SUBGAME = 0.0    # playing the game with a contract in force
+PROPOSE = 2.0    # agent 0 is choosing a contract to offer
+AGREE = 3.0      # the offered contract awaits accept/reject
+
 
 class CleanupContract:
     """Scalar contract space for Clean Up: pay `theta` per waste cell cleaned.
@@ -103,7 +111,7 @@ class CleanupContract:
 
     # ------------------------------------------------------------- observation
 
-    def to_obs(self, theta: jnp.ndarray) -> jnp.ndarray:
+    def to_obs(self, theta: jnp.ndarray, stage: float = SUBGAME) -> jnp.ndarray:
         """Contract feature vector [theta_normalised, stage] for the policy.
 
         theta is min-max normalised onto [0, 1] so the input is well scaled for the
@@ -111,11 +119,17 @@ class CleanupContract:
         small as 0.2, which would be a negligible input next to CNN activations).
         This is a numerical change only -- the ordering and semantics of the
         contract space are untouched.
+
+        `stage` is the reference implementation's contract-state indicator, carried
+        raw (0/2/3) as it is there -- its observation Box runs to high=3.0. It is
+        what lets one policy tell "propose a contract" from "accept or reject this
+        contract" from "play the game under this contract". Defaults to SUBGAME, so
+        every existing caller keeps the behaviour it had.
         """
         theta = jnp.asarray(theta, dtype=jnp.float32)
         theta_norm = (theta - self.low) / (self.high - self.low)
-        stage = jnp.zeros_like(theta_norm)  # always the subgame stage
-        return jnp.stack([theta_norm, stage], axis=-1)
+        stage_arr = jnp.full_like(theta_norm, jnp.float32(stage))
+        return jnp.stack([theta_norm, stage_arr], axis=-1)
 
     # --------------------------------------------------------------- transfers
 

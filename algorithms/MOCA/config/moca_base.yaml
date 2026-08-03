@@ -43,8 +43,14 @@
 #                  negotiate=False, disabling the learned proposal game entirely.
 #                  No proposer, no voting; contracts are scored by the frozen
 #                  critic and chosen by a majority decision rule.
+#   "negotiate" -- the learned contracting game of Algorithm 1, as the authors
+#                  coded it for their other domains: agent 0 always proposes, the
+#                  action is a continuous Box [theta, accept_prob], nu sampled
+#                  non-proposers gate the contract with the product of their
+#                  accept probabilities, and it is trained by PPO over a two-step
+#                  episode (propose, agree, then the frozen rollout as reward).
 #   "reinforce" -- this repo's discretised proposal/voting game (VOTER_SAMPLE_NU,
-#                  CONTRACT_* settings below). Kept so the two can be compared.
+#                  CONTRACT_* settings below). Kept so the three can be compared.
 "PHASE2_MODE": "solver"
 
 # ---- Solver phase 2 (PHASE2_MODE: solver) ---------------------------------
@@ -57,6 +63,15 @@
 # rule behind the published Cleanup numbers). "max": pure welfare maximisation,
 # ignoring whether agents would accept.
 "SOLVER_DECISION_RULE": "majority"
+
+# ---- Learned negotiation stage (PHASE2_MODE: negotiate) -------------------
+# Non-proposers polled on agent 0's offer. The reference takes 2 above 3 agents
+# and all of them below; null here means "use that rule for this num_agents".
+"NEGOTIATE_NU": null
+# The negotiation stage is its own PPO trainer in the reference, so it gets its
+# own learning rate and epoch count rather than sharing phase 1's.
+"NEGOTIATE_LR": 0.0005
+"NEGOTIATE_UPDATE_EPOCHS": 4
 
 # ---- REINFORCE phase 2 (PHASE2_MODE: reinforce) ---------------------------
 # Number of non-proposing agents polled on a proposal. The paper samples nu agents

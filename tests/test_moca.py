@@ -321,6 +321,66 @@ def test_solver_values_come_from_the_frozen_critic():
         "values do not depend on the contract"
 
 
+# -------------------------------------------- learned negotiation stage
+
+def test_negotiate_default_nu_follows_reference_branch():
+    """`random.sample(range(1, n), 2)` above 3 agents, every non-proposer below."""
+    from algorithms.MOCA.negotiate import default_nu
+    assert default_nu(2) == 1
+    assert default_nu(3) == 2
+    for n in (4, 5, 7, 12):
+        assert default_nu(n) == 2, f"nu should stay 2 at {n} agents"
+
+
+def test_negotiate_voters_exclude_the_fixed_proposer():
+    """Agent 0 always proposes, so it is never polled, and exactly nu others are."""
+    from algorithms.MOCA.negotiate import sample_voters
+    mask = np.array(sample_voters(jax.random.PRNGKey(0), 7, 2, 256))
+    assert not mask[0].any(), "the proposer must never be sampled as a voter"
+    assert np.all(mask.sum(axis=0) == 2), "exactly nu voters per env"
+    # Every non-proposer should get polled sometimes -- otherwise the sampling is
+    # biased and some agents would never learn an acceptance policy.
+    assert np.all(mask[1:].sum(axis=1) > 0)
+
+
+def test_negotiate_acceptance_is_product_of_polled_probabilities():
+    """Only the sampled agents gate the contract; the rest are ignored entirely."""
+    from algorithms.MOCA.negotiate import acceptance
+    probs = jnp.array([[0.0], [0.5], [0.5], [0.0]])      # agents 0 and 3 would veto
+    mask = jnp.array([[False], [True], [True], [False]])  # but only 1 and 2 are polled
+    _, prod = acceptance(jax.random.PRNGKey(0), probs, mask)
+    assert abs(float(prod[0]) - 0.25) < 1e-6, f"expected 0.5*0.5, got {float(prod[0])}"
+
+    # Acceptance frequency must track that product.
+    probs = jnp.full((3, 4000), 0.5)
+    mask = jnp.array([[False], [True], [True]]).repeat(4000, axis=1)
+    accepted, _ = acceptance(jax.random.PRNGKey(1), probs, mask)
+    assert abs(float(accepted.mean()) - 0.25) < 0.03
+
+
+def test_negotiate_unsquash_covers_the_action_bounds():
+    """RLlib's normalize_actions mapping: [-1, 1] onto [low, high], clipped."""
+    from algorithms.MOCA.negotiate import unsquash
+    raw = jnp.array([-2.0, -1.0, 0.0, 1.0, 2.0])
+    got = np.array(unsquash(raw, 0.0, 0.2))
+    assert np.allclose(got, [0.0, 0.0, 0.1, 0.2, 0.2]), got
+
+
+def test_negotiate_gae_credits_the_proposal_through_the_value_function():
+    """Reward lands only on the agreement step, so the proposal step is credited
+    via the critic -- that bootstrap is what makes this PPO rather than a bandit."""
+    from algorithms.MOCA.negotiate import two_step_gae
+    rewards = jnp.array([[0.0], [10.0]])
+    values = jnp.array([[0.0], [4.0]])
+    adv, targets = two_step_gae(rewards, values, gamma=1.0, gae_lambda=1.0)
+    assert abs(float(adv[1, 0]) - 6.0) < 1e-6      # 10 - 4
+    assert abs(float(adv[0, 0]) - 10.0) < 1e-6     # (0 + 1*4 - 0) + 1*1*6
+    assert np.allclose(np.array(targets), np.array(adv + values))
+    # A proposal that leads nowhere must not be credited.
+    adv0, _ = two_step_gae(jnp.array([[0.0], [0.0]]), values, 1.0, 1.0)
+    assert float(adv0[0, 0]) < float(adv[0, 0])
+
+
 def _phase2_cfg(**overrides):
     """Tiny end-to-end MOCA config that still exercises the real phase-2 code path."""
     cfg = {
@@ -435,6 +495,31 @@ def test_solver_phase2_runs_end_to_end():
     assert np.all((theta >= lo) & (theta <= hi)), f"theta out of range: {theta}"
     null_rate = np.array(m["stage_2/solver_null_rate"])
     assert np.all((null_rate >= 0.0) & (null_rate <= 1.0))
+
+
+def test_negotiate_phase2_runs_end_to_end():
+    """Agent 0's offers must be continuous (not snapped to the REINFORCE grid), and
+    an unsigned contract must fall back to null."""
+    m, cfg = _run_phase2("negotiate")
+    assert m["__has_proposal_state__"] is False
+    for k in ("stage_2/contract_theta_proposed", "stage_2/contract_accept_prob",
+              "stage_2/negotiate_policy_entropy"):
+        assert k in m, f"missing negotiate metric {k}; got {sorted(m)}"
+
+    lo, hi = cfg["CONTRACT_LOW"], cfg["CONTRACT_HIGH"]
+    proposed = np.array(m["stage_2/contract_theta_proposed"])
+    assert np.all((proposed >= lo) & (proposed <= hi)), proposed
+    grid = np.linspace(lo, hi, cfg["NUM_CONTRACT_BINS"])
+    assert not np.isclose(proposed[:, None], grid).any(axis=-1).all(), \
+        "proposals look discretised; the negotiation action space must be continuous"
+
+    # theta_eff is theta_prop on signing and null otherwise, so averaged over envs
+    # it can never exceed the proposal.
+    effective = np.array(m["stage_2/contract_theta_effective"])
+    assert np.all(effective <= proposed + 1e-6), \
+        "effective contract exceeded the proposal; rejection must fall back to null"
+    acc = np.array(m["stage_2/contract_accept_rate"])
+    assert np.all((acc >= 0.0) & (acc <= 1.0))
 
 
 def test_phase2_mode_validated():

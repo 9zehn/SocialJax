@@ -34,6 +34,21 @@ def single_run(config, make_train, *, wandb_name):
     for i in range(num_agents):
         save_params(train_state[i], f"./checkpoints/moca/{filename}_{i}.pkl")
 
+    if "negotiate_state" in out:
+        for i in range(num_agents):
+            save_params(out["negotiate_state"][i],
+                        f"./checkpoints/moca/{filename}_negotiate_{i}.pkl")
+        m = out["metrics_phase2"]
+        theta = np.array(m["stage_2/contract_theta_proposed"])
+        eff = np.array(m["stage_2/contract_theta_effective"])
+        acc = np.array(m["stage_2/contract_accept_rate"])
+        tail = max(len(theta) // 10, 1)
+        print("\n=== Learned negotiation stage (agent 0 proposes) ===")
+        print(f"  proposed theta (last 10%) : {theta[-tail:].mean():.4f}")
+        print(f"  effective theta (last 10%): {eff[-tail:].mean():.4f}")
+        print(f"  accept rate (last 10%)    : {acc[-tail:].mean():.4f}")
+        return out
+
     if "proposal_state" not in out:
         # Solver phase 2: nothing is learned in phase 2, so the run's result is the
         # contract the search settled on, which lives in the logged metrics rather
