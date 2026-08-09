@@ -606,6 +606,19 @@ def test_phase1_only_and_phase1_from_are_mutually_exclusive():
         raise AssertionError("setting both should raise")
 
 
+def test_phase1_from_rejects_an_empty_value():
+    """An unset shell variable makes PHASE1_FROM the empty string, which is falsy and
+    would silently train phase 1 instead -- visible only as a 90/10 update split."""
+    from algorithms.MOCA.moca_cnn_cleanup import make_train
+    for empty in ("", "   "):
+        try:
+            make_train(_phase2_cfg(PHASE2_MODE="solver", PHASE1_FROM=empty))
+        except ValueError as e:
+            assert "PHASE1_FROM" in str(e) and "empty" in str(e), e
+        else:
+            raise AssertionError(f"PHASE1_FROM={empty!r} should raise")
+
+
 def test_phase1_from_rejects_a_wrong_agent_count():
     """A glob that also catches the contracting checkpoints would silently load the
     wrong weights, so the count is checked against the env."""

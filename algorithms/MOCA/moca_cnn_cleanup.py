@@ -233,6 +233,17 @@ def make_train(config):
         )
     config["PHASE1_ONLY"] = phase1_only
 
+    # An UNSET shell variable expands to nothing, so `PHASE1_FROM="$P1"` arrives as
+    # the empty string -- which is falsy, and would silently fall through to a full
+    # phase-1 training run that looks superficially fine. Refuse it instead: the
+    # difference only shows up as a 90/10 update split buried in the progress lines.
+    if phase1_from is not None and not str(phase1_from).strip():
+        raise ValueError(
+            "PHASE1_FROM was set but is empty -- the shell variable holding the glob "
+            "is probably unset (it does not survive between Colab cells). Define it "
+            "in the SAME command, or omit PHASE1_FROM to train phase 1 deliberately."
+        )
+
     loaded_phase1 = None
     if phase1_from:
         import glob
