@@ -41,7 +41,7 @@ import socialjax
 from socialjax.wrappers.baselines import LogWrapper
 import wandb
 
-from algorithms.utils import checkpoint_filename, save_params, save_train_state
+from algorithms.utils import checkpoint_filename, load_params, save_params, save_train_state
 from algorithms.MOCA import negotiate, solver
 from algorithms.MOCA.contracts import AGREE, PROPOSE, make_contract
 from algorithms.MOCA.networks import (
@@ -135,9 +135,9 @@ STAGE2_SOLVER_METRICS = (
     "contract_theta_std",       # do the per-env negotiations agree?
     "solver_null_rate",         # how often nothing beat the null contract
     "solver_accept_count",      # agents preferring the chosen contract to null
-    "solver_value_gain",        # predicted welfare gain over the null contract
+    "solver_predicted_welfare",  # critic's estimate; compare against `welfare`
     "cleaned_by_agent_mean",
-    "welfare",
+    "welfare",                  # realised
     "equality",
 )
 
@@ -212,9 +212,34 @@ def make_train(config):
             f"num_inner_steps={inner_steps}. Set them equal."
         )
 
+    # Skip phase 1 entirely and run phase 2 against a saved gameplay policy.
+    #
+    # The point of this is controlled comparison. A phase-2 decision rule does not
+    # touch phase 1, and the solver family does not train in phase 2 at all, so
+    # comparing N rules by running N full trainings would retrain an identical
+    # phase 1 N times -- and any difference in the phase-1 policies would then
+    # confound the comparison it was meant to isolate. Loading one frozen policy
+    # makes every arm exact.
+    phase1_from = config.get("PHASE1_FROM")
+    loaded_phase1 = None
+    if phase1_from:
+        import glob
+        matches = sorted(glob.glob(phase1_from))
+        if len(matches) != num_agents:
+            raise ValueError(
+                f"PHASE1_FROM={phase1_from!r} matched {len(matches)} files but the env "
+                f"has {num_agents} agents. Point it at the per-agent GAMEPLAY policies "
+                f"(not _contract_/_proposal_/_voting_/_resume_): {matches}"
+            )
+        loaded_phase1 = [load_params(m) for m in matches]
+        print(f"[MOCA] phase 1 loaded from {len(matches)} checkpoints; skipping phase-1 "
+              f"training and running phase 2 only", flush=True)
+
     # Split the update budget 90/10 as in Algorithm 1.
-    phase1_frac = config.get("PHASE1_FRAC", 0.9)
-    config["NUM_UPDATES_PHASE1"] = max(int(config["NUM_UPDATES"] * phase1_frac), 1)
+    phase1_frac = 0.0 if phase1_from else config.get("PHASE1_FRAC", 0.9)
+    config["NUM_UPDATES_PHASE1"] = (
+        0 if phase1_from else max(int(config["NUM_UPDATES"] * phase1_frac), 1)
+    )
     config["NUM_UPDATES_PHASE2"] = max(
         config["NUM_UPDATES"] - config["NUM_UPDATES_PHASE1"], 1
     )
@@ -259,9 +284,10 @@ def make_train(config):
         config.setdefault("SOLVER_DECISION_RULE", "majority")
         if config["SOLVER_SAMPLES"] < 1:
             raise ValueError(f"SOLVER_SAMPLES must be >= 1, got {config['SOLVER_SAMPLES']}")
-        if config["SOLVER_DECISION_RULE"] not in ("majority", "max"):
+        if config["SOLVER_DECISION_RULE"] not in solver.DECISION_RULES:
             raise ValueError(
-                f"SOLVER_DECISION_RULE must be 'majority' or 'max', got "
+                f"SOLVER_DECISION_RULE must be one of "
+                f"{', '.join(solver.DECISION_RULES)}, got "
                 f"{config['SOLVER_DECISION_RULE']!r}"
             )
 
@@ -342,7 +368,11 @@ def make_train(config):
         init_onehot = jnp.zeros((1, num_agents))
         init_theta = jnp.zeros((1,))
 
-        network_params = [network[i].init(_rng, init_x, init_c) for i in range(num_agents)]
+        network_params = (
+            loaded_phase1
+            if loaded_phase1 is not None
+            else [network[i].init(_rng, init_x, init_c) for i in range(num_agents)]
+        )
         proposal_params = [proposal_net[i].init(_rng) for i in range(num_agents)]
         voting_params = [
             voting_net[i].init(_rng, init_onehot, init_theta) for i in range(num_agents)
@@ -1038,9 +1068,15 @@ def make_train(config):
         # --------------------------------------------------------------- run
         rng, _rng = jax.random.split(rng)
         runner_state = (train_state, env_state, obsv, 0, _rng)
-        runner_state, metric1 = jax.lax.scan(
-            _update_step_phase1, runner_state, None, config["NUM_UPDATES_PHASE1"]
-        )
+        if config["NUM_UPDATES_PHASE1"] == 0:
+            # PHASE1_FROM: the policy is already trained, so there is nothing to
+            # scan over. Skipped in Python rather than run as a zero-length scan so
+            # metrics_phase1 is absent rather than empty.
+            metric1 = None
+        else:
+            runner_state, metric1 = jax.lax.scan(
+                _update_step_phase1, runner_state, None, config["NUM_UPDATES_PHASE1"]
+            )
 
         # FREEZE the gameplay policy: phase 2 only ever reads these params.
         train_state, env_state, last_obs, update_step, rng = runner_state
@@ -1049,8 +1085,9 @@ def make_train(config):
         out = {
             "runner_state": (train_state,),
             "contract_grid": contract_grid,
-            "metrics_phase1": metric1,
         }
+        if metric1 is not None:
+            out["metrics_phase1"] = metric1
 
         if phase2_mode == "solver":
             # No contracting policies to carry: the solver reads the frozen critic

@@ -294,6 +294,46 @@ def test_solver_falls_back_to_null_contract():
     assert int(select_contract(values, "majority")[0]) == 0
 
 
+def test_bargaining_rules_require_unanimity():
+    """A contract a majority likes but one agent is worse off under is feasible for
+    the reference's `majority` rule and infeasible for every bargaining rule, since a
+    bargaining solution is defined only on outcomes dominating the disagreement point
+    for EVERY agent."""
+    from algorithms.MOCA.solver import select_contract, BARGAINING_RULES
+    # 3 agents, 1 env, row 0 = null. k1 has the highest welfare but agent 2 loses.
+    v = jnp.array([
+        [[10.], [10.], [10.]],      # k0 null,  gains (0, 0, 0)
+        [[70.], [11.], [9.0]],      # k1 welfare 90, gains (60, 1, -1)
+        [[30.], [20.], [13.]],      # k2 welfare 63, gains (20, 10, 3)
+    ])
+    assert int(select_contract(v, "majority")[0]) == 1, "majority should take k1"
+    for rule in BARGAINING_RULES:
+        assert int(select_contract(v, rule)[0]) == 2, f"{rule} must reject k1"
+
+
+def test_bargaining_rules_pick_their_own_solutions():
+    """Nash, Kalai-Smorodinsky and egalitarian must actually differ -- otherwise the
+    comparison between them measures nothing."""
+    from algorithms.MOCA.solver import select_contract
+    v = jnp.array([
+        [[10.], [10.], [10.]],      # k0 null
+        [[30.], [20.], [13.]],      # k1 gains (20, 10,  3), product 600
+        [[16.], [16.], [16.]],      # k2 gains ( 6,  6,  6), product 216, maximin 6
+        [[24.], [18.], [14.]],      # k3 gains (14,  8,  4), product 448
+    ])
+    assert int(select_contract(v, "nash")[0]) == 1, "nash maximises the gain product"
+    assert int(select_contract(v, "egalitarian")[0]) == 2, "egalitarian maximises min gain"
+    # KS equalises fraction-of-ideal: ideals are (20, 10, 6), so k3 scores
+    # min(0.70, 0.80, 0.67) = 0.67 against k1's min(1, 1, 0.5) = 0.5.
+    assert int(select_contract(v, "kalai_smorodinsky")[0]) == 3
+
+
+def test_bargaining_falls_back_to_null_when_nothing_is_unanimous():
+    from algorithms.MOCA.solver import select_contract
+    v = jnp.array([[[10.], [10.]], [[50.], [1.0]]])
+    assert int(select_contract(v, "nash")[0]) == 0
+
+
 def test_solver_rejects_unknown_decision_rule():
     from algorithms.MOCA.solver import select_contract
     try:
@@ -520,6 +560,51 @@ def test_negotiate_phase2_runs_end_to_end():
         "effective contract exceeded the proposal; rejection must fall back to null"
     acc = np.array(m["stage_2/contract_accept_rate"])
     assert np.all((acc >= 0.0) & (acc <= 1.0))
+
+
+def test_phase1_from_skips_phase1_training():
+    """Loading a phase-1 policy must skip phase 1 entirely, so a protocol comparison
+    runs one training and N cheap phase-2 arms instead of retraining an identical
+    phase 1 per arm."""
+    import tempfile
+    from algorithms.MOCA.moca_cnn_cleanup import make_train
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _write_fake_negotiate_run(tmp, n=5)
+        stem = Path(tmp) / "clean_up_seed42_reward_individual_agents5_negotiate"
+        cfg = _phase2_cfg(PHASE2_MODE="solver", PHASE1_FROM=f"{stem}_[0-9].pkl")
+        make_train(cfg)
+        assert cfg["NUM_UPDATES_PHASE1"] == 0, cfg["NUM_UPDATES_PHASE1"]
+        assert cfg["NUM_UPDATES_PHASE2"] > 0
+
+
+def test_phase1_from_rejects_a_wrong_agent_count():
+    """A glob that also catches the contracting checkpoints would silently load the
+    wrong weights, so the count is checked against the env."""
+    import tempfile
+    from algorithms.MOCA.moca_cnn_cleanup import make_train
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pattern = _write_fake_negotiate_run(tmp, n=5)   # matches gameplay AND contract
+        try:
+            make_train(_phase2_cfg(PHASE2_MODE="solver", PHASE1_FROM=pattern))
+        except ValueError as e:
+            assert "PHASE1_FROM" in str(e) and "agents" in str(e), e
+        else:
+            raise AssertionError("a 10-file glob for a 5-agent env should raise")
+
+
+def test_solver_decision_rule_is_in_the_checkpoint_name():
+    """Solver arms differ only in the rule and share a seed, so the rule must be in
+    the path or every arm of the comparison overwrites the last."""
+    from algorithms.utils import checkpoint_filename
+    names = set()
+    for rule in ("majority", "nash", "egalitarian"):
+        cfg = _phase2_cfg(PHASE2_MODE="solver", SOLVER_DECISION_RULE=rule)
+        name = checkpoint_filename(cfg)
+        assert rule in name, f"{rule} missing from {name}"
+        names.add(name)
+    assert len(names) == 3, names
 
 
 def test_phase2_mode_validated():

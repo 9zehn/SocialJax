@@ -76,6 +76,13 @@ def checkpoint_filename(config: Dict[str, Any], latest: bool = False) -> str:
     phase2_mode = config.get("PHASE2_MODE")
     if phase2_mode:
         suffix += f"_{phase2_mode}"
+        # Solver arms differ only in the decision rule, and are meant to be run
+        # against one shared phase-1 policy at the same seed -- so without the rule
+        # in the name every arm of that comparison lands on one path.
+        if phase2_mode == "solver":
+            rule = config.get("SOLVER_DECISION_RULE")
+            if rule:
+                suffix += f"_{rule}"
 
     name = f'{config["ENV_NAME"]}_seed{config["SEED"]}{suffix}'
     return f"{name}_latest" if latest else name

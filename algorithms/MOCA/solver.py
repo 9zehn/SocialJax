@@ -88,6 +88,52 @@ def contract_values(networks, params, obs_batch, contract, thetas):
     return jax.lax.map(values_for, thetas)
 
 
+BARGAINING_RULES = ("nash", "kalai_smorodinsky", "egalitarian")
+DECISION_RULES = ("majority", "max") + BARGAINING_RULES
+
+
+def _bargaining_select(values, rule: str):
+    """Axiomatic bargaining solutions over the sampled contracts.
+
+    These differ from the reference's rules in two ways, both deliberate:
+
+    * Participation is UNANIMOUS. A bargaining solution is defined on the set of
+      outcomes that dominate the disagreement point for EVERY agent, so a contract
+      a single agent dislikes is infeasible -- where `majority` would let it pass.
+    * Feasibility uses a weak inequality (gain >= 0), the axiomatic convention,
+      against the reference's strict `>` for counting acceptances. The null contract
+      therefore always sits in the feasible set with a gain of exactly 0, so the
+      mechanism can decline.
+
+    The disagreement point is V_i(s_0, 0), the same object the acceptance rule and
+    the solver already use.
+    """
+    disagreement = values[0]                          # (N, num_envs)
+    gains = values - disagreement[None, :, :]         # (K, N, num_envs)
+    feasible = (gains >= 0.0).all(axis=1)             # (K, num_envs), unanimity
+    feasible = feasible.at[0].set(True)
+
+    if rule == "egalitarian":
+        score = gains.min(axis=1)                     # maximin on absolute gain
+    elif rule == "nash":
+        # Sum of logs, not a raw product: with several agents and gains of order
+        # 100 the product overflows, and log is monotone so the argmax is identical.
+        # Infeasible entries are masked out below, so clipping at ~0 only affects
+        # the null contract, which correctly scores worst.
+        score = jnp.log(jnp.maximum(gains, 1e-12)).sum(axis=1)
+    elif rule == "kalai_smorodinsky":
+        # Each agent's best attainable gain over the FEASIBLE set, so the ideal
+        # point respects participation rather than being read off contracts nobody
+        # would sign.
+        masked = jnp.where(feasible[:, None, :], gains, -jnp.inf)
+        ideal = jnp.maximum(masked.max(axis=0), 1e-12)          # (N, num_envs)
+        score = (gains / ideal[None, :, :]).min(axis=1)
+    else:
+        raise ValueError(f"unknown bargaining rule {rule!r}")
+
+    return jnp.argmax(jnp.where(feasible, score, -jnp.inf), axis=0).astype(jnp.int32)
+
+
 def select_contract(values, rule: str = "majority"):
     """Index of the chosen contract per env, given (K, N, num_envs) critic values.
 
@@ -100,8 +146,12 @@ def select_contract(values, rule: str = "majority"):
     Returns:
         (num_envs,) int32 index into the leading axis of `values`.
     """
-    if rule not in ("majority", "max"):
-        raise ValueError(f"unknown decision rule {rule!r} (available: 'majority', 'max')")
+    if rule not in DECISION_RULES:
+        raise ValueError(
+            f"unknown decision rule {rule!r} (available: {', '.join(DECISION_RULES)})"
+        )
+    if rule in BARGAINING_RULES:
+        return _bargaining_select(values, rule)
 
     welfare = values.sum(axis=1)                     # (K, num_envs)
     if rule == "max":
@@ -138,5 +188,10 @@ def negotiate(key, networks, params, obs_batch, contract, num_samples, rule="maj
         "solver_null_rate": (best == 0).mean(),
         "solver_accept_count": (chosen_values > disagreement).sum(axis=0).mean(),
         "solver_value_gain": (chosen_values - disagreement).sum(axis=0).mean(),
+        # Predicted welfare at the chosen contract. Logged so it can be compared
+        # against the welfare the episode ACTUALLY produces: every rule here selects
+        # on critic estimates, so if the two diverge the whole solver family is
+        # choosing on bad information and the comparison between rules is moot.
+        "solver_predicted_welfare": chosen_values.sum(axis=0).mean(),
     }
     return theta, info

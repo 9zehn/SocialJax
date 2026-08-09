@@ -74,11 +74,25 @@
 # the reference default (NegotiationSolver's contract_samples=50). The null
 # contract is always evaluated in addition to these.
 "SOLVER_SAMPLES": 50
-# "majority": maximise summed agent values subject to at least half the agents
-# preferring the contract to the null contract (the reference default, and the
-# rule behind the published Cleanup numbers). "max": pure welfare maximisation,
-# ignoring whether agents would accept.
+# How the sampled contracts are chosen between.
+#   "majority"           maximise summed agent values subject to at least half the
+#                        agents preferring the contract to the null (the reference
+#                        default, and the rule behind the published Cleanup numbers)
+#   "max"                pure welfare maximisation, ignoring acceptance
+#   "nash"               Nash bargaining: maximise the product of gains over the null
+#   "kalai_smorodinsky"  equalise each agent's fraction of its best attainable gain
+#   "egalitarian"        maximise the smallest gain (maximin)
+# The three bargaining rules require UNANIMOUS participation -- a solution is
+# defined on outcomes dominating the disagreement point for every agent -- where
+# "majority" lets a contract pass over a minority's objection.
 "SOLVER_DECISION_RULE": "majority"
+
+# Skip phase-1 training and run phase 2 against saved gameplay policies (a glob
+# matching one file per agent). This is what makes a protocol comparison
+# controlled: the decision rule never touches phase 1, so every arm should share
+# one frozen policy rather than retraining an identical phase 1 per arm and
+# letting phase-1 variation confound the comparison.
+"PHASE1_FROM": null
 
 # ---- Learned negotiation stage (PHASE2_MODE: negotiate) -------------------
 # What is actually negotiated is a single scalar: theta, the payment per waste
