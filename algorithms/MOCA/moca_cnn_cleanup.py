@@ -99,6 +99,7 @@ STAGE1_METRICS = (
     "shaped_rewards_mean",             # read by progress_callback
     "cleaned_by_agent_mean",           # public-good provision
     "cleaned_by_agent_std",            # is cleaning concentrated in a few agents?
+    "waste_cleared_mean",              # river state: cells NOT dirt, higher = cleaner
     # Outcome measures the contracting results are stated in.
     "welfare",
     "equality",
@@ -122,6 +123,7 @@ STAGE2_METRICS = (
     # Did the contract change behaviour? Transfers are zero-sum, so welfare can
     # only move if cleaning does.
     "cleaned_by_agent_mean",
+    "waste_cleared_mean",              # river state: cells NOT dirt, higher = cleaner
     "transfer_volume",
     # Headline outcomes.
     "welfare",
@@ -137,6 +139,7 @@ STAGE2_SOLVER_METRICS = (
     "solver_accept_count",      # agents preferring the chosen contract to null
     "solver_predicted_welfare",  # critic's estimate; compare against `welfare`
     "cleaned_by_agent_mean",
+    "waste_cleared_mean",              # river state: cells NOT dirt, higher = cleaner
     "welfare",                  # realised
     "equality",
 )
@@ -150,6 +153,7 @@ STAGE2_NEGOTIATE_METRICS = (
     "contract_accept_prob",      # the product of the polled agents' probabilities
     "negotiate_policy_entropy",  # falling entropy = the proposal is converging
     "cleaned_by_agent_mean",
+    "waste_cleared_mean",              # river state: cells NOT dirt, higher = cleaner
     "welfare",
     "equality",
 )
