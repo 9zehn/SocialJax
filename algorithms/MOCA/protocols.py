@@ -183,6 +183,66 @@ def p_descending_receiver_veto(t):
     return _descend(t, ok)
 
 
+def p_highest_acceptance(t):
+    """Everyone proposes; the proposal the MOST agents would accept wins.
+
+    This is approval voting over the agents' ideal points. Its weakness is not
+    strategic -- unlike max-selection there is no dominant bid -- but distributional:
+    the most widely-acceptable proposal is the one nearest the majority's preference,
+    so with more harvesters than cleaners it tracks the harvesters. It also gives
+    every agent an incentive to propose what is POPULAR rather than what it wants,
+    since a proposal only wins by being agreeable, which collapses the proposals
+    toward one point and throws away the minority's preference entirely.
+    """
+    r = t["returns"]
+    cands = sorted(set(ideal_points(r).tolist()))
+    counts = [(accepts(r, k).sum(), r[k].sum(), k) for k in cands]
+    counts.sort(reverse=True)                     # most accepts, welfare as tie-break
+    best = counts[0][2]
+    return best if majority_ok(r, best) else 0
+
+
+def p_random_dictator(t):
+    """Each agent in turn is the sole proposer; report the welfare-median outcome.
+
+    Rotating proposal rights is the obvious "make it fair by symmetry" fix. It
+    equalises rights ex ante but every individual episode is still an ultimatum, so
+    it trades a systematic bias for variance rather than removing the extraction.
+    """
+    r = t["returns"]
+    picks = []
+    for i in range(r.shape[1]):
+        ok = np.array([unanimous_ok(r, k, exclude=(i,)) for k in range(len(r))])
+        ok[0] = True
+        picks.append(int(np.argmax(np.where(ok, r[:, i], -np.inf))))
+    return int(np.median(picks))
+
+
+def p_supermajority(t):
+    """Welfare-max subject to at least 80% of agents accepting."""
+    r = t["returns"]
+    need = int(np.ceil(0.8 * r.shape[1]))
+    ok = np.array([accepts(r, k).sum() >= need for k in range(len(r))])
+    ok[0] = True
+    return int(np.argmax(np.where(ok, r.sum(axis=1), -np.inf)))
+
+
+def p_cleaner_veto(t):
+    """Welfare-max subject to a majority AND every net receiver accepting.
+
+    Gives the agents being paid -- the minority the contract exists to compensate --
+    a hard veto, rather than letting the agents funding it outvote them.
+    """
+    r, b = t["returns"], t["base_returns"]
+    ok = []
+    for k in range(len(r)):
+        recv = net_receivers(r, b, k)
+        ok.append(majority_ok(r, k) and (not recv.any() or accepts(r, k)[recv].all()))
+    ok = np.array(ok)
+    ok[0] = True
+    return int(np.argmax(np.where(ok, r.sum(axis=1), -np.inf)))
+
+
 # ------------------------------------------------- bargaining-solution refs
 
 def p_nash(t):
@@ -219,6 +279,10 @@ PROTOCOLS = [
     ("descending, strategic, free delay", p_descending_strategic_nodelay),
     ("descending, strategic, costly delay", p_descending_strategic_costly),
     ("descending + receiver veto", p_descending_receiver_veto),
+    ("all propose, highest acceptance", p_highest_acceptance),
+    ("random dictator (rotating proposer)", p_random_dictator),
+    ("supermajority (80%)", p_supermajority),
+    ("majority + cleaner veto", p_cleaner_veto),
     ("[ref] Nash bargaining", p_nash),
     ("[ref] Kalai-Smorodinsky", p_kalai_smorodinsky),
     ("[ref] egalitarian (maximin gain)", p_egalitarian),
