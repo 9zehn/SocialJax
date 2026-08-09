@@ -512,12 +512,14 @@ class Clean_up(MultiAgentEnv):
         #
         # Pass dirt_spawn_cells=1 to recover upstream.
         dirt_spawn_cells=2,
-        # Dirt fraction the episode STARTS at. Must sit below thresholdDepletion
-        # (0.4) for any apple to grow at reset; upstream effectively uses 0.473, so
-        # the map opens past the gate with zero apples and no harvest until roughly
-        # 13 cells are cleared. 0.35 leaves a small standing flow from step 0.
-        # Pass 0.473 to recover upstream's fully-dirty river.
-        initial_dirt_fraction=0.35,
+        # Dirt fraction the episode STARTS at. Upstream marks all of the map's DIRT,
+        # which is 0.473 -- above the 0.4 thresholdDepletion gate, so no apple grows
+        # at reset and there is nothing to harvest until roughly 13 cells have been
+        # cleared. Kept at the upstream value by default.
+        # Pass anything below 0.4 (e.g. 0.35) to open with a standing apple flow, so
+        # harvesting is viable from step 0 and the dilemma is about sustaining the
+        # commons rather than resurrecting it.
+        initial_dirt_fraction=0.473,
         # Add payment-state channels to the observation (see _get_obs). OFF by default:
         # turning it on changes the observation SHAPE, so a policy trained with it is
         # not loadable by, or comparable to, a baseline trained without it.
