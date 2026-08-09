@@ -503,11 +503,17 @@ def test_phase2_signs_contracts_and_leaves_uniform():
     m, cfg = _run_phase2("reinforce")
     num_agents = cfg["ENV_KWARGS"]["num_agents"]
 
-    rate = float(np.mean(np.array(m["stage_2/contract_accept_rate"])))
+    # The FIRST update, before the voting policy has taken a gradient step: its
+    # logits are still ~0, so p(accept) ~ 0.5 each and the realised rate is
+    # 0.5**nu against 0.5**(N-1) if every non-proposer were polled. Averaging over
+    # all updates instead would conflate "nu sampling is in effect" -- the thing
+    # under test -- with "the voters learned to reject", which is a legitimate
+    # response to the environment and moves with the ecology.
+    rate = float(np.array(m["stage_2/contract_accept_rate"])[0])
     poll_everyone = 0.5 ** (num_agents - 1)
     assert rate > 3 * poll_everyone, (
-        f"accept rate {rate:.3f} is near the {poll_everyone:.3f} expected when every "
-        f"non-proposer is polled -- nu voter sampling is not in effect"
+        f"initial accept rate {rate:.3f} is near the {poll_everyone:.3f} expected "
+        f"when every non-proposer is polled -- nu voter sampling is not in effect"
     )
 
     ent = np.array(m["stage_2/contract_proposal_entropy"])
@@ -576,6 +582,28 @@ def test_phase1_from_skips_phase1_training():
         make_train(cfg)
         assert cfg["NUM_UPDATES_PHASE1"] == 0, cfg["NUM_UPDATES_PHASE1"]
         assert cfg["NUM_UPDATES_PHASE2"] > 0
+
+
+def test_phase1_only_skips_phase2_and_keeps_the_whole_budget():
+    """PHASE1_ONLY produces the shared policy the comparison arms load, so it gets
+    all of TOTAL_TIMESTEPS rather than the usual 90%, and returns no phase-2
+    metrics for _runner to report on."""
+    from algorithms.MOCA.moca_cnn_cleanup import make_train
+    cfg = _phase2_cfg(PHASE1_ONLY=True)
+    make_train(cfg)
+    assert cfg["NUM_UPDATES_PHASE1"] == cfg["NUM_UPDATES"], cfg["NUM_UPDATES_PHASE1"]
+    assert cfg["NUM_UPDATES_PHASE2"] == 0
+
+
+def test_phase1_only_and_phase1_from_are_mutually_exclusive():
+    """They are opposites; setting both silently means one wins, so it raises."""
+    from algorithms.MOCA.moca_cnn_cleanup import make_train
+    try:
+        make_train(_phase2_cfg(PHASE1_ONLY=True, PHASE1_FROM="whatever_*.pkl"))
+    except ValueError as e:
+        assert "PHASE1_ONLY" in str(e) and "PHASE1_FROM" in str(e), e
+    else:
+        raise AssertionError("setting both should raise")
 
 
 def test_phase1_from_rejects_a_wrong_agent_count():

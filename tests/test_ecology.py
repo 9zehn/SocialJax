@@ -79,6 +79,41 @@ def test_default_dirt_rate_is_raised_but_still_clearable():
     )
 
 
+def test_river_starts_below_the_apple_growth_gate():
+    """Upstream opens at 0.473 dirt fraction against a 0.4 growth gate, so no apple
+    grows until ~13 cells are cleared -- the episode starts with the commons already
+    collapsed. Starting just under the gate leaves a harvest to defend."""
+    env = _env()
+    _, s = env.reset(jax.random.PRNGKey(0))
+    lab = np.array(s.potential_dirt_and_dirt_label)
+    frac = (lab == int(Items.dirt)).sum() / (len(lab) + len(env.RIVER))
+    assert frac < env.thresholdDepletion, (
+        f"river opens at {frac:.3f}, at or above the {env.thresholdDepletion} growth "
+        f"gate, so no apple can spawn at reset"
+    )
+    assert frac > 0.25, f"river opens at {frac:.3f} -- too clean to pose a dilemma"
+
+
+def test_apples_are_standing_before_anyone_cleans():
+    """The behavioural version of the above: idle agents should find a harvest."""
+    env = _env()
+    _, s = env.reset(jax.random.PRNGKey(0))
+    rng = jax.random.PRNGKey(1)
+    for _ in range(50):
+        rng, k = jax.random.split(rng)
+        _, s, _, _, _ = env.step_env(k, s, [STAY] * 7)
+    apples = int((np.array(s.grid) == int(Items.apple)).sum())
+    assert apples > 0, "no apples grew in 50 idle steps; nothing to harvest at t=0"
+
+
+def test_upstream_dirty_river_is_still_reachable():
+    env = _env(initial_dirt_fraction=0.473)
+    _, s = env.reset(jax.random.PRNGKey(0))
+    lab = np.array(s.potential_dirt_and_dirt_label)
+    frac = (lab == int(Items.dirt)).sum() / (len(lab) + len(env.RIVER))
+    assert frac >= env.thresholdDepletion, frac
+
+
 def test_dirt_spawn_delay_is_halved_from_upstream():
     """Upstream's 50-step grace window let apples reach the map before anyone had to
     clean, front-loading free reward and muting the dilemma early in an episode."""

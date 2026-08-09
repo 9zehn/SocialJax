@@ -94,6 +94,12 @@
 # letting phase-1 variation confound the comparison.
 "PHASE1_FROM": null
 
+# Train phase 1 and stop, saving the gameplay policies. The other half of the
+# workflow above: one PHASE1_ONLY run produces the shared policy, then one cheap
+# phase-2 run per decision rule with PHASE1_FROM pointing at it. Gives the whole
+# TOTAL_TIMESTEPS budget to phase 1 rather than the usual 90%.
+"PHASE1_ONLY": False
+
 # ---- Learned negotiation stage (PHASE2_MODE: negotiate) -------------------
 # What is actually negotiated is a single scalar: theta, the payment per waste
 # cell cleaned, funded evenly by the other agents. Agent 0 names a number in

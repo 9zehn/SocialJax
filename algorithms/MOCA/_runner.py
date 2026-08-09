@@ -34,6 +34,17 @@ def single_run(config, make_train, *, wandb_name):
     for i in range(num_agents):
         save_params(train_state[i], f"./checkpoints/moca/{filename}_{i}.pkl")
 
+    if "metrics_phase2" not in out:
+        # PHASE1_ONLY. The gameplay policies are the whole product of the run, so
+        # print the glob that feeds them back in -- getting it wrong (catching the
+        # contracting checkpoints too) is the easy mistake, and PHASE1_FROM rejects
+        # it on file count rather than loading the wrong weights.
+        print("\n=== phase 1 complete (PHASE1_ONLY) ===")
+        print(f"  saved {num_agents} gameplay policies")
+        print(f"  rerun phase 2 against them with:")
+        print(f"    PHASE1_FROM='./checkpoints/moca/{filename}_[0-9].pkl'")
+        return out
+
     if "negotiate_state" in out:
         for i in range(num_agents):
             save_params(out["negotiate_state"][i],

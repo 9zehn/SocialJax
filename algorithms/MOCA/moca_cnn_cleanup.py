@@ -221,6 +221,14 @@ def make_train(config):
     # confound the comparison it was meant to isolate. Loading one frozen policy
     # makes every arm exact.
     phase1_from = config.get("PHASE1_FROM")
+    phase1_only = bool(config.get("PHASE1_ONLY", False))
+    if phase1_only and phase1_from:
+        raise ValueError(
+            "PHASE1_ONLY and PHASE1_FROM are opposites (train phase 1 vs load it); "
+            "set exactly one"
+        )
+    config["PHASE1_ONLY"] = phase1_only
+
     loaded_phase1 = None
     if phase1_from:
         import glob
@@ -235,13 +243,18 @@ def make_train(config):
         print(f"[MOCA] phase 1 loaded from {len(matches)} checkpoints; skipping phase-1 "
               f"training and running phase 2 only", flush=True)
 
-    # Split the update budget 90/10 as in Algorithm 1.
+    # Split the update budget 90/10 as in Algorithm 1 -- or give it all to whichever
+    # phase is actually running.
     phase1_frac = 0.0 if phase1_from else config.get("PHASE1_FRAC", 0.9)
-    config["NUM_UPDATES_PHASE1"] = (
-        0 if phase1_from else max(int(config["NUM_UPDATES"] * phase1_frac), 1)
-    )
-    config["NUM_UPDATES_PHASE2"] = max(
-        config["NUM_UPDATES"] - config["NUM_UPDATES_PHASE1"], 1
+    if phase1_from:
+        config["NUM_UPDATES_PHASE1"] = 0
+    elif phase1_only:
+        config["NUM_UPDATES_PHASE1"] = config["NUM_UPDATES"]
+    else:
+        config["NUM_UPDATES_PHASE1"] = max(int(config["NUM_UPDATES"] * phase1_frac), 1)
+    config["NUM_UPDATES_PHASE2"] = (
+        0 if phase1_only
+        else max(config["NUM_UPDATES"] - config["NUM_UPDATES_PHASE1"], 1)
     )
 
     # Which phase 2 to run. "solver" is what the paper's Cleanup experiments used
@@ -1088,6 +1101,11 @@ def make_train(config):
         }
         if metric1 is not None:
             out["metrics_phase1"] = metric1
+
+        if config["NUM_UPDATES_PHASE2"] == 0:
+            # PHASE1_ONLY: stop here. _runner saves the gameplay policies and prints
+            # the glob to hand to PHASE1_FROM.
+            return out
 
         if phase2_mode == "solver":
             # No contracting policies to carry: the solver reads the frozen critic

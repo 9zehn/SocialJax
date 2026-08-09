@@ -512,6 +512,12 @@ class Clean_up(MultiAgentEnv):
         #
         # Pass dirt_spawn_cells=1 to recover upstream.
         dirt_spawn_cells=2,
+        # Dirt fraction the episode STARTS at. Must sit below thresholdDepletion
+        # (0.4) for any apple to grow at reset; upstream effectively uses 0.473, so
+        # the map opens past the gate with zero apples and no harvest until roughly
+        # 13 cells are cleared. 0.35 leaves a small standing flow from step 0.
+        # Pass 0.473 to recover upstream's fully-dirty river.
+        initial_dirt_fraction=0.35,
         # Add payment-state channels to the observation (see _get_obs). OFF by default:
         # turning it on changes the observation SHAPE, so a policy trained with it is
         # not loadable by, or comparable to, a baseline trained without it.
@@ -600,6 +606,7 @@ class Clean_up(MultiAgentEnv):
 
         self.maxAppleGrowthRate = maxAppleGrowthRate
         self.dirt_spawn_cells = int(dirt_spawn_cells)
+        self.initial_dirt_fraction = float(initial_dirt_fraction)
         self.observe_payment = bool(observe_payment)
         self.freeze_share_state = bool(freeze_share_state)
         self.toggle_cooldown = int(toggle_cooldown)
@@ -2120,7 +2127,22 @@ class Clean_up(MultiAgentEnv):
             dirt = self.DIRT
 
             potential_dirt_label = jnp.zeros((len(potential_dirt)), dtype=jnp.int16) +Items.potential_dirt
-            dirt_label = jnp.zeros((len(dirt)), dtype=jnp.int16) + Items.dirt
+            # How much of the map's DIRT starts dirty. Upstream marks all of it,
+            # which puts the river at 0.473 dirt fraction against a 0.4 growth gate,
+            # so NO apple grows until ~13 cells have been cleared -- the episode
+            # opens with the commons already collapsed and nothing to harvest.
+            # Starting just below the gate leaves a small standing apple flow from
+            # step 0, so harvesting is viable immediately and the dilemma is about
+            # sustaining the commons rather than resurrecting it.
+            n_dirt = len(dirt)
+            keep_dirty = int(round(self.initial_dirt_fraction * (
+                len(potential_dirt) + n_dirt + len(river))))
+            keep_dirty = max(0, min(keep_dirty, n_dirt))
+            # A contiguous prefix of DIRT stays dirty; the rest reverts to
+            # potential_dirt. Deterministic, so every episode opens identically.
+            is_dirty = jnp.arange(n_dirt) < keep_dirty
+            dirt_label = jnp.where(is_dirty, jnp.int16(Items.dirt),
+                                   jnp.int16(Items.potential_dirt))
 
             potential_dirt_and_dirt = jnp.concatenate((potential_dirt, dirt))
             potential_dirt_and_dirt_label = jnp.concatenate((potential_dirt_label, dirt_label))
@@ -2132,11 +2154,12 @@ class Clean_up(MultiAgentEnv):
                 wall_pos[:, 1]
             ].set(jnp.int16(Items.wall))
 
-            # set dirt
+            # set dirt -- by label, so cells the fraction left clean are drawn (and
+            # treated) as potential_dirt rather than dirt.
             grid = grid.at[dirt[:, 0],
                            dirt[:, 1]
-                           ].set(jnp.int16(Items.dirt))
-            
+                           ].set(dirt_label)
+
             # set river
             grid = grid.at[river[:, 0],
                             river[:, 1]
