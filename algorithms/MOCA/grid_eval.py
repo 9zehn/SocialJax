@@ -59,7 +59,11 @@ def rollout_at_theta(env, network, params, contract, theta, num_envs, num_steps,
     num_agents = env.num_agents
     key, k_reset = jax.random.split(key)
     obsv, env_state = jax.vmap(env.reset)(jax.random.split(k_reset, num_envs))
-    contract_obs = contract.to_obs(jnp.full((num_envs,), theta))
+    # theta may be a scalar (one contract for the batch) or per-env: the solver and
+    # the negotiation policy both pick a contract per episode, so an arm's realised
+    # behaviour is only reproduced by replaying the contract each env actually got.
+    theta = jnp.broadcast_to(jnp.asarray(theta, dtype=jnp.float32), (num_envs,))
+    contract_obs = contract.to_obs(theta)
 
     def step(carry, _):
         env_state, last_obs, rng = carry
@@ -74,10 +78,14 @@ def rollout_at_theta(env, network, params, contract, theta, num_envs, num_steps,
             jax.random.split(k_step, num_envs), env_state, actions
         )
         cleaned = info["cleaned_by_agent"]                         # (E, N)
-        transfers = contract.compute_transfer(jnp.full((num_envs,), theta), cleaned)
-        return (env_state, obsv, rng), (reward, transfers, cleaned)
+        transfers = contract.compute_transfer(theta, cleaned)
+        # River STOCK, not per-agent throughput: cells that are not dirt. This is
+        # what actually gates apple growth, so it says whether a contract merely
+        # bought cleaning actions or actually sustained the commons.
+        clear = info["waste_cleared"][:, 0]                        # (E,), agent-invariant
+        return (env_state, obsv, rng), (reward, transfers, cleaned, clear)
 
-    (_, _, _), (reward, transfers, cleaned) = jax.lax.scan(
+    (_, _, _), (reward, transfers, cleaned, clear) = jax.lax.scan(
         step, (env_state, obsv, key), None, num_steps
     )                                                              # each (T, E, N)
     base = reward.sum(axis=0)                                      # (E, N)
@@ -88,6 +96,9 @@ def rollout_at_theta(env, network, params, contract, theta, num_envs, num_steps,
         "return": (base + moved).mean(axis=0),
         "cleaned_per_step": cleaned.mean(axis=(0, 1)),
         "transfer_volume": jnp.maximum(transfers, 0.0).sum(axis=(0, 2)).mean(),
+        "river_mean": clear.mean(),          # average cells clear over the episode
+        "river_final": clear[-1].mean(),     # ... and at the end: did it hold?
+        "theta": theta.mean(),
     }
 
 
