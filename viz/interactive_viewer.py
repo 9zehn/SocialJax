@@ -723,8 +723,17 @@ def detect_moca(checkpoint_arg):
         return {"mode": "negotiate", "contract_paths": contracts, "gameplay": gameplay}
 
     # Solver runs save no contracting policy, so the stem is the only evidence.
-    if "_solver" in os.path.basename(stem):
+    base = os.path.basename(stem)
+    if "_solver" in base:
         return {"mode": "solver", "gameplay": gameplay}
+    # PHASE1_ONLY: checkpoint_filename always marks a PHASE2_MODE, so the stem still
+    # carries the token even though phase 2 never ran and no contracting policy was
+    # ever written. The gameplay policy is contract-conditioned regardless, so it has
+    # to be replayed through the contract path -- its weights will not even load into
+    # the plain ActorCritic. There is no learned theta to recover, so the caller must
+    # supply one (--contract-theta 0 for the null contract).
+    if "_negotiate" in base or "_reinforce" in base:
+        return {"mode": "phase1", "gameplay": gameplay}
     return None
 
 
@@ -966,15 +975,18 @@ def main():
     parser.add_argument("--contract-theta", type=float, default=None,
                         help="MOCA only: replay under this contract value instead of the one the "
                              "learned proposal policy favours (0 = null contract, no transfers)")
-    parser.add_argument("--contract-low", type=float, default=0.0,
-                        help="MOCA only: lower bound of the contract space the run was trained on "
-                             "(not encoded in the filename; must match CONTRACT_LOW)")
+    parser.add_argument("--contract-low", type=float, default=0.2,
+                        help="MOCA only: lower bound of the NON-NULL contract range the run was "
+                             "trained on (not encoded in the filename; must match CONTRACT_LOW). "
+                             "The null contract theta=0 is always available and is unaffected by "
+                             "these bounds. Default tracks moca_base.yaml; pass 0.0 for runs "
+                             "trained before the range excluded weak contracts")
     parser.add_argument("--solver-samples", type=int, default=50,
                         help="PHASE2_MODE=solver: contracts sampled and scored by the "
                              "frozen critics at reset (training default: 50)")
     parser.add_argument("--solver-rule", default="majority", choices=("majority", "max"),
                         help="PHASE2_MODE=solver: decision rule (training default: majority)")
-    parser.add_argument("--contract-high", type=float, default=0.5,
+    parser.add_argument("--contract-high", type=float, default=1.0,
                         help="MOCA only: upper bound of the contract space (must match the run's "
                              "CONTRACT_HIGH; the bounds are not encoded in the filename, and a "
                              "mismatch silently rescales theta). Default tracks moca_base.yaml; "
@@ -1086,6 +1098,15 @@ def main():
             if len(probs):
                 print(f"  mean accept prob {probs.mean():.3f} -> a nu={info['nu']} draw "
                       f"signs with probability ~{probs.mean() ** info['nu']:.3f}")
+        elif mode == "phase1":
+            print("  no contracting policy on disk -- PHASE1_ONLY run, so there is no "
+                  "learned theta to recover")
+            if args.contract_theta is None:
+                raise SystemExit(
+                    "this is a PHASE1_ONLY checkpoint: phase 2 never ran, so no contract "
+                    "was ever negotiated. Pass --contract-theta explicitly to choose what "
+                    "to replay under (--contract-theta 0 is the null contract)."
+                )
         elif mode == "solver":
             if params is None:
                 raise SystemExit("solver runs need --checkpoint to score contracts")
