@@ -13,6 +13,13 @@ def single_run(config, make_train, *, wandb_name):
     """One MOCA training run (phase 1 then phase 2), saving all policies at the end."""
     config = OmegaConf.to_container(config)
 
+    # Build the training function BEFORE naming the run. make_train fills in derived
+    # config values (NEGOTIATE_NU, NUM_UPDATES_*), and checkpoint_filename reads some
+    # of them -- naming first gave the final checkpoints a different stem from the
+    # rolling _latest ones written from inside the run, so one run appeared on disk
+    # twice under two names (..._negotiate_N.pkl and ..._negotiate_nu2_latest_N.pkl).
+    # It also means wandb now records the RESOLVED config rather than the raw one.
+    train = make_train(config)
     filename = checkpoint_filename(config)
 
     wandb.init(
@@ -25,8 +32,7 @@ def single_run(config, make_train, *, wandb_name):
     )
 
     rng = jax.random.PRNGKey(config["SEED"])
-    train_jit = jax.jit(make_train(config))
-    out = train_jit(rng)
+    out = jax.jit(train)(rng)
 
     print("** Saving Results **")
     num_agents = config["ENV_KWARGS"]["num_agents"]
