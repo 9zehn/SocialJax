@@ -1064,9 +1064,17 @@ def main():
     contract, theta, contract_info = None, None, None
     moca = detect_moca(args.checkpoint) if args.checkpoint else None
     if moca is not None:
-        from algorithms.MOCA.contracts import CleanupContract
+        from algorithms.MOCA.contracts import CleanupContract, contract_for_params
 
-        contract = CleanupContract(env.num_agents, args.contract_low, args.contract_high)
+        # Matched to the checkpoint's own encoding so pre-fix policies (2 contract
+        # features, no is_null flag) stay replayable; without a checkpoint there are
+        # no weights to read, so fall back to the current space.
+        one = params[0] if isinstance(params, list) else params
+        contract = (contract_for_params(one, env.num_agents,
+                                        args.contract_low, args.contract_high)
+                    if one is not None
+                    else CleanupContract(env.num_agents, args.contract_low,
+                                         args.contract_high))
         mode = moca["mode"]
         print(f"MOCA run detected (PHASE2_MODE={mode})")
         print(f"  contract space: theta in [{args.contract_low}, {args.contract_high}]"

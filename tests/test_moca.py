@@ -143,6 +143,36 @@ def test_sample_batch_null_count_is_exact_and_stratified():
     assert not np.array_equal(null, other)
 
 
+def test_legacy_encoding_keeps_pre_fix_checkpoints_loadable():
+    """Pre-fix policies have a 2-wide contract input; without the legacy space they
+    cannot be opened at all, so every run made before the flag becomes unmeasurable."""
+    from algorithms.MOCA.contracts import (LegacyCleanupContract, contract_for_params,
+                                           contract_obs_dim_of)
+    legacy = LegacyCleanupContract(7, 0.0, 0.5)
+    o = np.array(legacy.to_obs(jnp.array([0.0, 0.25, 0.5])))
+    assert o.shape == (3, 2), "old layout: [theta_norm, stage]"
+    assert np.allclose(o[:, 0], [0.0, 0.5, 1.0]), "old normalisation ran over [0, 1]"
+
+    # The legacy encoding is only faithful when low is the null contract.
+    try:
+        LegacyCleanupContract(7, 0.2, 1.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("legacy encoding with low > 0 should raise")
+
+    # Round-trip: build both networks, save-shaped params, and recover the encoding.
+    obs = jnp.zeros((2, 11, 11, 19))
+    for space, expect in ((legacy, 2), (CleanupContract(7, 0.2, 1.0), 3)):
+        net = ContractActorCritic(9)
+        p = net.init(jax.random.PRNGKey(0), obs, jnp.zeros((2, space.obs_dim)))
+        assert contract_obs_dim_of(p) == expect
+        recovered = contract_for_params(p, 7, space.low, space.high)
+        assert recovered.obs_dim == space.obs_dim
+        # And the recovered space must actually drive the network it came from.
+        net.apply(p, obs, recovered.to_obs(jnp.array([0.0, space.high])))
+
+
 def test_invalid_contract_configs_rejected():
     for bad in (dict(num_agents=1), dict(num_agents=4, low=0.5, high=0.1)):
         kw = dict(num_agents=4, low=0.0, high=0.2)

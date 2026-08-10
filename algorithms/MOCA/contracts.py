@@ -263,6 +263,89 @@ class CleanupContract:
         return receive - pay
 
 
+class LegacyCleanupContract(CleanupContract):
+    """The contract observation as it was BEFORE the is_null flag: [theta_norm, stage].
+
+    Kept solely so pre-fix checkpoints stay loadable. Policies trained under the old
+    encoding have a first Dense layer sized for 2 contract features, so the current
+    CleanupContract cannot be used with them at all -- the widths simply do not match
+    and the checkpoint is unopenable without this.
+
+    Do not train anything new with it. theta_norm ran over [0, 1], so the null
+    contract encoded as the all-zero vector, which is the defect described at length
+    in CleanupContract.to_obs: it made the contract pathway functionally absent at
+    theta=0 and left V_i(s, 0) contaminated by nearby contracts.
+
+    The old code used `low` as the null contract, so this only reproduces the old
+    behaviour when low == 0 -- which every pre-fix run had, since splitting the null
+    out from the range floor arrived with the flag.
+    """
+
+    def __init__(self, num_agents: int, low: float = 0.0, high: float = 0.2):
+        super().__init__(num_agents, low=low, high=high)
+        if abs(low - self.null) > _NULL_TOL:
+            raise ValueError(
+                f"the legacy encoding used `low` as the null contract, so it is only "
+                f"faithful with low == {self.null}; got low={low}. Pre-fix runs were "
+                f"trained on a range starting at 0 (typically [0.0, 0.5])."
+            )
+        self.obs_dim = 2
+
+    def to_obs(self, theta: jnp.ndarray, stage: float = SUBGAME) -> jnp.ndarray:
+        theta = jnp.asarray(theta, dtype=jnp.float32)
+        theta_norm = (theta - self.low) / (self.high - self.low)
+        stage_arr = jnp.full_like(theta_norm, jnp.float32(stage))
+        return jnp.stack([theta_norm, stage_arr], axis=-1)
+
+
+def contract_obs_dim_of(params) -> int:
+    """How many contract features a saved ContractActorCritic expects.
+
+    Read off the weights rather than guessed from a flag, because getting it wrong is
+    an unopenable checkpoint rather than a wrong number. The gameplay network
+    concatenates the contract vector onto the CNN embedding before its first Dense
+    layer, so the width is (that Dense's input) - (the CNN's output).
+    """
+    p = params.get("params", params)
+    try:
+        embedding = p["CNN_0"]["Dense_0"]["kernel"].shape[1]
+        head_input = p["Dense_0"]["kernel"].shape[0]
+    except (KeyError, TypeError, IndexError) as exc:
+        raise ValueError(
+            "these params do not look like a ContractActorCritic gameplay policy "
+            "(expected CNN_0/Dense_0 and Dense_0 kernels)"
+        ) from exc
+    return int(head_input - embedding)
+
+
+def contract_for_params(params, num_agents: int, low: float, high: float):
+    """The contract space matching the encoding a checkpoint was actually trained with.
+
+    Use this instead of constructing CleanupContract directly anywhere a checkpoint
+    from disk is involved: pre- and post-fix runs need different contract observation
+    widths, and mixing them is a shape error several frames from the real cause.
+    """
+    dim = contract_obs_dim_of(params)
+    current = CleanupContract(num_agents, low=low, high=high)
+    if dim == current.obs_dim:
+        return current
+    if dim == 2:
+        if abs(low - current.null) > _NULL_TOL:
+            raise SystemExit(
+                f"this checkpoint predates the is_null contract flag ({dim} contract "
+                f"features). It was trained on a range starting at 0, so pass "
+                f"--contract-low 0.0 (and the run's own --contract-high, typically "
+                f"0.5); got --contract-low {low}."
+            )
+        print(f"[MOCA] pre-fix checkpoint ({dim} contract features): using the legacy "
+              f"contract encoding [theta_norm, stage] over [{low}, {high}]")
+        return LegacyCleanupContract(num_agents, low=low, high=high)
+    raise SystemExit(
+        f"checkpoint expects {dim} contract features, which matches neither the "
+        f"current encoding ({current.obs_dim}) nor the legacy one (2)"
+    )
+
+
 def make_contract(name: str, num_agents: int, low: float, high: float):
     """Contract-space factory, so the space is selectable from config."""
     if name != "cleanup":

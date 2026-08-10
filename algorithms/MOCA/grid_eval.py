@@ -45,7 +45,7 @@ import numpy as np
 import socialjax
 from socialjax.wrappers.baselines import LogWrapper
 from algorithms.utils import load_params
-from algorithms.MOCA.contracts import CleanupContract
+from algorithms.MOCA.contracts import CleanupContract, contract_for_params
 from algorithms.MOCA.networks import ContractActorCritic
 
 
@@ -220,7 +220,10 @@ def main():
     print(f"Env kwargs: {env_kwargs}")
 
     env = LogWrapper(socialjax.make(args.env, **env_kwargs), replace_info=False)
-    contract = CleanupContract(args.num_agents, args.contract_low, args.contract_high)
+    # Matched to the checkpoint's own encoding, so pre-fix policies (2 contract
+    # features, no is_null flag) stay measurable rather than failing to load.
+    contract = contract_for_params(params[0], args.num_agents,
+                                   args.contract_low, args.contract_high)
     # contract.grid, not a bare linspace: when the range excludes weak contracts
     # (--contract-low > 0) the null contract is not the range floor, and protocols.py
     # requires it at row 0 as the disagreement point.
