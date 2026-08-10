@@ -142,6 +142,20 @@ def test_non_moca_configs_are_unaffected_by_the_phase2_marker():
     assert checkpoint_filename(cfg) == "clean_up_seed42_reward_individual_agents4"
 
 
+def test_negotiate_nu_is_in_the_checkpoint_name():
+    """nu changes who gates the contract and so what the negotiation policy learns;
+    a nu=2 and a nu=all run at one seed must not share a path."""
+    names = set()
+    for nu in (2, 6):
+        cfg = _config()
+        cfg["PHASE2_MODE"] = "negotiate"
+        cfg["NEGOTIATE_NU"] = nu
+        name = checkpoint_filename(cfg)
+        assert f"nu{nu}" in name, name
+        names.add(name)
+    assert len(names) == 2, names
+
+
 ALL_TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 if __name__ == "__main__":

@@ -83,6 +83,12 @@ def checkpoint_filename(config: Dict[str, Any], latest: bool = False) -> str:
             rule = config.get("SOLVER_DECISION_RULE")
             if rule:
                 suffix += f"_{rule}"
+        elif phase2_mode == "negotiate":
+            # nu changes who gates the contract and so what gets learned; a nu=2 and
+            # a nu=all run at the same seed would otherwise overwrite each other.
+            nu = config.get("NEGOTIATE_NU")
+            if nu:
+                suffix += f"_nu{nu}"
 
     name = f'{config["ENV_NAME"]}_seed{config["SEED"]}{suffix}'
     return f"{name}_latest" if latest else name

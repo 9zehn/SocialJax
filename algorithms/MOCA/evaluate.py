@@ -96,6 +96,41 @@ def negotiate_thetas(cparams, obs0, contract):
     return neg.unsquash(pi0.mean()[:, 0], contract.low, contract.high)
 
 
+def negotiate_sign_prob(cparams, obs0, contract, theta, nu):
+    """P(the offer is signed), and each non-proposer's accept probability.
+
+    Agent 0 proposes; nu of the other N-1 are drawn uniformly WITHOUT replacement and
+    the product of their accept probabilities is the signing probability. Averaging
+    that product over every possible nu-subset gives the exact expectation rather than
+    a sampled estimate -- with 6 non-proposers there are only C(6,nu) of them.
+
+    This is where nu bites: acceptance is a PRODUCT, so polling more agents multiplies
+    in more sub-unit terms. Raising nu from 2 to all-6 does not make agents pickier,
+    it just makes agreement combinatorially rarer.
+    """
+    import itertools
+    net = NegotiationActorCritic(2, activation="relu")
+    from algorithms.MOCA.contracts import AGREE
+    agree_obs = contract.to_obs(theta, stage=AGREE)
+    probs = []
+    for j in range(1, len(cparams)):
+        pi, _ = net.apply(cparams[j], obs0[j], agree_obs)
+        probs.append(np.asarray(neg.unsquash(pi.mean()[:, 1], 0.0, 1.0)))
+    probs = np.stack(probs)                                    # (N-1, num_envs)
+    subsets = list(itertools.combinations(range(probs.shape[0]), nu))
+    p_sign = np.mean([np.prod(probs[list(s)], axis=0) for s in subsets], axis=0)
+    return p_sign, probs
+
+
+def _blend(signed, null, p):
+    """Expected outcome when the offer is signed with probability p, else null."""
+    out = {}
+    for k in ("return", "cleaned_per_step", "theta", "river_final", "transfer_volume"):
+        out[k] = p * np.asarray(signed[k]) + (1.0 - p) * np.asarray(null[k])
+    out["theta_std"] = signed["theta_std"]
+    return out
+
+
 def equality(v):
     diffs = np.abs(v[:, None] - v[None, :]).sum()
     return 1.0 - diffs / (2.0 * len(v) * np.abs(v).sum() + 1e-8)
@@ -115,6 +150,10 @@ def main():
     p.add_argument("--num-envs", type=int, default=32, help="episodes per arm")
     p.add_argument("--num-steps", type=int, default=1000)
     p.add_argument("--solver-samples", type=int, default=50)
+    p.add_argument("--negotiate-nu", type=int, default=None,
+                   help="non-proposers polled on the offer. Default follows the "
+                        "reference rule (2 above 3 agents); pass num_agents-1 for "
+                        "the poll-everyone comparison")
     p.add_argument("--grid-points", type=int, default=11,
                    help="theta grid for the efficiency/fairness benchmarks")
     p.add_argument("--seed", type=int, default=0)
@@ -150,8 +189,15 @@ def main():
         t, info = solver_thetas(rule, nets, params, obs0, contract, args.solver_samples, k)
         arms[f"solver:{rule}"] = t
         extra[f"solver:{rule}"] = info
+    sign = None
     if cparams is not None:
-        arms["negotiate"] = negotiate_thetas(cparams, obs0, contract)
+        t_neg = negotiate_thetas(cparams, obs0, contract)
+        arms["negotiate"] = t_neg
+        nu = args.negotiate_nu or neg.default_nu(n)
+        if not 1 <= nu <= n - 1:
+            raise SystemExit(f"--negotiate-nu must be in [1, {n-1}], got {nu}")
+        p_sign, acc = negotiate_sign_prob(cparams, obs0, contract, t_neg, nu)
+        sign = {"nu": nu, "p": p_sign, "per_agent": acc}
 
     # ---- replay each contract for real episodes -----------------------------
     print(f"Replaying {len(arms)} arms x {args.num_envs} episodes x {args.num_steps} steps")
@@ -194,6 +240,13 @@ def main():
           f"harvesters={list(np.where(~is_cleaner)[0])}")
 
     # ---- report --------------------------------------------------------------
+    # Expected outcome of the negotiation arm: the offer only takes force if signed,
+    # and on rejection the episode runs under the null contract.
+    if sign is not None:
+        results["negotiate(E)"] = _blend(results["negotiate"], results["null"],
+                                         float(sign["p"].mean()))
+        arms["negotiate(E)"] = arms["negotiate"]
+
     best_welfare = max(best_welfare,
                        max(float(results[a]["return"].sum()) for a in arms))
     null_ret = results["null"]["return"]
@@ -213,6 +266,19 @@ def main():
               f"{equality(v):>7.3f}{cl_v:>8.1f}{hv_v:>8.1f}{cl_v/hv_v if hv_v else np.nan:>7.2f}"
               f"{v.min():>8.1f}{ir:>5d}"
               f"{r['cleaned_per_step'].sum():>7.2f}{float(r['river_final']):>7.1f}")
+
+    if sign is not None:
+        import itertools as _it
+        pa = sign["per_agent"]
+        allnu = n - 1
+        p_all = np.mean([np.prod(pa[list(s_)], axis=0)
+                         for s_ in _it.combinations(range(pa.shape[0]), allnu)], axis=0)
+        print(f"\nnegotiation acceptance (nu={sign['nu']} of {allnu} non-proposers polled):")
+        for j, pr in enumerate(pa, start=1):
+            print(f"    agent {j} accepts with p={pr.mean():.3f}")
+        print(f"  P(signed) at nu={sign['nu']:<2}          : {sign['p'].mean():.3f}")
+        print(f"  P(signed) at nu={allnu} (poll everyone): {p_all.mean():.3f}")
+        print("  -> 'negotiate' is the outcome IF signed; 'negotiate(E)' weights by P(signed)")
 
     print("\nbenchmarks (theta maximising each criterion on the sweep):")
     for k_, v_ in best.items():
