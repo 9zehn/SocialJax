@@ -37,18 +37,38 @@
 # they reject it. The range only needs to be wide enough to CONTAIN the optimum;
 # the acceptance rule discards the rest.
 #
-# Set CONTRACT_HIGH=0.2 to recover the paper's exact contract space.
-"CONTRACT_LOW": 0.0
-"CONTRACT_HIGH": 0.5
-# Phase 2 proposes from a discretised grid over [CONTRACT_LOW, CONTRACT_HIGH].
-# Only used by PHASE2_MODE=reinforce; solver and negotiate are continuous. Raised
-# with the range to keep the step at 0.025 (21 bins over [0, 0.5]).
+# CONTRACT_LOW is the floor on a NON-NULL contract, not the null contract itself
+# (contracts.NULL_THETA = 0.0 is always available and always moves nothing). The
+# space is therefore {0} u [CONTRACT_LOW, CONTRACT_HIGH]. Excluding (0, 0.2) drops
+# contracts too weak to change behaviour against a unit apple: those samples spend
+# phase-1 budget on a regime that looks contracted but plays uncontracted, which is
+# exactly what blurs V_i(s, 0), the disagreement point phase 2 measures against.
+#
+# Set CONTRACT_LOW=0.0, CONTRACT_HIGH=0.2 to recover the paper's exact contract space.
+"CONTRACT_LOW": 0.2
+"CONTRACT_HIGH": 1.0
+# Phase 2 proposes from a discretised grid. Index 0 is the null contract whenever
+# CONTRACT_LOW > 0, and the remaining bins span [CONTRACT_LOW, CONTRACT_HIGH].
+# Only used by PHASE2_MODE=reinforce; solver and negotiate are continuous.
+# 21 bins = null + 20 values at a step of 0.042.
 "NUM_CONTRACT_BINS": 21
 # Fraction of the update budget spent in phase 1 (Algorithm 1 uses 9/10).
 "PHASE1_FRAC": 0.9
-# Probability that phase 1 draws the NULL contract instead of a uniform sample, so
-# the policy keeps experience of playing uncontracted (reference impl: null_prob).
-"NULL_CONTRACT_PROB": 0.1
+# Fraction of each phase-1 update's envs given the NULL contract, so the policy
+# keeps experience of playing uncontracted (reference impl: null_prob, but drawn
+# i.i.d. per env there -- this is an exact, stratified split; see
+# CleanupContract.sample_batch).
+#
+# The reference's 0.1 leaves the disagreement point V_i(s, 0) as the noisiest part
+# of the value table while being the one quantity every acceptance rule compares
+# against, and it is too little signal to pull uncontracted behaviour away from
+# contracted behaviour. Reweighting P(Theta) toward the null is legitimate under
+# MOCA -- the unbiasedness argument needs P(Theta) fixed, policy-independent and
+# full-support, not uniform.
+#
+# Do not push far past 0.5: phase 2 takes an argmax over theta, so starving the
+# contracted range turns value noise into contract-selection error.
+"NULL_CONTRACT_FRAC": 0.1
 # Which phase 2 to run.
 #   "negotiate" -- MOCA's contracting game (Algorithm 1), and THE BASELINE THE
 #                  PAPERS REPORT. Agent 0 always proposes; the action is a

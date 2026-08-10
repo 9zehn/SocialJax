@@ -85,10 +85,62 @@ def test_contract_grid_spans_range():
 
 def test_to_obs_normalises():
     c = CleanupContract(7, 0.0, 0.2)
-    o = c.to_obs(jnp.array([0.0, 0.1, 0.2]))
-    assert o.shape == (3, 2), "layout matches the reference impl: [params..., stage]"
-    assert np.allclose(np.array(o)[:, 0], [0.0, 0.5, 1.0])
-    assert np.allclose(np.array(o)[:, 1], 0.0), "stage indicator is the subgame"
+    o = np.array(c.to_obs(jnp.array([0.0, 0.1, 0.2])))
+    assert o.shape == (3, 3), "layout is [theta_norm, is_null, stage]"
+    # theta_norm spans [-1, 1] over the contracted range; the null is pinned to 0
+    # and identified by its own flag instead.
+    assert np.allclose(o[:, 0], [0.0, 0.0, 1.0])
+    assert np.allclose(o[:, 1], [1.0, -1.0, -1.0]), "is_null marks the null contract"
+    assert np.allclose(o[:, 2], 0.0), "stage indicator is the subgame"
+    # No theta anywhere in the space may encode as the all-zero vector.
+    grid = c.to_obs(c.grid(21))
+    assert float(jnp.abs(grid).sum(axis=-1).min()) > 0.0
+
+
+def test_null_contract_obs_is_not_the_zero_vector():
+    """The null contract must reach the policy's contract weights.
+
+    Those weights enter as a Dense layer over the concatenated [embedding, contract]
+    vector, whose weight gradient is (upstream grad) x (input). An all-zero contract
+    feature therefore contributes nothing forward AND receives no gradient back, so
+    null-contract episodes could only ever move parameters shared with every other
+    theta. Regression guard on that specific failure.
+    """
+    for low, high in ((0.0, 0.2), (0.2, 1.0)):
+        c = CleanupContract(7, low, high)
+        o = np.array(c.to_obs(jnp.array([c.null])))
+        assert np.abs(o).sum() > 0.0, f"null obs is all-zero for range [{low}, {high}]"
+
+
+def test_range_excluding_weak_contracts_keeps_a_genuine_null():
+    """CONTRACT_LOW > 0 must not promote the range floor into the null contract."""
+    c = CleanupContract(7, 0.2, 1.0)
+    assert c.null == 0.0 and c.low == 0.2
+    assert np.allclose(np.array(c.compute_transfer(jnp.float32(c.null),
+                                                   jnp.array([3., 1, 0, 0, 0, 0, 0]))), 0.0)
+    g = np.array(c.grid(11))
+    assert g[0] == 0.0, "null contract sits at grid index 0 for protocols.py"
+    assert abs(g[1] - 0.2) < 1e-6 and abs(g[-1] - 1.0) < 1e-6
+    assert np.all(np.diff(g[1:]) > 0)
+    s = c.sample(jax.random.PRNGKey(0), (4000,), null_prob=0.3)
+    assert 0.27 < float((s == 0.0).mean()) < 0.33, "null draws are 0, not low"
+    assert float(s[s > 0].min()) >= 0.2
+
+
+def test_sample_batch_null_count_is_exact_and_stratified():
+    c = CleanupContract(7, 0.2, 1.0)
+    theta = c.sample_batch(jax.random.PRNGKey(0), 128, null_frac=0.25)
+    assert theta.shape == (128,)
+    null = np.array(c.is_null(theta))
+    assert null.sum() == 32, "exact fraction, not a binomial draw"
+    drawn = np.sort(np.array(theta)[~null])
+    assert drawn.min() >= 0.2 and drawn.max() <= 1.0
+    # One jittered draw per equal-width bin: every bin is hit exactly once.
+    edges = np.linspace(0.2, 1.0, len(drawn) + 1)
+    assert np.all((drawn >= edges[:-1] - 1e-6) & (drawn <= edges[1:] + 1e-6))
+    # And a different key must permute which env slots are null.
+    other = np.array(c.is_null(c.sample_batch(jax.random.PRNGKey(1), 128, 0.25)))
+    assert not np.array_equal(null, other)
 
 
 def test_invalid_contract_configs_rejected():
@@ -114,13 +166,19 @@ def test_invalid_contract_configs_rejected():
 def test_policy_actually_conditions_on_contract():
     """A different contract must change the policy's output -- otherwise Phase 1
     cannot be learning the family {pi(.|s,theta)} that MOCA's whole argument rests on."""
+    c = CleanupContract(7, 0.2, 1.0)
     net = ContractActorCritic(9)
     obs = jnp.zeros((2, 11, 11, 19))
-    params = net.init(jax.random.PRNGKey(0), obs, jnp.zeros((2, 2)))
-    _, v_lo = net.apply(params, obs, jnp.array([[0.0, 0.0], [0.0, 0.0]]))
-    _, v_hi = net.apply(params, obs, jnp.array([[1.0, 0.0], [1.0, 0.0]]))
+    params = net.init(jax.random.PRNGKey(0), obs, jnp.zeros((2, c.obs_dim)))
+    _, v_lo = net.apply(params, obs, c.to_obs(jnp.array([0.2, 0.2])))
+    _, v_hi = net.apply(params, obs, c.to_obs(jnp.array([1.0, 1.0])))
     assert not np.allclose(np.array(v_lo), np.array(v_hi)), \
         "value must depend on the active contract"
+    # And the null contract must be separable from the weakest real contract, which
+    # the old all-zero null encoding could not express (see to_obs).
+    _, v_null = net.apply(params, obs, c.to_obs(jnp.array([c.null, c.null])))
+    assert not np.allclose(np.array(v_null), np.array(v_lo)), \
+        "the null contract must be distinguishable from theta=CONTRACT_LOW"
 
 
 def test_proposal_and_voting_shapes():
@@ -239,7 +297,7 @@ def test_phase_split_follows_algorithm_1():
         "ENT_COEF": 0.01, "VF_COEF": 0.5, "MAX_GRAD_NORM": 0.5, "ACTIVATION": "relu",
         "ANNEAL_LR": True, "PARAMETER_SHARING": False, "SEED": 0,
         "CONTRACT_SPACE": "cleanup", "CONTRACT_LOW": 0.0, "CONTRACT_HIGH": 0.2,
-        "NUM_CONTRACT_BINS": 5, "PHASE1_FRAC": 0.9, "NULL_CONTRACT_PROB": 0.1,
+        "NUM_CONTRACT_BINS": 5, "PHASE1_FRAC": 0.9, "NULL_CONTRACT_FRAC": 0.1,
         "CONTRACT_LR": 0.01, "ENV_NAME": "clean_up",
         "TOTAL_TIMESTEPS": 10 * 4 * 100,
         "ENV_KWARGS": {"num_agents": 3, "num_inner_steps": 10, "shared_rewards": False,
@@ -352,7 +410,7 @@ def test_solver_values_come_from_the_frozen_critic():
     c = CleanupContract(3, 0.0, 0.2)
     nets = [ContractActorCritic(9) for _ in range(3)]
     obs = jnp.zeros((3, 4, 11, 11, 19))              # (N, num_envs, ...)
-    params = [nets[i].init(jax.random.PRNGKey(i), obs[i], jnp.zeros((4, 2)))
+    params = [nets[i].init(jax.random.PRNGKey(i), obs[i], jnp.zeros((4, c.obs_dim)))
               for i in range(3)]
     thetas = jnp.array([[0.0] * 4, [0.1] * 4, [0.2] * 4])
     vals = contract_values(nets, params, obs, c, thetas)
@@ -429,7 +487,7 @@ def _phase2_cfg(**overrides):
         "ENT_COEF": 0.01, "VF_COEF": 0.5, "MAX_GRAD_NORM": 0.5, "ACTIVATION": "relu",
         "ANNEAL_LR": True, "PARAMETER_SHARING": False, "SEED": 0,
         "CONTRACT_SPACE": "cleanup", "CONTRACT_LOW": 0.0, "CONTRACT_HIGH": 0.2,
-        "NUM_CONTRACT_BINS": 11, "PHASE1_FRAC": 0.5, "NULL_CONTRACT_PROB": 0.1,
+        "NUM_CONTRACT_BINS": 11, "PHASE1_FRAC": 0.5, "NULL_CONTRACT_FRAC": 0.1,
         "CONTRACT_LR": 0.3, "VOTER_SAMPLE_NU": 2, "CONTRACT_MINIBATCHES": 4,
         "PHASE2_MODE": "reinforce", "SOLVER_SAMPLES": 12,
         "SOLVER_DECISION_RULE": "majority",
@@ -745,14 +803,16 @@ def _write_fake_negotiate_run(tmp, n=3, theta=0.15, low=0.0, high=0.2):
     play = ContractActorCritic(9)
     stem = Path(tmp) / f"clean_up_seed42_reward_individual_agents{n}_negotiate"
     for i in range(n):
-        p = net.init(jax.random.PRNGKey(i), jnp.zeros(obs_shape), jnp.zeros((1, 2)))
+        p = net.init(jax.random.PRNGKey(i), jnp.zeros(obs_shape),
+                     jnp.zeros((1, CleanupContract(n, low, high).obs_dim)))
         # Bias the proposal head so agent 0's mean maps to a known theta, letting the
         # test assert the exact value the viewer should recover.
         target_raw = 2.0 * (theta - low) / (high - low) - 1.0
         p["params"]["Dense_1"]["bias"] = jnp.array([target_raw, 0.0])
         save_params(TrainState.create(apply_fn=net.apply, params=p, tx=optax.adam(1e-3)),
                     f"{stem}_contract_{i}.pkl")
-        gp = play.init(jax.random.PRNGKey(100 + i), jnp.zeros(obs_shape), jnp.zeros((1, 2)))
+        gp = play.init(jax.random.PRNGKey(100 + i), jnp.zeros(obs_shape),
+                       jnp.zeros((1, CleanupContract(n, low, high).obs_dim)))
         save_params(TrainState.create(apply_fn=play.apply, params=gp, tx=optax.adam(1e-3)),
                     f"{stem}_{i}.pkl")
     return f"{stem}*.pkl"

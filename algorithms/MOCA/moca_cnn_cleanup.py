@@ -35,6 +35,7 @@ from typing import NamedTuple, Tuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from flax.training.train_state import TrainState
 import socialjax
@@ -110,6 +111,15 @@ STAGE1_METRICS = (
     "entropy_mean",
     # Sanity check on P(Theta): phase 1 must see the whole contract space.
     "contract_theta_sampled",
+    "contract_null_frac",
+    # Does the policy CONDITION on theta? cleaned_gap must open up; if it stays at
+    # ~0 the contract is inert and every phase-2 comparison downstream is moot.
+    "cleaned_null",
+    "cleaned_contracted",
+    "cleaned_gap",
+    # V_i(s, 0), the disagreement point phase 2 measures acceptance against.
+    "welfare_null",
+    "welfare_contracted",
 )
 
 STAGE2_METRICS = (
@@ -354,6 +364,23 @@ def make_train(config):
             flush=True,
         )
 
+    # Renamed from NULL_CONTRACT_PROB when the i.i.d. per-env draw became an exact
+    # stratified split. Refused rather than aliased: a run launched with the old
+    # override would otherwise train at the default null fraction while its command
+    # line and wandb config both claim otherwise -- and null mass is the variable
+    # under test.
+    if "NULL_CONTRACT_PROB" in config:
+        raise ValueError(
+            "NULL_CONTRACT_PROB was renamed to NULL_CONTRACT_FRAC (it is now an "
+            "exact fraction of envs per update, not an i.i.d. draw probability). "
+            "Update the override."
+        )
+    if not 0.0 <= config["NULL_CONTRACT_FRAC"] < 1.0:
+        raise ValueError(
+            f"NULL_CONTRACT_FRAC must be in [0, 1), got "
+            f"{config['NULL_CONTRACT_FRAC']} -- phase 1 must see contracted play."
+        )
+
     contract = make_contract(
         config.get("CONTRACT_SPACE", "cleanup"),
         num_agents,
@@ -363,11 +390,11 @@ def make_train(config):
     contract_grid = contract.grid(config["NUM_CONTRACT_BINS"])
     # Plain Python copy of the grid, purely for building metric NAMES. Formatting a
     # device array with float() fails under tracing, and label text must never depend
-    # on a traced value anyway.
-    contract_grid_labels = [
-        contract.low + (contract.high - contract.low) * k / (config["NUM_CONTRACT_BINS"] - 1)
-        for k in range(config["NUM_CONTRACT_BINS"])
-    ]
+    # on a traced value anyway. Read off the grid itself rather than recomputed from
+    # low/high: the grid is not a plain linspace when the range excludes weak
+    # contracts (index 0 is then the null contract), and labels that disagree with it
+    # would mislabel every proposal-probability series.
+    contract_grid_labels = [float(x) for x in np.asarray(contract_grid)]
 
     env = LogWrapper(env, replace_info=False)
 
@@ -554,9 +581,10 @@ def make_train(config):
             train_state, env_state, last_obs, update_step, rng = runner_state
 
             # Contract for this episode, independent of any proposal policy.
+            # Stratified with an exact null block -- see CleanupContract.sample_batch.
             rng, _rng = jax.random.split(rng)
-            theta = contract.sample(
-                _rng, (config["NUM_ENVS"],), null_prob=config["NULL_CONTRACT_PROB"]
+            theta = contract.sample_batch(
+                _rng, config["NUM_ENVS"], null_frac=config["NULL_CONTRACT_FRAC"]
             )
 
             params_list = [ts.params for ts in train_state]
@@ -650,6 +678,34 @@ def make_train(config):
             out["equality"] = stats["equality"]
             out["transfer_volume"] = stats["transfer_volume"]
             out["contract_theta_sampled"] = theta.mean()
+
+            # Is the policy actually CONDITIONING on theta? The headline question of
+            # phase 1, and invisible in the pooled averages above: a policy that
+            # cleans identically at theta=0 and theta>0 produces exactly the same
+            # cleaned_by_agent_mean as one that has learned the distinction.
+            #
+            # Splitting by regime makes it a live training curve rather than a
+            # post-hoc grid_eval run. cleaned_contracted - cleaned_null is the thing
+            # that must open up; welfare_null is the disagreement point V_i(s, 0)
+            # that phase 2's acceptance rules will be measured against, so it doubles
+            # as a check that the null baseline is not itself drifting.
+            null_mask = contract.is_null(theta).astype(jnp.float32)     # (NUM_ENVS,)
+            n_null = jnp.maximum(null_mask.sum(), 1.0)
+            n_contracted = jnp.maximum((1.0 - null_mask).sum(), 1.0)
+            cleaned_per_env = jnp.stack([
+                traj_batch[i].info["cleaned_by_agent"].squeeze(-1)
+                for i in range(num_agents)
+            ]).sum(axis=(0, 1))                                          # (NUM_ENVS,)
+            welfare_per_env = stats["returns"].sum(axis=0)               # (NUM_ENVS,)
+            for name, per_env in (("cleaned", cleaned_per_env),
+                                  ("welfare", welfare_per_env)):
+                out[f"{name}_null"] = (per_env * null_mask).sum() / n_null
+                out[f"{name}_contracted"] = (
+                    (per_env * (1.0 - null_mask)).sum() / n_contracted
+                )
+            out["cleaned_gap"] = out["cleaned_contracted"] - out["cleaned_null"]
+            out["contract_null_frac"] = null_mask.mean()
+
             # Namespaced by stage, as the reference logger does (stage_1/..., stage_2/...):
             # the two phases measure different things, so sharing a key would splice a
             # subgame-learning curve onto a contract-negotiation curve.
@@ -710,7 +766,7 @@ def make_train(config):
             votes = jnp.stack(votes)                        # (N, NUM_ENVS)
 
             # Rejected proposals fall back to the null contract (no transfers).
-            theta_eff = jnp.where(accept_all, theta_prop, jnp.float32(contract.low))
+            theta_eff = jnp.where(accept_all, theta_prop, jnp.float32(contract.null))
 
             # -- play the episode with the FROZEN gameplay policy --
             traj_batch, env_state, last_obs, rng = rollout(
@@ -929,7 +985,7 @@ def make_train(config):
             accept_probs = negotiate.unsquash(raw1[:, :, 1], 0.0, 1.0)   # (N, E)
             voter_mask = negotiate.sample_voters(k_sel, num_agents, nu_neg, n_envs)
             accepted, prod_prob = negotiate.acceptance(k_acc, accept_probs, voter_mask)
-            theta_eff = jnp.where(accepted, theta_prop, jnp.float32(low))
+            theta_eff = jnp.where(accepted, theta_prop, jnp.float32(contract.null))
 
             # -- play the episode with the FROZEN gameplay policy --
             traj_batch, env_state, last_obs, rng = rollout(

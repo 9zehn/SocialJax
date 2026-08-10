@@ -221,7 +221,10 @@ def main():
 
     env = LogWrapper(socialjax.make(args.env, **env_kwargs), replace_info=False)
     contract = CleanupContract(args.num_agents, args.contract_low, args.contract_high)
-    thetas = np.linspace(args.contract_low, args.contract_high, args.points)
+    # contract.grid, not a bare linspace: when the range excludes weak contracts
+    # (--contract-low > 0) the null contract is not the range floor, and protocols.py
+    # requires it at row 0 as the disagreement point.
+    thetas = np.asarray(contract.grid(args.points))
 
     print(f"Evaluating {len(thetas)} contracts x {args.num_envs} envs x "
           f"{args.num_steps} steps")

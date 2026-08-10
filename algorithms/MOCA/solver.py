@@ -54,7 +54,10 @@ def sample_contract_candidates(key, contract, num_samples: int, num_envs: int):
     sampled = jax.random.uniform(
         key, (num_samples, num_envs), minval=contract.low, maxval=contract.high
     )
-    null = jnp.full((1, num_envs), contract.low, dtype=jnp.float32)
+    # contract.null, not contract.low: with a range that excludes weak contracts
+    # (low > 0) the two differ, and row 0 has to be the genuinely null contract for
+    # select_contract's disagreement point to mean anything.
+    null = jnp.full((1, num_envs), contract.null, dtype=jnp.float32)
     return jnp.concatenate([null, sampled.astype(jnp.float32)], axis=0)
 
 

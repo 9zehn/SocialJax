@@ -90,6 +90,15 @@ def checkpoint_filename(config: Dict[str, Any], latest: bool = False) -> str:
             if nu:
                 suffix += f"_nu{nu}"
 
+    # Phase-1 null-contract mass. This shapes the GAMEPLAY policy, so unlike the
+    # phase-2 knobs above it is not neutralised by PHASE1_ONLY / PHASE1_FROM: two
+    # PHASE1_ONLY runs differing only in null mass -- precisely the controlled
+    # comparison this variable is swept for -- otherwise resolve to one path and the
+    # second silently overwrites the first. Marked only when off the reference's 0.1.
+    null_frac = config.get("NULL_CONTRACT_FRAC")
+    if null_frac is not None and abs(float(null_frac) - 0.1) > 1e-9:
+        suffix += f"_null{null_frac}"
+
     name = f'{config["ENV_NAME"]}_seed{config["SEED"]}{suffix}'
     return f"{name}_latest" if latest else name
 

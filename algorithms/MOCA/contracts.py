@@ -28,6 +28,14 @@ SUBGAME = 0.0    # playing the game with a contract in force
 PROPOSE = 2.0    # agent 0 is choosing a contract to offer
 AGREE = 3.0      # the offered contract awaits accept/reject
 
+# The null contract: zero transfers by construction, since compute_transfer is
+# linear in theta. It is the disagreement point every acceptance rule measures
+# against (solver.select_contract, protocols.accepts), so it is a property of the
+# mechanism rather than of the configured range -- see CleanupContract on why the
+# two are now separate.
+NULL_THETA = 0.0
+_NULL_TOL = 1e-6
+
 
 class CleanupContract:
     """Scalar contract space for Clean Up: pay `theta` per waste cell cleaned.
@@ -51,9 +59,18 @@ class CleanupContract:
     is a net payer, so the contract subsidises exactly the under-provided public
     good (river cleaning) at the expense of those free-riding on it.
 
+    The contract space is {NULL_THETA} u [low, high]. `low` used to double as the
+    null contract, which is only correct when low == 0: with low > 0 the "no
+    contract" fallback would itself move reward, silently corrupting every
+    disagreement value V_i(s, 0) the acceptance rules compare against. They are now
+    separate, so the range can exclude weak contracts -- theta below ~0.2 is too
+    small to change behaviour against a unit apple, and those samples only blur the
+    boundary between contracted and uncontracted play -- while the null contract
+    stays available and genuinely null.
+
     Args:
         num_agents: N, the number of agents (>= 2; a transfer needs a counterparty).
-        low: minimum contract value (the null contract theta=0 must be included).
+        low: minimum NON-NULL contract value (>= 0).
         high: maximum contract value.
     """
 
@@ -62,18 +79,24 @@ class CleanupContract:
             raise ValueError(f"contracts need >= 2 agents, got {num_agents}")
         if not high > low:
             raise ValueError(f"need high > low, got low={low}, high={high}")
+        if low < NULL_THETA:
+            raise ValueError(
+                f"low must be >= the null contract {NULL_THETA}, got low={low}"
+            )
         self.num_agents = int(num_agents)
         self.low = float(low)
         self.high = float(high)
-        # Contract feature vector handed to the policy: [theta_normalised, stage].
-        # The reference implementation builds this as
-        # np.concatenate((self.params[key], np.array([0]))) -- the contract
-        # parameters followed by a stage indicator -- so the shape/layout is kept
-        # identical here. `stage` is always 0 (subgame) for us because the
-        # contracting stage is played by dedicated proposal/voting networks rather
-        # than by the gameplay policy acting in augmented states; it is retained so
-        # the interface matches theirs and stays extensible.
-        self.obs_dim = 2
+        self.null = float(NULL_THETA)
+        # Contract feature vector handed to the policy:
+        # [theta_normalised, is_null, stage]. The reference builds the first and
+        # last of these as np.concatenate((self.params[key], np.array([0]))) -- the
+        # contract parameters followed by a stage indicator. `stage` is always 0
+        # (subgame) for us because the contracting stage is played by dedicated
+        # proposal/voting networks rather than by the gameplay policy acting in
+        # augmented states; it is retained so the interface matches theirs.
+        #
+        # `is_null` is an addition; see to_obs for why it is load-bearing.
+        self.obs_dim = 3
 
     # ---------------------------------------------------------------- sampling
 
@@ -94,11 +117,54 @@ class CleanupContract:
         theta = jax.random.uniform(key_u, shape=shape, minval=self.low, maxval=self.high)
         if null_prob > 0.0:
             is_null = jax.random.uniform(key_null, shape=shape) < null_prob
-            theta = jnp.where(is_null, jnp.float32(self.low), theta)
+            theta = jnp.where(is_null, jnp.float32(self.null), theta)
         return theta.astype(jnp.float32)
 
+    def sample_batch(self, key: jnp.ndarray, num_envs: int, null_frac: float = 0.0):
+        """One phase-1 update's contracts: an exact null block plus a stratified rest.
+
+        Preferred over `sample` for training. Two differences, both mattering more
+        as null mass is raised:
+
+        * The null count is EXACT (round(null_frac * num_envs)) rather than
+          Binomial(num_envs, null_prob). At 128 envs and p=0.1 the i.i.d. draw
+          varies by +-3.4 envs per update, which is noise on the one quantity every
+          downstream acceptance rule is measured against.
+        * The non-null draws are STRATIFIED -- one jittered sample per equal-width
+          bin -- so every update covers the whole range. That matters because
+          raising null mass shrinks the budget left for theta > 0, and phase 2 takes
+          an argmax over theta, so gaps in coverage become contract-selection error.
+
+        Reweighting P(Theta) toward the null is legitimate under MOCA: the
+        unbiasedness of V_i(s_0, theta) needs P(Theta) fixed, independent of the
+        proposal policy, and full-support -- NOT uniform. It reallocates estimation
+        accuracy toward the disagreement point.
+
+        The result is permuted so no env slot is systematically the null one.
+        """
+        if not 0.0 <= null_frac <= 1.0:
+            raise ValueError(f"null_frac must be in [0, 1], got {null_frac}")
+        # Static under jit: null_frac is a config value, not a traced array.
+        n_null = int(round(null_frac * num_envs))
+        n_draw = num_envs - n_null
+        key_j, key_perm = jax.random.split(key)
+
+        nulls = jnp.full((n_null,), self.null, dtype=jnp.float32)
+        if n_draw == 0:
+            return nulls
+        edges = jnp.linspace(self.low, self.high, n_draw + 1, dtype=jnp.float32)
+        u = jax.random.uniform(key_j, (n_draw,))
+        drawn = edges[:-1] + u * (edges[1:] - edges[:-1])
+        return jax.random.permutation(
+            key_perm, jnp.concatenate([nulls, drawn]).astype(jnp.float32)
+        )
+
+    def is_null(self, theta: jnp.ndarray) -> jnp.ndarray:
+        """Boolean mask of which contracts are the null contract."""
+        return jnp.asarray(theta, dtype=jnp.float32) <= self.null + _NULL_TOL
+
     def grid(self, num_points: int) -> jnp.ndarray:
-        """Evenly spaced contract values spanning [low, high].
+        """Contract values for phase 2, with the NULL CONTRACT ALWAYS AT INDEX 0.
 
         Phase 2's proposal policy is a categorical distribution over this grid.
         Discretising keeps the proposal a plain Categorical (stable under the
@@ -106,30 +172,74 @@ class CleanupContract:
         learned contract distribution directly plottable; the gameplay policy is
         still trained on *continuous* theta in Phase 1, as in the reference
         implementation, so it interpolates across the space.
+
+        When low > null the grid is the null contract followed by num_points - 1
+        evenly spaced values over [low, high], so the mechanism can still decline.
+        protocols.py and solver.py both index the null as row 0.
         """
-        return jnp.linspace(self.low, self.high, num_points, dtype=jnp.float32)
+        if self.low <= self.null + _NULL_TOL:
+            return jnp.linspace(self.low, self.high, num_points, dtype=jnp.float32)
+        return jnp.concatenate([
+            jnp.array([self.null], dtype=jnp.float32),
+            jnp.linspace(self.low, self.high, num_points - 1, dtype=jnp.float32),
+        ])
 
     # ------------------------------------------------------------- observation
 
     def to_obs(self, theta: jnp.ndarray, stage: float = SUBGAME) -> jnp.ndarray:
-        """Contract feature vector [theta_normalised, stage] for the policy.
+        """Contract feature vector [theta_normalised, is_null, stage] for the policy.
 
-        theta is min-max normalised onto [0, 1] so the input is well scaled for the
-        network regardless of the configured contract range (raw theta can be as
-        small as 0.2, which would be a negligible input next to CNN activations).
-        This is a numerical change only -- the ordering and semantics of the
-        contract space are untouched.
+        theta is normalised onto [-1, 1] over [low, high] so the input is well scaled
+        for the network regardless of the configured range (raw theta can be as small
+        as 0.2, a negligible input next to CNN activations) AND so that no contract in
+        force encodes as the zero vector -- see below.
 
-        `stage` is the reference implementation's contract-state indicator, carried
-        raw (0/2/3) as it is there -- its observation Box runs to high=3.0. It is
-        what lets one policy tell "propose a contract" from "accept or reject this
-        contract" from "play the game under this contract". Defaults to SUBGAME, so
-        every existing caller keeps the behaviour it had.
+        `is_null` is +1 for the null contract and -1 otherwise. It is not cosmetic. The
+        contract vector is concatenated onto the CNN embedding and fed to a Dense
+        layer (networks.py), whose weight gradient is (upstream grad) (x) (input). The
+        previous encoding put the null contract at exactly [0, 0]:
+
+          * forward, the contract weights contributed nothing, and
+          * backward, they received exactly zero gradient,
+
+        so the contract pathway was functionally absent at theta=0 in both
+        directions. Null episodes could then only move the CNN trunk and biases,
+        which are SHARED with every other theta, and the whole theta-response
+        collapsed to a rank-1 additive shift that is continuous in theta -- making
+        behaviour at theta=0 necessarily the limit of behaviour at theta=eps. That is
+        the wrong inductive bias here: "no contract" and "contract in force" are
+        qualitatively different regimes (clean vs. free-ride), not two points on a
+        smooth ramp, and V_i(s, 0) is the disagreement point every acceptance rule
+        compares against, so contamination of it by nearby contracts is fatal to the
+        mechanism rather than merely inaccurate.
+
+        A dedicated indicator gives null episodes their own weights to push and lets
+        the network place a genuine discontinuity at theta=0. The reference
+        implementation has the same degeneracy (its contract_obs is
+        np.concatenate((params, [0])) over a raw [0, 0.2] Box, so the null contract
+        is literally the zero vector); this deviates from it deliberately.
+
+        `stage` is the reference's contract-state indicator, carried raw (0/2/3) as
+        it is there -- its observation Box runs to high=3.0. It is what lets one
+        policy tell "propose a contract" from "accept or reject this contract" from
+        "play the game under this contract". Defaults to SUBGAME, so every existing
+        caller keeps the behaviour it had.
         """
         theta = jnp.asarray(theta, dtype=jnp.float32)
-        theta_norm = (theta - self.low) / (self.high - self.low)
+        null = self.is_null(theta)
+        # +/-1 rather than 1/0 so the feature vector is never all-zero for ANY input.
+        # With a 0/1 flag the midpoint of the contracted range still encodes as
+        # [0, 0, 0] and reintroduces exactly the degeneracy this exists to remove --
+        # only at an interior theta instead of at the null contract.
+        is_null = jnp.where(null, jnp.float32(1.0), jnp.float32(-1.0))
+        theta_norm = 2.0 * (theta - self.low) / (self.high - self.low) - 1.0
+        # The null contract may sit below `low`, and its position on the contracted
+        # scale is meaningless anyway -- `is_null` carries it. Pinning it to 0 keeps
+        # the feature inside [-1, 1] for every input.
+        theta_norm = jnp.where(null, jnp.float32(0.0),
+                               jnp.clip(theta_norm, -1.0, 1.0))
         stage_arr = jnp.full_like(theta_norm, jnp.float32(stage))
-        return jnp.stack([theta_norm, stage_arr], axis=-1)
+        return jnp.stack([theta_norm, is_null, stage_arr], axis=-1)
 
     # --------------------------------------------------------------- transfers
 
