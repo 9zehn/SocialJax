@@ -43,10 +43,11 @@ from socialjax.wrappers.baselines import LogWrapper
 import wandb
 
 from algorithms.utils import checkpoint_filename, load_params, save_params, save_train_state
-from algorithms.MOCA import negotiate, solver
+from algorithms.MOCA import bargain, negotiate, solver
 from algorithms.MOCA.contracts import AGREE, PROPOSE, make_contract
 from algorithms.MOCA.networks import (
-    ContractActorCritic, NegotiationActorCritic, ProposalPolicy, VotingPolicy,
+    BargainingActorCritic, ContractActorCritic, NegotiationActorCritic,
+    ProposalPolicy, VotingPolicy,
 )
 
 
@@ -169,6 +170,32 @@ STAGE2_NEGOTIATE_METRICS = (
 )
 
 
+# Joint Rubinstein bargaining. Efficiency here is SPEED OF AGREEMENT, not welfare:
+# above the contract threshold welfare is flat, so it cannot discriminate between
+# contracts, whereas every round of disagreement burns a measurable slice of the
+# episode. Equity is where in the range theta lands.
+JOINT_BARGAIN_METRICS = (
+    # Did the mechanism produce a contract, and how much did delay cost?
+    "agreement_rate",
+    "agreement_round",
+    "disagreement_steps",
+    "contract_in_force_rate",   # near zero for long = the cold-start failure
+    # What was agreed, versus what was asked for.
+    "theta_agreed",
+    "theta_offered",
+    "accept_count",
+    # Did it change behaviour, and for whom?
+    "cleaned_by_agent_mean",
+    "waste_cleared_mean",
+    "transfer_volume",
+    "welfare",
+    "equality",
+    "returned_episode_returns_mean",
+    "returned_episode_returns_std",
+    "shaped_rewards_mean",
+)
+
+
 def _select(metrics: dict, allowed: Tuple[str, ...]) -> dict:
     """Restrict `metrics` to `allowed`, raising if a name in the allowlist is absent.
 
@@ -286,12 +313,68 @@ def make_train(config):
     # (see algorithms/MOCA/solver.py); "reinforce" is this repo's discretised
     # proposal/voting game, kept selectable so both can be compared.
     phase2_mode = config.get("PHASE2_MODE", "solver")
-    if phase2_mode not in ("solver", "reinforce", "negotiate"):
+    if phase2_mode not in ("solver", "reinforce", "negotiate", "bargain"):
         raise ValueError(
-            f"PHASE2_MODE must be 'solver', 'negotiate' or 'reinforce', "
+            f"PHASE2_MODE must be 'solver', 'negotiate', 'reinforce' or 'bargain', "
             f"got {phase2_mode!r}"
         )
     config["PHASE2_MODE"] = phase2_mode
+
+    # ---- Rubinstein bargaining, trained jointly -----------------------------
+    # A separate training schedule, not a phase-2 protocol: gameplay and bargaining
+    # learn together and nothing is ever frozen. It exists to get the GAME right
+    # before layering MOCA's two-phase construction on top of it.
+    training_mode = config.get("TRAINING_MODE", "two_phase")
+    if training_mode not in ("two_phase", "joint"):
+        raise ValueError(
+            f"TRAINING_MODE must be 'two_phase' or 'joint', got {training_mode!r}")
+    config["TRAINING_MODE"] = training_mode
+    if (training_mode == "joint") != (phase2_mode == "bargain"):
+        raise ValueError(
+            "TRAINING_MODE='joint' and PHASE2_MODE='bargain' currently go together: "
+            "joint has no other protocol implemented, and bargain has no two-phase "
+            f"variant yet. Got TRAINING_MODE={training_mode!r}, "
+            f"PHASE2_MODE={phase2_mode!r}."
+        )
+    quorum_b = 0
+    if training_mode == "joint":
+        if phase1_from or phase1_only:
+            raise ValueError(
+                "PHASE1_FROM / PHASE1_ONLY are meaningless under TRAINING_MODE=joint: "
+                "there is no phase split and no frozen policy. Drop them, or use "
+                "TRAINING_MODE=two_phase."
+            )
+        seg = int(config.get("BARGAIN_SEGMENT", 100))
+        inner = int(config["ENV_KWARGS"]["num_inner_steps"])
+        if seg <= 0 or inner % seg != 0:
+            raise ValueError(
+                f"BARGAIN_SEGMENT ({seg}) must be a positive divisor of "
+                f"num_inner_steps ({inner}), so the episode splits into whole rounds."
+            )
+        config["BARGAIN_SEGMENT"] = seg
+        config["BARGAIN_ROUNDS"] = inner // seg
+        config.setdefault("BARGAIN_PROPOSER", "rotate")
+        if config["BARGAIN_PROPOSER"] not in bargain.PROPOSER_MODES:
+            raise ValueError(
+                f"BARGAIN_PROPOSER must be one of "
+                f"{', '.join(bargain.PROPOSER_MODES)}, "
+                f"got {config['BARGAIN_PROPOSER']!r}")
+        config.setdefault("BARGAIN_FEATURES", "private")
+        quorum_b = bargain.quorum_size(
+            config.setdefault("BARGAIN_QUORUM", "all"), num_agents)
+        for key, default in (("BARGAIN_LR", 3e-4), ("BARGAIN_UPDATE_EPOCHS", 4),
+                             ("BARGAIN_CLIP_EPS", 0.2), ("BARGAIN_ENT_COEF", 0.01),
+                             ("BARGAIN_VF_COEF", 0.5), ("BARGAIN_ACCEPT_BIAS", 1.0),
+                             ("BARGAIN_GAE_LAMBDA", 0.95), ("BARGAIN_HIDDEN", 64)):
+            config.setdefault(key, default)
+        # Not a free hyperparameter: impatience is already realised as reward lost to
+        # disagreement in the environment, so discounting rounds on top would count
+        # the same delay cost twice and hand the proposer an advantage it has not
+        # earned. See bargain.round_gae.
+        if float(config.setdefault("BARGAIN_GAMMA", 1.0)) != 1.0:
+            print(f"[MOCA warning] BARGAIN_GAMMA={config['BARGAIN_GAMMA']} != 1.0. "
+                  f"Delay is already costly in-environment; an extra discount "
+                  f"double-counts it.", flush=True)
     if phase2_mode == "negotiate":
         # Reference branch: 2 sampled non-proposers above 3 agents, all of them
         # below. Overridable, but the default is the rule as coded.
@@ -483,6 +566,30 @@ def make_train(config):
         negotiate_state = [
             TrainState.create(
                 apply_fn=negotiate_net[i].apply, params=negotiate_params[i], tx=negotiate_tx
+            )
+            for i in range(num_agents)
+        ]
+
+        # Rubinstein bargaining policies. Built unconditionally (cheap, and keeps the
+        # PRNG stream identical across modes) but only trained under TRAINING_MODE=joint.
+        bargain_net = [
+            BargainingActorCritic(
+                hidden=int(config.get("BARGAIN_HIDDEN", 64)),
+                activation=config["ACTIVATION"],
+                accept_bias=float(config.get("BARGAIN_ACCEPT_BIAS", 1.0)),
+            )
+            for _ in range(num_agents)
+        ]
+        init_b = jnp.zeros((1, bargain.feature_dim(num_agents)))
+        bargain_tx = optax.chain(
+            optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+            optax.adam(config.get("BARGAIN_LR") or 3e-4, eps=1e-5),
+        )
+        bargain_state = [
+            TrainState.create(
+                apply_fn=bargain_net[i].apply,
+                params=bargain_net[i].init(_rng, init_b),
+                tx=bargain_tx,
             )
             for i in range(num_agents)
         ]
@@ -1080,6 +1187,324 @@ def make_train(config):
             return (frozen_params, negotiate_state, env_state, last_obs,
                     update_step, rng), out
 
+        # =================================================================
+        # RUBINSTEIN BARGAINING, trained JOINTLY (no MOCA phase split)
+        # =================================================================
+        # Everything below is a separate code path. It deliberately duplicates a
+        # little of the phase-1 PPO body rather than refactoring it: the four arms
+        # above are published baselines, and restructuring their shared rollout would
+        # change how PRNG keys are consumed, silently moving numbers that have
+        # already been collected. tests/test_golden_arms.py pins them against exactly
+        # that. Unify once this path has earned its keep.
+        def _bargain_ppo_loss(params, traj_batch, gae, targets, net):
+            """Phase-1's PPO objective, copied so phase 1 stays untouched."""
+            pi, value = net.apply(params, traj_batch.obs, traj_batch.contract)
+            log_prob = pi.log_prob(traj_batch.action)
+            value_pred_clipped = traj_batch.value + (
+                value - traj_batch.value
+            ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
+            value_loss = 0.5 * jnp.maximum(
+                jnp.square(value - targets), jnp.square(value_pred_clipped - targets)
+            ).mean()
+            ratio = jnp.exp(log_prob - traj_batch.log_prob)
+            gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+            loss_actor = -jnp.minimum(
+                ratio * gae,
+                jnp.clip(ratio, 1.0 - config["CLIP_EPS"], 1.0 + config["CLIP_EPS"]) * gae,
+            ).mean()
+            entropy = pi.entropy().mean()
+            return (loss_actor + config["VF_COEF"] * value_loss
+                    - config["ENT_COEF"] * entropy)
+
+        def rollout_bargaining(gameplay_params, bargain_params, env_state, last_obs, rng):
+            """One episode of alternating-offers bargaining interleaved with play.
+
+            Scans over ROUNDS; each round makes one bargaining decision and then
+            plays `BARGAIN_SEGMENT` steps under whatever contract is in force. A
+            scan rather than a Python loop so only one segment body is compiled.
+
+            Returns the gameplay trajectory reshaped to (NUM_STEPS, ...) -- so the
+            existing GAE and loss consume it unchanged -- plus the per-round record
+            the bargaining update needs.
+            """
+            K, x = config["BARGAIN_ROUNDS"], config["BARGAIN_SEGMENT"]
+            n_envs = config["NUM_ENVS"]
+            feat_mask = bargain.feature_mask(config["BARGAIN_FEATURES"], num_agents)
+            # Scales so the state arrives at roughly unit range. Episode return is
+            # bounded by one apple per step; cleaning likewise.
+            ret_scale = float(config["NUM_STEPS"]) * float(
+                config["ENV_KWARGS"].get("apple_reward", 1.0))
+            clean_scale = float(config["NUM_STEPS"])
+            river_scale = float(env.GRID_SIZE_ROW * env.GRID_SIZE_COL)
+
+            def _seg_step(carry, unused):
+                """One gameplay step under the segment's contract. Mirrors `rollout`."""
+                env_state, last_obs, theta, rng = carry
+                contract_obs = contract.to_obs(theta)
+                rng, _rng = jax.random.split(rng)
+                obs_batch = jnp.transpose(last_obs, (1, 0, 2, 3, 4))
+                env_act, log_prob, value = {}, [], []
+                act_keys = jax.random.split(_rng, num_agents)
+                for i in range(num_agents):
+                    pi, value_i = network[i].apply(
+                        gameplay_params[i], obs_batch[i], contract_obs)
+                    action = pi.sample(seed=act_keys[i])
+                    log_prob.append(pi.log_prob(action))
+                    env_act[env.agents[i]] = action
+                    value.append(value_i)
+                env_act_list = [v for v in env_act.values()]
+
+                rng, _rng = jax.random.split(rng)
+                rng_step = jax.random.split(_rng, n_envs)
+                obsv, env_state, reward, done, info = jax.vmap(
+                    env.step, in_axes=(0, 0, 0))(rng_step, env_state, env_act_list)
+
+                transfers = contract.compute_transfer(theta, info["cleaned_by_agent"])
+                reward = reward + transfers
+                info = dict(info)
+                info["contract_transfer"] = transfers
+                info["contract_theta"] = jnp.broadcast_to(theta[:, None], transfers.shape)
+
+                done_list = [v for v in done.values()]
+                transition = []
+                for i in range(num_agents):
+                    info_i = {
+                        k: jax.tree.map(lambda z: z.reshape((config["NUM_ACTORS"]), 1), v[:, i])
+                        for k, v in info.items()
+                    }
+                    transition.append(MOCATransition(
+                        done_list[i], env_act_list[i], value[i], reward[:, i],
+                        log_prob[i], obs_batch[i], contract_obs, info_i))
+                cleaned = info["cleaned_by_agent"]                  # (E, N)
+                clear = info["waste_cleared"][:, 0]                 # (E,)
+                return (env_state, obsv, theta, rng), (transition, cleaned, clear)
+
+            def _round(carry, r):
+                (env_state, last_obs, rng, agreed, locked, cum_return, cum_clean,
+                 last_theta_n, had_offer, n_reject, river) = carry
+                rng, k_prop, k_theta, k_vote = jax.random.split(rng, 4)
+
+                proposer = bargain.proposer_for_round(
+                    r, num_agents, n_envs, config["BARGAIN_PROPOSER"],
+                    key=k_prop, contributions=cum_clean)
+                feats = bargain.bargaining_features(
+                    r, K, proposer, num_agents, last_theta_n, had_offer, n_reject,
+                    cum_return / ret_scale, cum_clean / clean_scale,
+                    river / river_scale, feat_mask)                  # (N, E, F)
+
+                raws, lp_t, votes, lp_v, vals = [], [], [], [], []
+                kt = jax.random.split(k_theta, num_agents)
+                kv = jax.random.split(k_vote, num_agents)
+                for i in range(num_agents):
+                    pi_theta, pi_vote, v = bargain_net[i].apply(bargain_params[i], feats[i])
+                    raw = pi_theta.sample(seed=kt[i])                # (E, 1)
+                    vote = pi_vote.sample(seed=kv[i])                # (E,)
+                    raws.append(raw[:, 0])
+                    lp_t.append(pi_theta.log_prob(raw))
+                    votes.append(vote)
+                    lp_v.append(pi_vote.log_prob(vote))
+                    vals.append(v)
+                raw = jnp.stack(raws)                                # (N, E)
+                votes = jnp.stack(votes)
+                values = jnp.stack(vals)
+
+                theta_all = negotiate.unsquash(raw, contract.low, contract.high)
+                mine = bargain.is_proposer_mask(proposer, num_agents)
+                theta_offer = jnp.sum(jnp.where(mine, theta_all, 0.0), axis=0)   # (E,)
+                passed, n_accept = bargain.accepted(
+                    votes.astype(bool), proposer, quorum_b, num_agents)
+                newly = passed & ~agreed
+                theta_eff = jnp.where(
+                    agreed, locked,
+                    jnp.where(newly, theta_offer, jnp.float32(contract.null)))
+
+                (env_state, last_obs, _, rng), (traj, cleaned, clear) = jax.lax.scan(
+                    _seg_step, (env_state, last_obs, theta_eff, rng), None, x)
+
+                seg_return = jnp.stack(
+                    [traj[i].reward.sum(axis=0) for i in range(num_agents)])     # (N,E)
+                record = {
+                    "feats": feats, "raw": raw, "logp_theta": jnp.stack(lp_t),
+                    "vote": votes, "logp_vote": jnp.stack(lp_v), "value": values,
+                    "seg_return": seg_return,
+                    "active": ~agreed, "newly": newly,
+                    "is_proposer": mine, "theta_offer": theta_offer,
+                    "n_accept": n_accept, "theta_eff": theta_eff,
+                }
+                carry = (env_state, last_obs, rng,
+                         agreed | newly,
+                         jnp.where(newly, theta_offer, locked),
+                         cum_return + seg_return,
+                         cum_clean + jnp.transpose(cleaned.sum(axis=0)),
+                         2.0 * (theta_offer - contract.low)
+                         / (contract.high - contract.low) - 1.0,
+                         jnp.ones_like(had_offer),
+                         n_reject + (~agreed & ~passed).astype(jnp.int32),
+                         clear[-1].astype(jnp.float32))
+                return carry, (record, traj)
+
+            zeros_e = jnp.zeros((n_envs,), jnp.float32)
+            init = (env_state, last_obs, rng,
+                    jnp.zeros((n_envs,), bool), jnp.full((n_envs,), contract.null),
+                    jnp.zeros((num_agents, n_envs), jnp.float32),
+                    jnp.zeros((num_agents, n_envs), jnp.float32),
+                    zeros_e, jnp.zeros((n_envs,), bool),
+                    jnp.zeros((n_envs,), jnp.int32), zeros_e)
+            carry, (rounds, traj) = jax.lax.scan(_round, init, jnp.arange(K))
+            env_state, last_obs, rng, agreed, locked = carry[0], carry[1], carry[2], carry[3], carry[4]
+
+            # (K, x, ...) -> (NUM_STEPS, ...), so the existing GAE/loss are unchanged.
+            traj_batch = [
+                jax.tree.map(lambda z: z.reshape((K * x,) + z.shape[2:]), traj[i])
+                for i in range(num_agents)
+            ]
+
+            # Semi-MDP reward. A rejected round pays only its own null segment; the
+            # round where the offer is accepted pays every remaining segment at once,
+            # because bargaining ends there and those segments are its consequence.
+            active = rounds["active"]                                    # (K, E)
+            post = jnp.sum(
+                jnp.where(active[:, None, :], 0.0, rounds["seg_return"]), axis=0)  # (N,E)
+            rounds["reward"] = rounds["seg_return"] + (
+                rounds["newly"][:, None, :] * post[None, :, :])
+            last_round = jnp.arange(K)[:, None] == (K - 1)
+            rounds["terminal"] = rounds["newly"] | last_round
+            final_theta = jnp.where(agreed, locked, jnp.float32(contract.null))
+            return traj_batch, rounds, env_state, last_obs, final_theta, rng
+
+        def _update_step_joint_bargain(runner_state, unused):
+            (train_state, bargain_state, env_state, last_obs, update_step, rng) = runner_state
+            params_list = [ts.params for ts in train_state]
+            b_params = [bs.params for bs in bargain_state]
+
+            (traj_batch, rounds, env_state, last_obs, final_theta,
+             rng) = rollout_bargaining(params_list, b_params, env_state, last_obs, rng)
+
+            # ---------------------------------------------------- gameplay PPO
+            contract_obs = contract.to_obs(final_theta)
+            last_obs_batch = jnp.transpose(last_obs, (1, 0, 2, 3, 4))
+            last_val = [network[i].apply(params_list[i], last_obs_batch[i],
+                                         contract_obs)[1] for i in range(num_agents)]
+            for i in range(num_agents):
+                advantages_i, targets_i = compute_gae(traj_batch[i], last_val[i])
+
+                def _epoch(state, unused, i=i):
+                    def _minibatch(ts, b):
+                        tb, adv, tgt = b
+                        grads = jax.grad(_bargain_ppo_loss)(
+                            ts.params, tb, adv, tgt, network[i])
+                        return ts.apply_gradients(grads=grads), None
+
+                    ts, tb, adv, tgt, rng_ = state
+                    rng_, _rng = jax.random.split(rng_)
+                    batch_size = config["MINIBATCH_SIZE"] * config["NUM_MINIBATCHES"]
+                    perm = jax.random.permutation(_rng, batch_size)
+                    batch = jax.tree_util.tree_map(
+                        lambda z: z.reshape((batch_size,) + z.shape[2:]), (tb, adv, tgt))
+                    shuffled = jax.tree_util.tree_map(
+                        lambda z: jnp.take(z, perm, axis=0), batch)
+                    mbs = jax.tree_util.tree_map(
+                        lambda z: jnp.reshape(
+                            z, [config["NUM_MINIBATCHES"], -1] + list(z.shape[1:])),
+                        shuffled)
+                    ts, _ = jax.lax.scan(_minibatch, ts, mbs)
+                    return (ts, tb, adv, tgt, rng_), None
+
+                state = (train_state[i], traj_batch[i], advantages_i, targets_i, rng)
+                state, _ = jax.lax.scan(_epoch, state, None, config["UPDATE_EPOCHS"])
+                train_state[i] = state[0]
+                rng = state[-1]
+
+            # -------------------------------------------------- bargaining PPO
+            adv_b, targ_b = bargain.round_gae(
+                rounds["reward"], rounds["value"], rounds["active"][:, None, :],
+                rounds["terminal"][:, None, :],
+                config["BARGAIN_GAMMA"], config["BARGAIN_GAE_LAMBDA"])
+
+            def bargain_loss(params, i):
+                pi_theta, pi_vote, value = bargain_net[i].apply(
+                    params, rounds["feats"][:, i])                  # (K, E, ...)
+                a = adv_b[:, i]
+                a = (a - a.mean()) / (a.std() + 1e-8)
+                act = rounds["active"].astype(jnp.float32)          # (K, E)
+                mine = rounds["is_proposer"][:, i].astype(jnp.float32)
+                w_prop, w_vote = act * mine, act * (1.0 - mine)
+                eps = config["BARGAIN_CLIP_EPS"]
+
+                def clipped(logp, old_logp, w):
+                    ratio = jnp.exp(logp - old_logp)
+                    obj = jnp.minimum(
+                        ratio * a, jnp.clip(ratio, 1.0 - eps, 1.0 + eps) * a)
+                    return -(obj * w).sum() / (w.sum() + 1e-8)
+
+                # An agent proposes OR votes in a given round, never both, so the two
+                # heads are trained on disjoint masks. Rounds after agreement carry no
+                # decision and are excluded from all three terms.
+                loss = clipped(pi_theta.log_prob(rounds["raw"][:, i][..., None]),
+                               rounds["logp_theta"][:, i], w_prop)
+                loss = loss + clipped(pi_vote.log_prob(rounds["vote"][:, i]),
+                                      rounds["logp_vote"][:, i], w_vote)
+                v_loss = (jnp.square(value - targ_b[:, i]) * act).sum() / (act.sum() + 1e-8)
+                entropy = (pi_vote.entropy() * w_vote).sum() / (w_vote.sum() + 1e-8)
+                return (loss + config["BARGAIN_VF_COEF"] * v_loss
+                        - config["BARGAIN_ENT_COEF"] * entropy)
+
+            def _bargain_epoch(state, unused):
+                for i in range(num_agents):
+                    g = jax.grad(bargain_loss)(state[i].params, i)
+                    state[i] = state[i].apply_gradients(grads=g)
+                return state, None
+
+            bargain_state, _ = jax.lax.scan(
+                _bargain_epoch, bargain_state, None, config["BARGAIN_UPDATE_EPOCHS"])
+
+            update_step = update_step + 1
+            jax.debug.callback(checkpoint_callback, train_state, update_step)
+            jax.debug.callback(bargain_checkpoint_callback, bargain_state, update_step)
+
+            # ------------------------------------------------------- metrics
+            metric = jax.tree.map(
+                lambda z: z.mean(), [dict(traj_batch[i].info) for i in range(num_agents)])
+            stacked = {k: jnp.stack([d[k] for d in metric]) for k in metric[0]}
+            out = {}
+            for k, v in stacked.items():
+                out[f"{k}_mean"] = v.mean()
+                out[f"{k}_std"] = v.std()
+            stats = episode_stats(traj_batch, num_agents)
+            out["welfare"] = stats["welfare"]
+            out["equality"] = stats["equality"]
+            out["transfer_volume"] = stats["transfer_volume"]
+
+            agreed_any = rounds["newly"].any(axis=0)                   # (E,)
+            K = config["BARGAIN_ROUNDS"]
+            # Round of agreement, K if the episode never agreed -- so the mean is
+            # directly "how many rounds of bargaining were burned".
+            round_idx = jnp.arange(K)[:, None]
+            agree_round = jnp.where(
+                agreed_any, jnp.sum(jnp.where(rounds["newly"], round_idx, 0), axis=0), K)
+            out["agreement_rate"] = agreed_any.mean()
+            out["agreement_round"] = agree_round.mean()
+            out["disagreement_steps"] = agree_round.mean() * config["BARGAIN_SEGMENT"]
+            out["contract_in_force_rate"] = (
+                rounds["theta_eff"] > contract.null).mean()
+            # theta actually agreed, averaged over the envs that agreed at all.
+            agreed_theta = jnp.sum(jnp.where(rounds["newly"], rounds["theta_offer"], 0.0),
+                                   axis=0)
+            out["theta_agreed"] = (jnp.sum(agreed_theta) /
+                                   jnp.maximum(agreed_any.sum(), 1.0))
+            out["theta_offered"] = rounds["theta_offer"].mean()
+            out["accept_count"] = (rounds["n_accept"] * rounds["active"]).sum() / jnp.maximum(
+                rounds["active"].sum(), 1.0)
+            out = {f"joint/{k}": v for k, v in _select(out, JOINT_BARGAIN_METRICS).items()}
+            out["phase"] = jnp.float32(3.0)
+            out["update_step"] = update_step
+            out["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
+            jax.debug.callback(log_callback, out)
+            jax.debug.callback(progress_callback, update_step, out["joint/welfare"], 3)
+
+            return (train_state, bargain_state, env_state, last_obs,
+                    update_step, rng), out
+
         # ----------------------------------------------------------- callbacks
         def log_callback(metric):
             wandb.log({k: float(v) for k, v in metric.items()})
@@ -1123,6 +1548,19 @@ def make_train(config):
                 save_params(negotiate_state[i], f"./checkpoints/moca/{filename}_contract_{i}.pkl")
             print(f"[checkpoint] MOCA negotiation policies at update {update_step}")
 
+        def bargain_checkpoint_callback(bargain_state, update_step):
+            update_step = int(update_step)
+            every = config.get("CHECKPOINT_EVERY", 20)
+            if every <= 0 or update_step % every != 0:
+                return
+            filename = checkpoint_filename(config, latest=True)
+            for i in range(num_agents):
+                # "_contract_", the same role suffix the negotiation stage uses, so
+                # the viewer's gameplay/contracting split keeps working unchanged.
+                save_params(bargain_state[i],
+                            f"./checkpoints/moca/{filename}_contract_{i}.pkl")
+            print(f"[checkpoint] bargaining policies at update {update_step}")
+
         def progress_callback(update_step, mean_val, phase):
             update_step = int(update_step)
             now = time.time()
@@ -1152,6 +1590,22 @@ def make_train(config):
         # --------------------------------------------------------------- run
         rng, _rng = jax.random.split(rng)
         runner_state = (train_state, env_state, obsv, 0, _rng)
+        if config["TRAINING_MODE"] == "joint":
+            # One loop, nothing frozen: gameplay and bargaining learn together for
+            # the whole budget. Returns early -- there is no phase 1 or phase 2 here,
+            # so the two-phase bookkeeping below does not apply.
+            runner_state = (train_state, bargain_state, env_state, obsv,
+                            jnp.array(0), _rng)
+            runner_state, metric_j = jax.lax.scan(
+                _update_step_joint_bargain, runner_state, None, config["NUM_UPDATES"]
+            )
+            return {
+                "runner_state": (runner_state[0],),
+                "bargain_state": runner_state[1],
+                "contract_grid": contract_grid,
+                "metrics_joint": metric_j,
+            }
+
         if config["NUM_UPDATES_PHASE1"] == 0:
             # PHASE1_FROM: the policy is already trained, so there is nothing to
             # scan over. Skipped in Python rather than run as a zero-length scan so

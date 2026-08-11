@@ -40,6 +40,37 @@ def single_run(config, make_train, *, wandb_name):
     for i in range(num_agents):
         save_params(train_state[i], f"./checkpoints/moca/{filename}_{i}.pkl")
 
+    if "metrics_joint" in out:
+        # TRAINING_MODE=joint: no phase split, so the run's product is BOTH the
+        # gameplay policies and the bargaining policies.
+        for i in range(num_agents):
+            save_params(out["bargain_state"][i],
+                        f"./checkpoints/moca/{filename}_contract_{i}.pkl")
+        m = out["metrics_joint"]
+        tail = max(len(np.array(m["joint/welfare"])) // 10, 1)
+
+        def last(key):
+            return float(np.array(m[key])[-tail:].mean())
+
+        print("\n=== Rubinstein bargaining, joint training (last 10%) ===")
+        print(f"  agreement rate       : {last('joint/agreement_rate'):.3f}")
+        print(f"  agreement round      : {last('joint/agreement_round'):.2f} "
+              f"of {config['BARGAIN_ROUNDS']}")
+        print(f"  steps lost to delay  : {last('joint/disagreement_steps'):.0f}")
+        print(f"  theta agreed         : {last('joint/theta_agreed'):.4f}")
+        print(f"  contract in force    : {last('joint/contract_in_force_rate'):.3f}")
+        print(f"  welfare / equality   : {last('joint/welfare'):.1f} / "
+              f"{last('joint/equality'):.3f}")
+        if last("joint/contract_in_force_rate") < 0.02:
+            # The predictable failure of dropping MOCA: early on the gameplay policy
+            # cannot clean, so a contract really is worthless and rational agents
+            # reject everything -- after which the bargaining policy never observes a
+            # contract in force and has nothing to learn from.
+            print("  [warning] a contract was almost never in force. This is the "
+                  "cold-start failure, not a bug: raise BARGAIN_ACCEPT_BIAS or "
+                  "BARGAIN_ENT_COEF, or start from BARGAIN_QUORUM=majority.")
+        return out
+
     if "metrics_phase2" not in out:
         # PHASE1_ONLY. The gameplay policies are the whole product of the run, so
         # print the glob that feeds them back in -- getting it wrong (catching the

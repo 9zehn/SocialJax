@@ -173,3 +173,82 @@ class VotingPolicy(nn.Module):
         logits = nn.Dense(2, kernel_init=orthogonal(0.01),
                           bias_init=constant(0.0))(x)  # [reject, accept]
         return distrax.Categorical(logits=logits)
+
+
+class BargainingActorCritic(nn.Module):
+    """The Rubinstein bargaining policy: an MLP over a compact bargaining state.
+
+    Deliberately NOT the CNN trunk the reference uses for its negotiation stage. Two
+    reasons, one structural and one empirical.
+
+    Structural: the agent observation is an egocentric OBS_SIZE x OBS_SIZE window
+    (11x11 on a 19x28 grid), which cannot represent the round index, whose turn it
+    is, the standing offer, or the state of the river as a whole. The reference gets
+    away with feeding it to a negotiation head because its game is one shot at s_0,
+    where every episode looks alike; a multi-round game whose decisions condition on
+    history cannot. Some state augmentation is therefore forced, not optional.
+
+    Empirical: this is what the deep-RL bargaining literature does. Agents are given
+    "its utility function, the offer given by the opponent, its previous offer, and
+    agent ID", encoded through "an OfferMLP (multi-layer perceptron with ReLU
+    activation), an agent embedding ... and a turn embedding", with "the scalar
+    representing the current round of bargaining ... included in the state, as is
+    which agent was selected to propose and whether the current agent is proposing or
+    responding" (RLBOA and the multi-issue negotiation line of work). Cao et al.
+    (2018) likewise embed structured game state rather than raw perception.
+
+    And feedforward suffices: the SPE of a FINITE alternating-offers game is Markov
+    in (round, proposer), both of which are inputs here, so no recurrence is needed
+    to represent the equilibrium strategy.
+
+    Three heads, because the reference's single Gaussian over [theta, accept_prob]
+    conflates two different decisions and mis-specifies one of them: its accept
+    "probability" is a clipped Gaussian coordinate whose log-probability is the
+    Gaussian's, not a Bernoulli's, so the gradient does not correspond to the
+    accept/reject choice being made.
+
+    Attributes:
+        hidden: width of the two shared layers.
+        activation: "relu" or "tanh".
+        accept_bias: initial logit added to ACCEPT. Unanimity among 6 responders at
+            an unbiased initialisation fires with probability 0.5**6 = 1.6%, so
+            without a positive prior the contract is almost never in force and the
+            proposal head sees no signal to learn from. Annealing the quorum is the
+            other lever; this one is free.
+    """
+    hidden: int = 64
+    activation: str = "relu"
+    accept_bias: float = 1.0
+
+    @nn.compact
+    def __call__(self, x):
+        act = nn.relu if self.activation == "relu" else nn.tanh
+        h = nn.Dense(self.hidden, kernel_init=orthogonal(np.sqrt(2)),
+                     bias_init=constant(0.0))(x)
+        h = act(h)
+        h = nn.Dense(self.hidden, kernel_init=orthogonal(np.sqrt(2)),
+                     bias_init=constant(0.0))(h)
+        h = act(h)
+
+        # Proposal: a scalar contract in normalised space, unsquashed onto
+        # [low, high] by negotiate.unsquash exactly as the reference does. Kept
+        # Gaussian with a state-independent log-std, matching RLlib's DiagGaussian.
+        theta_mean = nn.Dense(1, kernel_init=orthogonal(0.01),
+                              bias_init=constant(0.0))(h)
+        log_std = self.param("log_std", nn.initializers.zeros, (1,))
+        pi_theta = distrax.MultivariateNormalDiag(theta_mean, jnp.exp(log_std))
+
+        # Vote: a real Bernoulli over [reject, accept].
+        def _vote_bias(key, shape, dtype=jnp.float32):
+            return jnp.array([0.0, self.accept_bias], dtype=dtype)
+
+        vote_logits = nn.Dense(2, kernel_init=orthogonal(0.01),
+                               bias_init=_vote_bias)(h)
+        pi_vote = distrax.Categorical(logits=vote_logits)
+
+        critic = nn.Dense(self.hidden, kernel_init=orthogonal(np.sqrt(2)),
+                          bias_init=constant(0.0))(h)
+        critic = act(critic)
+        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(critic)
+
+        return pi_theta, pi_vote, jnp.squeeze(critic, axis=-1)

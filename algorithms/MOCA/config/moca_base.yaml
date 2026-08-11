@@ -107,6 +107,57 @@
 # "majority" lets a contract pass over a minority's objection.
 "SOLVER_DECISION_RULE": "majority"
 
+# ---- Rubinstein bargaining (TRAINING_MODE: joint, PHASE2_MODE: bargain) ----
+# How the contracting stage is TRAINED, as opposed to which protocol it runs.
+#   "two_phase" -- MOCA Algorithm 1: phase 1 learns to play under contracts drawn
+#                  from a fixed P(Theta), then phase 2 chooses a contract against a
+#                  FROZEN gameplay policy. Every arm above.
+#   "joint"     -- one loop, nothing frozen: gameplay and bargaining learn together
+#                  for the whole budget. Drops MOCA's subgame-perfection argument
+#                  (the contract policy chases a moving gameplay policy, and the
+#                  gameplay policy only ever sees contracts near what is currently
+#                  proposed). Exists to get the bargaining GAME right before layering
+#                  the two-phase construction on top of it.
+"TRAINING_MODE": "two_phase"
+# Steps per bargaining round; must divide ENV_KWARGS.num_inner_steps. Sets the cost
+# of one rejection, which is the whole lever on bargaining power: at 100 steps of a
+# 1000-step episode a rejection burns roughly a tenth of the episode's welfare.
+"BARGAIN_SEGMENT": 100
+# Who proposes in round r. "rotate" is the symmetric Rubinstein protocol; "random"
+# is Baron-Ferejohn recognition; "contribution" weights proposal power by cumulative
+# cleaning (Ostrom's proportional equivalence).
+"BARGAIN_PROPOSER": "rotate"
+# How many of the N-1 non-proposers must accept. "all" (unanimity) is the default
+# and is what stops a proposer buying a minimal winning coalition and excluding the
+# cleaners -- who are the minority the contract exists to compensate. Affordable only
+# because rejection now costs one segment instead of the episode.
+"BARGAIN_QUORUM": "all"
+# Which tier of the bargaining state the policy sees (see bargain.feature_mask).
+#   "protocol" round / whose turn / standing offer -- the extensive-form game alone
+#   "private"  ...plus the agent's own return and cleaning so far  (default)
+#   "public"   ...plus commons aggregates. Telling an agent the mean contribution is
+#              close to handing it the inequality signal, so this is an ABLATION:
+#              a fair split obtained at "private" cannot be attributed to it.
+"BARGAIN_FEATURES": "private"
+# Round discount. Leave at 1.0: impatience is already realised as reward lost to
+# disagreement in the environment, so discounting rounds double-counts the delay
+# cost and inflates the proposer's advantage.
+"BARGAIN_GAMMA": 1.0
+"BARGAIN_GAE_LAMBDA": 0.95
+"BARGAIN_LR": 0.0003
+"BARGAIN_UPDATE_EPOCHS": 4
+"BARGAIN_CLIP_EPS": 0.2
+"BARGAIN_VF_COEF": 0.5
+# Non-zero, unlike the reference's negotiation stage: its accept "probability" is a
+# Gaussian coordinate whose own learned scale supplies exploration, but a Bernoulli
+# vote saturates to always-accept without an entropy term.
+"BARGAIN_ENT_COEF": 0.01
+# Initial logit on ACCEPT. Unanimity among 6 responders at an unbiased init fires
+# with probability 0.5**6 = 1.6%, so without a positive prior the contract is almost
+# never in force and the proposal head never sees a signal. 1.0 gives ~15%.
+"BARGAIN_ACCEPT_BIAS": 1.0
+"BARGAIN_HIDDEN": 64
+
 # Skip phase-1 training and run phase 2 against saved gameplay policies (a glob
 # matching one file per agent). This is what makes a protocol comparison
 # controlled: the decision rule never touches phase 1, so every arm should share

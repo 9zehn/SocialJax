@@ -90,6 +90,24 @@ def checkpoint_filename(config: Dict[str, Any], latest: bool = False) -> str:
             if nu:
                 suffix += f"_nu{nu}"
 
+    # Rubinstein bargaining. Segment length sets the cost of a rejection, and the
+    # proposer rule and quorum are the two design axes the arms differ on -- so all
+    # three have to be in the name or the comparison collides onto one path. Marked
+    # only for bargain runs, so no existing filename changes.
+    if phase2_mode == "bargain":
+        suffix += f"_seg{config.get('BARGAIN_SEGMENT')}"
+        proposer = config.get("BARGAIN_PROPOSER")
+        if proposer and proposer != "rotate":
+            suffix += f"_{proposer}"
+        quorum = config.get("BARGAIN_QUORUM")
+        if quorum and quorum != "all":
+            suffix += f"_q{quorum}"
+        features = config.get("BARGAIN_FEATURES")
+        if features and features != "private":
+            suffix += f"_{features}"
+    if config.get("TRAINING_MODE") == "joint":
+        suffix += "_joint"
+
     # Phase-1 null-contract mass. This shapes the GAMEPLAY policy, so unlike the
     # phase-2 knobs above it is not neutralised by PHASE1_ONLY / PHASE1_FROM: two
     # PHASE1_ONLY runs differing only in null mass -- precisely the controlled
