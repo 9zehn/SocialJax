@@ -199,6 +199,10 @@ JOINT_BARGAIN_METRICS = {
     # The two the result is stated in.
     "welfare": "outcome/welfare",
     "equality": "outcome/equality",
+    # Run health. A collapsing gameplay policy is invisible in every series above
+    # until it has already happened, so this is the early-warning one.
+    "policy_entropy": "health/policy_entropy",
+    "policy_entropy_min": "health/policy_entropy_min",
 }
 
 
@@ -493,12 +497,20 @@ def make_train(config):
     env = LogWrapper(env, replace_info=False)
 
     def linear_schedule(count):
+        # Denominator must be the number of updates that actually TOUCH the gameplay
+        # policy. Two-phase: phase 1 only, since phase 2 freezes it. Joint: the whole
+        # run. Using the phase-1 count under joint sent the rate through zero at 90%
+        # and NEGATIVE for the rest -- gradient ascent on a loss containing
+        # -ENT_COEF * entropy, which drives the policy deterministic and pins entropy
+        # at exactly 0. jnp.maximum makes that unreachable however the counts are
+        # configured; a negative learning rate is never the intent.
+        total = (config["NUM_UPDATES"] if config.get("TRAINING_MODE") == "joint"
+                 else config["NUM_UPDATES_PHASE1"])
         frac = (
             1.0
-            - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"]))
-            / config["NUM_UPDATES_PHASE1"]
+            - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / total
         )
-        return config["LR"] * frac
+        return config["LR"] * jnp.maximum(frac, 0.0)
 
     def train(rng):
         progress_state = {"times": {}}
@@ -1224,8 +1236,9 @@ def make_train(config):
                 jnp.clip(ratio, 1.0 - config["CLIP_EPS"], 1.0 + config["CLIP_EPS"]) * gae,
             ).mean()
             entropy = pi.entropy().mean()
-            return (loss_actor + config["VF_COEF"] * value_loss
-                    - config["ENT_COEF"] * entropy)
+            total = (loss_actor + config["VF_COEF"] * value_loss
+                     - config["ENT_COEF"] * entropy)
+            return total, entropy
 
         def rollout_bargaining(gameplay_params, bargain_params, env_state, last_obs, rng):
             """One episode of alternating-offers bargaining interleaved with play.
@@ -1405,15 +1418,16 @@ def make_train(config):
             last_obs_batch = jnp.transpose(last_obs, (1, 0, 2, 3, 4))
             last_val = [network[i].apply(params_list[i], last_obs_batch[i],
                                          contract_obs)[1] for i in range(num_agents)]
+            entropies = []
             for i in range(num_agents):
                 advantages_i, targets_i = compute_gae(traj_batch[i], last_val[i])
 
                 def _epoch(state, unused, i=i):
                     def _minibatch(ts, b):
                         tb, adv, tgt = b
-                        grads = jax.grad(_bargain_ppo_loss)(
+                        grads, ent = jax.grad(_bargain_ppo_loss, has_aux=True)(
                             ts.params, tb, adv, tgt, network[i])
-                        return ts.apply_gradients(grads=grads), None
+                        return ts.apply_gradients(grads=grads), ent
 
                     ts, tb, adv, tgt, rng_ = state
                     rng_, _rng = jax.random.split(rng_)
@@ -1427,13 +1441,14 @@ def make_train(config):
                         lambda z: jnp.reshape(
                             z, [config["NUM_MINIBATCHES"], -1] + list(z.shape[1:])),
                         shuffled)
-                    ts, _ = jax.lax.scan(_minibatch, ts, mbs)
-                    return (ts, tb, adv, tgt, rng_), None
+                    ts, ent = jax.lax.scan(_minibatch, ts, mbs)
+                    return (ts, tb, adv, tgt, rng_), ent
 
                 state = (train_state[i], traj_batch[i], advantages_i, targets_i, rng)
-                state, _ = jax.lax.scan(_epoch, state, None, config["UPDATE_EPOCHS"])
+                state, ent = jax.lax.scan(_epoch, state, None, config["UPDATE_EPOCHS"])
                 train_state[i] = state[0]
                 rng = state[-1]
+                entropies.append(ent.mean())
 
             # -------------------------------------------------- bargaining PPO
             adv_b, targ_b = bargain.round_gae(
@@ -1520,6 +1535,13 @@ def make_train(config):
                 rounds["theta_offer"] * rounds["active"]).sum() / n_active
             out["accept_count"] = (
                 rounds["n_accept"] * rounds["active"]).sum() / n_active
+            # Gameplay policy entropy, averaged over agents. Nothing else in this set
+            # detects a collapsing policy: welfare and cleaning stay plausible right
+            # up until the policies go deterministic, and then everything drops to
+            # zero in a single update with no warning in any other series. Watch this
+            # one -- if it trends toward 0 the run is dying, whatever else says.
+            out["policy_entropy"] = jnp.stack(entropies).mean()
+            out["policy_entropy_min"] = jnp.stack(entropies).min()
             out = {f"joint/{JOINT_BARGAIN_METRICS[k]}": v
                    for k, v in _select(out, tuple(JOINT_BARGAIN_METRICS)).items()}
             out["phase"] = jnp.float32(3.0)
