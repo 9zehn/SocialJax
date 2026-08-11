@@ -127,6 +127,15 @@
 # is Baron-Ferejohn recognition; "contribution" weights proposal power by cumulative
 # cleaning (Ostrom's proportional equivalence).
 "BARGAIN_PROPOSER": "rotate"
+# BARGAIN_PROPOSER=rotate only: who holds the FIRST move.
+#   "random" -- drawn once per episode per env (default). Rotation alone is not
+#               enough to make the protocol symmetric: the SPE of this game is
+#               agreement in round 0, so with a fixed order agent 0 proposes on
+#               every path actually taken and keeps the first-mover premium
+#               permanently, while rotation only ever shapes off-path values.
+#   "fixed"   -- agent 0 always opens. The ablation that measures how large that
+#               first-mover advantage is.
+"BARGAIN_ROTATE_START": "random"
 # How many of the N-1 non-proposers must accept. "all" (unanimity) is the default
 # and is what stops a proposer buying a minimal winning coalition and excluding the
 # cleaners -- who are the minority the contract exists to compensate. Affordable only

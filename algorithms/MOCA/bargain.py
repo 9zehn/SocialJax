@@ -73,12 +73,19 @@ def quorum_size(spec, num_agents: int) -> int:
 
 
 def proposer_for_round(round_idx, num_agents: int, num_envs: int, mode: str,
-                       key=None, contributions=None) -> jnp.ndarray:
+                       key=None, contributions=None, start_offset=None) -> jnp.ndarray:
     """(num_envs,) index of the proposing agent, per env.
 
-    rotate       round r is agent r mod N. Deterministic and identical across envs,
-                 so every agent gets the same number of turns -- the symmetric
-                 Rubinstein protocol, and the arm to read first.
+    rotate       round r is agent (r + start_offset) mod N -- alternating offers.
+                 `start_offset` is drawn ONCE PER EPISODE, per env, and is what keeps
+                 the protocol symmetric: without it agent 0 proposes in round 0 of
+                 every single episode, and since the SPE of this game is agreement in
+                 round 0, agent 0 would hold a permanent first-mover advantage on
+                 every path actually taken. Rotation would then shape only off-path
+                 continuation values while one fixed agent captured the premium --
+                 and if that agent happened to emerge as a cleaner, the fairness
+                 result would flatter itself. Pass None to recover the fixed order
+                 (the ablation that measures how large that advantage is).
     random       uniform each round (Baron-Ferejohn's random recognition). Included
                  because it is the standard multilateral baseline, and because with
                  majority quorum it should reproduce minority exclusion.
@@ -87,7 +94,9 @@ def proposer_for_round(round_idx, num_agents: int, num_envs: int, mode: str,
                  proportional equivalence). The only way to game it is to clean more.
     """
     if mode == "rotate":
-        return jnp.full((num_envs,), round_idx % num_agents, dtype=jnp.int32)
+        if start_offset is None:
+            return jnp.full((num_envs,), round_idx % num_agents, dtype=jnp.int32)
+        return ((start_offset + round_idx) % num_agents).astype(jnp.int32)
     if mode == "random":
         return jax.random.randint(key, (num_envs,), 0, num_agents).astype(jnp.int32)
     if mode == "contribution":

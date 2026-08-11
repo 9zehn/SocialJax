@@ -47,6 +47,40 @@ def test_rotation_gives_every_agent_equal_turns():
     assert (counts == 4).all(), counts
 
 
+def test_random_start_spreads_the_first_move_but_keeps_alternation():
+    """Rotation alone is not symmetric.
+
+    The SPE of this game is agreement in round 0, so with a fixed order agent 0
+    proposes on every path actually taken and keeps the first-mover premium
+    permanently. The per-episode offset has to move the FIRST move around while
+    leaving the alternating structure inside an episode intact.
+    """
+    n, envs = 5, 400
+    offset = jax.random.randint(jax.random.PRNGKey(0), (envs,), 0, n)
+
+    first = np.array(bargain.proposer_for_round(0, n, envs, "rotate",
+                                                start_offset=offset))
+    counts = np.bincount(first, minlength=n)
+    assert (counts > envs / n * 0.7).all(), f"first move is not spread: {counts}"
+
+    # Within an episode the order must still advance by exactly one agent a round.
+    prev = first
+    for r in range(1, 2 * n):
+        cur = np.array(bargain.proposer_for_round(r, n, envs, "rotate",
+                                                  start_offset=offset))
+        assert np.array_equal(cur, (prev + 1) % n), f"round {r} broke alternation"
+        prev = cur
+
+    # And every agent still gets exactly one turn per full cycle, per env.
+    cycle = np.stack([np.array(bargain.proposer_for_round(r, n, envs, "rotate",
+                                                          start_offset=offset))
+                      for r in range(n)])
+    assert (np.sort(cycle, axis=0) == np.arange(n)[:, None]).all()
+
+    # offset=None is the fixed-order ablation: agent 0 always opens.
+    assert (np.array(bargain.proposer_for_round(0, n, envs, "rotate")) == 0).all()
+
+
 def test_contribution_proposer_favours_the_cleaners():
     """Proposal power should accrue to whoever provisions the public good."""
     contributions = jnp.array([[9.0] * 400, [0.1] * 400, [0.1] * 400])   # (N, E)

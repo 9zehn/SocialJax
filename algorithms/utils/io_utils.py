@@ -99,6 +99,10 @@ def checkpoint_filename(config: Dict[str, Any], latest: bool = False) -> str:
         proposer = config.get("BARGAIN_PROPOSER")
         if proposer and proposer != "rotate":
             suffix += f"_{proposer}"
+        elif config.get("BARGAIN_ROTATE_START") == "fixed":
+            # Only meaningful under rotation, and it changes who captures the
+            # first-mover premium -- so the ablation needs its own path.
+            suffix += "_fixedstart"
         quorum = config.get("BARGAIN_QUORUM")
         if quorum and quorum != "all":
             suffix += f"_q{quorum}"

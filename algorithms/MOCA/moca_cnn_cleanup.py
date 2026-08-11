@@ -366,6 +366,11 @@ def make_train(config):
                 f"{', '.join(bargain.PROPOSER_MODES)}, "
                 f"got {config['BARGAIN_PROPOSER']!r}")
         config.setdefault("BARGAIN_FEATURES", "private")
+        config.setdefault("BARGAIN_ROTATE_START", "random")
+        if config["BARGAIN_ROTATE_START"] not in ("random", "fixed"):
+            raise ValueError(
+                f"BARGAIN_ROTATE_START must be 'random' or 'fixed', "
+                f"got {config['BARGAIN_ROTATE_START']!r}")
         quorum_b = bargain.quorum_size(
             config.setdefault("BARGAIN_QUORUM", "all"), num_agents)
         for key, default in (("BARGAIN_LR", 3e-4), ("BARGAIN_UPDATE_EPOCHS", 4),
@@ -1243,6 +1248,15 @@ def make_train(config):
             clean_scale = float(config["NUM_STEPS"])
             river_scale = float(env.GRID_SIZE_ROW * env.GRID_SIZE_COL)
 
+            # Who moves first, drawn once per episode per env. Constant across the
+            # rounds of an episode, so alternation is preserved; varying across
+            # episodes, so no agent owns the first move. See proposer_for_round.
+            rng, k_start = jax.random.split(rng)
+            start_offset = (
+                jax.random.randint(k_start, (n_envs,), 0, num_agents)
+                if config["BARGAIN_ROTATE_START"] == "random" else None
+            )
+
             def _seg_step(carry, unused):
                 """One gameplay step under the segment's contract. Mirrors `rollout`."""
                 env_state, last_obs, theta, rng = carry
@@ -1292,7 +1306,7 @@ def make_train(config):
 
                 proposer = bargain.proposer_for_round(
                     r, num_agents, n_envs, config["BARGAIN_PROPOSER"],
-                    key=k_prop, contributions=cum_clean)
+                    key=k_prop, contributions=cum_clean, start_offset=start_offset)
                 feats = bargain.bargaining_features(
                     r, K, proposer, num_agents, last_theta_n, had_offer, n_reject,
                     cum_return / ret_scale, cum_clean / clean_scale,
