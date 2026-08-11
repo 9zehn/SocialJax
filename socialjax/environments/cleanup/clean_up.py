@@ -1536,8 +1536,24 @@ class Clean_up(MultiAgentEnv):
             # Caveat: if two agents' beams cover the same dirt cell on the same step the
             # cell is cleared once but both are credited -- beam overlap is inherently
             # ambiguous to attribute, and the env has always resolved it this way.
+            # Count DISTINCT cells, not beam slots. Two of the four slots can resolve
+            # to the same cell: an out-of-grid diagonal falls back to the one-step tile
+            # above, and clip_beam_targets clamps an out-of-grid tile onto the edge.
+            # Counting slots then pays an agent 2-3x for a single dirt cell, and it is
+            # reachable on purpose -- stand at the edge of the river facing along it.
+            # A tile is only suppressed by an EARLIER tile that was itself counted, so
+            # a duplicate of an already-discarded (out-of-grid) slot still counts.
+            _coords = _beam_tiles[:, :, :2]
+            _counted = _tile_is_dirt
+            for _j in range(1, 4):
+                _dup = jnp.zeros(n_ag, dtype=bool)
+                for _k in range(_j):
+                    _same = ((_coords[_j][:, 0] == _coords[_k][:, 0])
+                             & (_coords[_j][:, 1] == _coords[_k][:, 1]))
+                    _dup = _dup | (_same & _counted[_k])
+                _counted = _counted.at[_j].set(_counted[_j] & ~_dup)
             cleaned_count = jnp.where(
-                zaps.reshape(-1), jnp.sum(_tile_is_dirt, axis=0), 0
+                zaps.reshape(-1), jnp.sum(_counted, axis=0), 0
             ).astype(jnp.float32)
             # Boolean form ("did this agent clean at all"), which is what last_clean_t
             # and the recent-cleaner recipient rules need.
@@ -1548,20 +1564,35 @@ class Clean_up(MultiAgentEnv):
 
             # all_zaped_locs = jax.vmap(filter_zaped_locs)(all_zaped_locs)
 
-            potential_dirt_all_zap = jnp.repeat(jnp.array(Items.potential_dirt), len(all_zaped_locs))
-            # make clean gird
-            def clean_gird(a, judge):
-                return state.grid.at[a[:, 0], a[:, 1]].set(
-                    jax.vmap(jnp.where)(
-                        ((judge == True) & (state.grid[a[:, 0], a[:, 1]] == Items.dirt)),
-                        potential_dirt_all_zap,
-                        state.grid[a[:, 0], a[:, 1]]
-                    )
-                )
+            # Cleaning is applied as a scatter of a boolean HIT MASK, then a single
+            # whole-grid where -- not as a scatter of grid VALUES.
+            #
+            # Scattering values was silently wrong wherever two beam slots resolved to
+            # the same cell, which is routine: clip_beam_targets clamps an out-of-grid
+            # tile onto the edge of the grid, so an agent standing one cell from the
+            # river's edge and facing outward has its two-step tile land back on the
+            # dirt cell in front of it. That slot is masked invalid, so its `where`
+            # yielded the cell's ORIGINAL value -- dirt -- and .at[].set() with
+            # duplicate indices resolves in an unspecified order. The invalid slot won,
+            # writing the dirt straight back over the legitimate clean from the
+            # one-step slot, while cleaned_count still credited it. The cell could
+            # never be cleared and paid out every single step: an infinite income
+            # source under any contract that prices cleaning.
+            #
+            # A boolean scatter-reduce has no such ambiguity -- .max over duplicate
+            # indices is an OR, so a cell is cleared iff ANY valid, firing beam slot
+            # covers it, whatever order the updates land in. This also fixes the
+            # converse case, where a NON-firing agent's overlapping beam could write
+            # stale dirt over a cleaner's work.
+            clean_hit = (zaps_4_locs_judge.squeeze() & all_zaped_valid)
+            hit_mask = jnp.zeros((R_, C_), dtype=jnp.int32).at[
+                all_zaped_locs[:, 0], all_zaped_locs[:, 1]
+            ].max(clean_hit.astype(jnp.int32)) > 0
 
-
-            grid_clean = clean_gird(
-                all_zaped_locs, (zaps_4_locs_judge.squeeze() & all_zaped_valid)
+            grid_clean = jnp.where(
+                hit_mask & (state.grid == Items.dirt),
+                jnp.int16(Items.potential_dirt),
+                state.grid,
             )
             state = state.replace(grid=grid_clean)
 
