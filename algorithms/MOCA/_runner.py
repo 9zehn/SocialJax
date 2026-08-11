@@ -22,10 +22,20 @@ def single_run(config, make_train, *, wandb_name):
     train = make_train(config)
     filename = checkpoint_filename(config)
 
+    # "--algo MOCA" only selects this directory; it does not mean the run uses MOCA's
+    # two-phase algorithm. Under TRAINING_MODE=joint there is no phase split, no
+    # frozen subgame policy and no P(Theta), so tagging it MOCA would mislabel the
+    # one axis these experiments are comparing.
+    joint = config.get("TRAINING_MODE", "two_phase") == "joint"
+    tags = ["CONTRACTS", "FF", "JOINT" if joint else "MOCA"]
+    protocol = config.get("PHASE2_MODE")
+    if protocol:
+        tags.append(protocol.upper())
+
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
-        tags=["MOCA", "CONTRACTS", "FF"],
+        tags=tags,
         config=config,
         mode=config["WANDB_MODE"],
         name=config.get("WANDB_RUN_NAME") or f"{wandb_name}_{filename}",
