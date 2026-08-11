@@ -122,6 +122,146 @@ def rollout(env, params, num_steps, seed, contract=None, theta=None):
 
 
 
+def infer_bargain_config(stem):
+    """Recover the bargaining settings from the run stem.
+
+    checkpoint_filename encodes segment length always and the other three knobs when
+    off-default, so the whole protocol is recoverable from the filename -- which
+    matters because replaying under the wrong quorum or proposer rule silently
+    reproduces a DIFFERENT mechanism rather than failing.
+    """
+    seg = re.search(r"_seg(\d+)", stem)
+    quorum = re.search(r"_q(majority|\d+)", stem)
+    proposer = ("contribution" if "_contribution" in stem
+                else "random" if "_random" in stem else "rotate")
+    features = ("protocol" if "_protocol" in stem
+                else "public" if "_public" in stem else "private")
+    return {
+        "segment": int(seg.group(1)) if seg else 100,
+        "quorum": (quorum.group(1) if quorum else "all"),
+        "proposer": proposer,
+        "features": features,
+        "rotate_start": "fixed" if "_fixedstart" in stem else "random",
+    }
+
+
+def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
+                       contract, cfg, fixed_theta=None):
+    """Replay a Rubinstein bargaining run: negotiate, play a segment, repeat.
+
+    Parallel to `rollout` rather than folded into it, so every pre-bargaining
+    checkpoint keeps its exact replay path.
+
+    Returns (states, extras) with the same keys `rollout` produces, plus
+    extras["rounds"]: one record per round in which a decision was actually made --
+    what was offered, by whom, how each agent voted, and whether it carried. That
+    is what the panel draws.
+
+    `fixed_theta` overrides the negotiation entirely (replay a counterfactual
+    contract); the round records are then empty, since nothing was negotiated.
+    """
+    from algorithms.MOCA import bargain as bg
+    from algorithms.MOCA import negotiate as neg
+    from algorithms.MOCA.networks import BargainingActorCritic, ContractActorCritic
+
+    n = env.num_agents
+    net = ContractActorCritic(action_dim=env.action_space().n, activation="relu")
+    bnet = BargainingActorCritic(hidden=cfg.get("hidden", 64), activation="relu",
+                                 accept_bias=cfg.get("accept_bias", 1.0))
+    mask = bg.feature_mask(cfg["features"], n)
+    quorum = bg.quorum_size(cfg["quorum"], n)
+    seg = int(cfg["segment"])
+
+    # Scales must match training exactly or the policy reads a different state.
+    inner = int(getattr(env, "num_inner_steps", num_steps))
+    ret_scale = float(inner) * float(getattr(env, "apple_reward", 1.0))
+    clean_scale = float(inner)
+    river_scale = float(env.GRID_SIZE_ROW * env.GRID_SIZE_COL)
+
+    rng = jax.random.PRNGKey(seed)
+    rng, k_reset, k_start = jax.random.split(rng, 3)
+    obs, state = env.reset(k_reset)
+    offset = (jax.random.randint(k_start, (1,), 0, n)
+              if cfg["rotate_start"] == "random" else None)
+
+    states, transfers, cleaned_hist, rounds = [state], [np.zeros(n)], [np.zeros(n)], []
+    cum_ret, cum_clean = np.zeros(n, np.float32), np.zeros(n, np.float32)
+    agreed, locked = False, float(contract.null)
+    last_tn, had_offer, n_reject, river = 0.0, False, 0, 0.0
+    step = 0
+    num_rounds = max(1, int(np.ceil(num_steps / seg)))
+
+    for r in range(num_rounds):
+        if fixed_theta is not None:
+            theta = float(fixed_theta)
+        elif agreed:
+            theta = locked
+        else:
+            rng, k_prop, k_theta, k_vote = jax.random.split(rng, 4)
+            proposer = int(bg.proposer_for_round(
+                r, n, 1, cfg["proposer"], key=k_prop,
+                contributions=jnp.asarray(cum_clean)[:, None], start_offset=offset)[0])
+            feats = bg.bargaining_features(
+                r, num_rounds, jnp.array([proposer]), n,
+                jnp.array([last_tn], jnp.float32), jnp.array([had_offer]),
+                jnp.array([n_reject], jnp.int32),
+                jnp.asarray(cum_ret)[:, None] / ret_scale,
+                jnp.asarray(cum_clean)[:, None] / clean_scale,
+                jnp.array([river], jnp.float32) / river_scale, mask)
+
+            kt = jax.random.split(k_theta, n)
+            kv = jax.random.split(k_vote, n)
+            raw, votes = [], []
+            for i in range(n):
+                pi_theta, pi_vote, _ = bnet.apply(bargain_params[i], feats[i])
+                raw.append(float(pi_theta.sample(seed=kt[i])[0, 0]))
+                votes.append(int(pi_vote.sample(seed=kv[i])[0]))
+            theta_offer = float(neg.unsquash(
+                jnp.float32(raw[proposer]), contract.low, contract.high))
+            n_accept = sum(v for i, v in enumerate(votes) if i != proposer)
+            passed = n_accept >= quorum
+
+            rounds.append({
+                "round": r, "step": step, "proposer": proposer,
+                "theta": theta_offer, "votes": list(votes), "accepted": bool(passed),
+                "n_accept": int(n_accept), "quorum": quorum,
+            })
+            last_tn = 2.0 * (theta_offer - contract.low) / (contract.high - contract.low) - 1.0
+            had_offer = True
+            if passed:
+                agreed, locked = True, theta_offer
+            else:
+                n_reject += 1
+            theta = locked if agreed else float(contract.null)
+
+        contract_vec = contract.to_obs(jnp.float32(theta))[None, ...]
+        for _ in range(min(seg, num_steps - step)):
+            rng, k_act, k_step = jax.random.split(rng, 3)
+            act_keys = jax.random.split(k_act, n)
+            actions = []
+            for i, a in enumerate(env.agents):
+                pi, _ = net.apply(gameplay_params[i], obs[a][None, ...], contract_vec)
+                actions.append(int(pi.sample(seed=act_keys[i]).squeeze()))
+            obs, state, reward, done, info = env.step(k_step, state, actions)
+            states.append(state)
+            step += 1
+
+            cl = np.atleast_1d(np.array(info["cleaned_by_agent"], np.float32))
+            tr = np.array(contract.compute_transfer(jnp.float32(theta), jnp.asarray(cl)))
+            cleaned_hist.append(cl)
+            transfers.append(tr)
+            cum_clean = cum_clean + cl
+            cum_ret = cum_ret + np.asarray(reward, np.float32).reshape(-1) + tr
+            river = float(np.array(info["waste_cleared"]).reshape(-1)[0])
+            if bool(done["__all__"]):
+                return states, {"transfers": transfers, "cleaned": cleaned_hist,
+                                "rounds": rounds}
+        if step >= num_steps:
+            break
+
+    return states, {"transfers": transfers, "cleaned": cleaned_hist, "rounds": rounds}
+
+
 def _agent_snapshot(state):
     snapshot = {}
     if hasattr(state, "agent_locs"):
@@ -337,7 +477,77 @@ def _scheme_caption(env, contract_info=None):
     return f"{reward} · instant pays {getattr(env, 'pay_amount', 1.0):g}{tag}"
 
 
-def render_info_panel(height, datum, colors, env, step, width, contract_info=None):
+def _render_bargain_log(draw, x0, y0, x1, y1, rounds, colors, width, n):
+    """The bargaining log: one row per round that actually had a decision.
+
+    Reads left to right as the round played out -- who proposed, what they asked
+    for, how each agent voted, and whether it carried. One vote dot per agent, in
+    agent order so the column lines up with the table above: green accept, red
+    reject, and hollow for the proposer, which never votes on its own offer.
+    """
+    from PIL import ImageDraw  # noqa: F401  (draw is already an ImageDraw)
+
+    head_f = _load_font(max(11, int(width * 0.04)))
+    cell_f = _load_font(max(12, int(width * 0.044)))
+    pad = max(14, int(width * 0.045))
+
+    draw.line([x0 - 4, y0, x1 + 4, y0], fill=_PANEL_ROW, width=2)
+    y = y0 + int(head_f.size * 0.8)
+    draw.text((x0, y), "Bargaining", font=_load_font(max(13, int(width * 0.052))),
+              fill=_PANEL_FG)
+    if not rounds:
+        draw.text((x1, y + 2), "no offer yet", font=head_f, fill=_PANEL_MUTED,
+                  anchor="ra")
+        return
+    settled = next((r for r in rounds if r["accepted"]), None)
+    status = (f"agreed R{settled['round']} at θ={settled['theta']:.3f}"
+              if settled else f"{len(rounds)} rejected")
+    draw.text((x1, y + 2), status, font=head_f,
+              fill=_PANEL_ON if settled else _PANEL_OFF, anchor="ra")
+
+    y += int(head_f.size * 2.0)
+    avail = y1 - y
+    row_h = min(int(cell_f.size * 1.8), max(1, int(avail / max(len(rounds), 1))))
+    dot = max(6, int(row_h * 0.42))
+    # Vote dots sit in a fixed-width strip on the right so rows stay aligned.
+    strip_w = (dot + 3) * n
+    x_dots = x1 - strip_w - int(width * 0.09)
+
+    for k, rec in enumerate(rounds):
+        ry = y + row_h * k
+        if ry + row_h > y1:
+            draw.text((x0, ry), f"+{len(rounds) - k} more", font=head_f,
+                      fill=_PANEL_MUTED)
+            break
+        cy = ry + row_h / 2
+        ok = rec["accepted"]
+        draw.rounded_rectangle([x0 - 4, ry + 1, x1 + 4, ry + row_h - 2],
+                               radius=5, fill=_PANEL_ROW)
+        p = rec["proposer"]
+        pcol = tuple(int(c) for c in colors[p]) if p < len(colors) else (200, 200, 200)
+        draw.text((x0 + 2, cy), f"R{rec['round']}", font=head_f,
+                  fill=_PANEL_MUTED, anchor="lm")
+        # Proposer swatch + id, so "who asked" is readable without counting dots.
+        sx = x0 + int(width * 0.075)
+        draw.rounded_rectangle([sx, cy - dot / 2, sx + dot, cy + dot / 2],
+                               radius=3, fill=pcol, outline=(15, 16, 24))
+        draw.text((sx + dot + 4, cy), f"A{p}", font=head_f, fill=_PANEL_FG, anchor="lm")
+        draw.text((x_dots - int(width * 0.02), cy), f"θ={rec['theta']:.3f}",
+                  font=cell_f, fill=_PANEL_FG, anchor="rm")
+
+        for i in range(n):
+            dx = x_dots + i * (dot + 3)
+            box = [dx, cy - dot / 2, dx + dot, cy + dot / 2]
+            if i == p:
+                draw.ellipse(box, outline=_PANEL_MUTED, width=1)   # proposer: no vote
+            else:
+                draw.ellipse(box, fill=_PANEL_ON if rec["votes"][i] else _PANEL_OFF)
+        draw.text((x1, cy), "✓" if ok else "✗", font=cell_f,
+                  fill=_PANEL_ON if ok else _PANEL_OFF, anchor="rm")
+
+
+def render_info_panel(height, datum, colors, env, step, width, contract_info=None,
+                      bargain_rounds=None, bargain_slots=0):
     """Render one info-panel frame (RGB, height x width) for a single step.
 
     First column is each agent's color (a swatch + a color bar down the row edge)
@@ -396,9 +606,15 @@ def render_info_panel(height, datum, colors, env, step, width, contract_info=Non
         draw.text((x_last, y_head), "Transfer", font=head_f, fill=_PANEL_MUTED, anchor="ra")
     x_share = x_last
 
-    # Rows.
+    # Rows. Under bargaining the agent table gives up the lower part of the panel to
+    # the round log. Sized from the TOTAL number of rounds rather than the ones
+    # revealed so far, so the table does not jump as the scrubber moves.
     top = y_head + int(head_f.size * 1.5)
-    avail = height - top - pad
+    bottom = height - pad
+    if bargain_rounds is not None:
+        need = 0.20 + 0.05 * max(bargain_slots, 1)
+        bottom = top + int((height - pad - top) * (1.0 - min(need, 0.55)))
+    avail = bottom - top
     row_h = avail / max(n, 1)
     swatch = min(int(row_h * 0.5), int(width * 0.09))
 
@@ -450,10 +666,15 @@ def render_info_panel(height, datum, colors, env, step, width, contract_info=Non
                 fill, txt = _PANEL_MUTED, "0.00"
             draw.text((x_share, cy), txt, font=cell_f, fill=fill, anchor="rm")
 
+    if bargain_rounds is not None:
+        _render_bargain_log(draw, pad, bottom + int(pad * 0.6), width - pad,
+                            height - pad, bargain_rounds, colors, width, n)
+
     return np.array(img)
 
 
-def add_info_panels(frames, panel_data, colors, env, width=None, contract_info=None):
+def add_info_panels(frames, panel_data, colors, env, width=None, contract_info=None,
+                    bargain_rounds=None):
     """Composite a per-step info panel onto the right of each grid frame.
 
     Returns new (wider) frames of uniform size so both the GIF export and the
@@ -465,8 +686,14 @@ def add_info_panels(frames, panel_data, colors, env, width=None, contract_info=N
         width = max(360, int(h * 0.75))
     out = []
     for i, frame in enumerate(frames):
+        # Reveal rounds as the scrubber reaches them, so the log reads as history
+        # accumulating rather than spoiling the outcome from frame 0.
+        so_far = (None if bargain_rounds is None
+                  else [r for r in bargain_rounds if r["step"] <= i])
         panel = render_info_panel(h, panel_data[i], colors, env, i, width,
-                                  contract_info=contract_info)
+                                  contract_info=contract_info,
+                                  bargain_rounds=so_far,
+                                  bargain_slots=len(bargain_rounds or ()))
         out.append(np.hstack([frame, panel]))
     return out
 
@@ -716,6 +943,19 @@ def detect_moca(checkpoint_arg):
             "gameplay": gameplay,
         }
 
+    base = os.path.basename(stem)
+
+    # Rubinstein bargaining writes its policies under the SAME "_contract_" role
+    # suffix as the one-shot negotiation stage, so the stem token has to be checked
+    # first -- otherwise a bargaining run is read as a negotiate run and its weights
+    # are loaded into the wrong network. Checked before the glob for that reason.
+    if "_bargain" in base:
+        contracts = sorted(glob.glob(f"{stem}_contract_*.pkl"))
+        if contracts:
+            return {"mode": "bargain", "contract_paths": contracts,
+                    "gameplay": gameplay, "stem": base}
+        return {"mode": "phase1", "gameplay": gameplay}
+
     contracts = sorted(glob.glob(f"{stem}_contract_*.pkl"))
     if not contracts:  # runs written before the role suffix was disambiguated
         contracts = sorted(glob.glob(f"{stem}_negotiate_*.pkl"))
@@ -723,7 +963,6 @@ def detect_moca(checkpoint_arg):
         return {"mode": "negotiate", "contract_paths": contracts, "gameplay": gameplay}
 
     # Solver runs save no contracting policy, so the stem is the only evidence.
-    base = os.path.basename(stem)
     if "_solver" in base:
         return {"mode": "solver", "gameplay": gameplay}
     # PHASE1_ONLY: checkpoint_filename always marks a PHASE2_MODE, so the stem still
@@ -981,6 +1220,10 @@ def main():
                              "The null contract theta=0 is always available and is unaffected by "
                              "these bounds. Default tracks moca_base.yaml; pass 0.0 for runs "
                              "trained before the range excluded weak contracts")
+    parser.add_argument("--bargain-segment", type=int, default=None,
+                        help="PHASE2_MODE=bargain: steps per bargaining round. Read "
+                             "from the checkpoint name (_seg<N>) by default; pass this "
+                             "to replay the same policies at a different round length")
     parser.add_argument("--solver-samples", type=int, default=50,
                         help="PHASE2_MODE=solver: contracts sampled and scored by the "
                              "frozen critics at reset (training default: 50)")
@@ -1062,6 +1305,7 @@ def main():
     # wanting to sign -- with --contract-theta available to replay a counterfactual
     # (notably 0, the null contract, to see what the same policies do unsubsidised).
     contract, theta, contract_info = None, None, None
+    bargain_cfg, bargain_params, bargain_rounds = None, None, None
     moca = detect_moca(args.checkpoint) if args.checkpoint else None
     if moca is not None:
         from algorithms.MOCA.contracts import CleanupContract, contract_for_params
@@ -1125,16 +1369,51 @@ def main():
                   f"chose theta={info['theta']:.4f}"
                   + ("  [the NULL contract -- nothing beat it]" if info["null"] else ""))
 
+        if mode == "bargain":
+            bargain_cfg = infer_bargain_config(moca["stem"])
+            if args.bargain_segment is not None:
+                bargain_cfg["segment"] = args.bargain_segment
+            bargain_params = [load_params(p) for p in moca["contract_paths"]]
+            print(f"  {len(bargain_params)} bargaining policies; "
+                  f"segment={bargain_cfg['segment']}, "
+                  f"proposer={bargain_cfg['proposer']} "
+                  f"(start {bargain_cfg['rotate_start']}), "
+                  f"quorum={bargain_cfg['quorum']}, "
+                  f"features={bargain_cfg['features']}")
+            print("  theta is renegotiated during the episode, so it is not fixed "
+                  "up front -- see the bargaining log in the panel")
+
         if args.contract_theta is not None:
             theta, source = float(args.contract_theta), "(manual)"
         else:
             theta, source = learned, "(learned)"
         contract_info = {"theta": theta, "source": source}
-        print(f"  replaying under theta={theta:g} {source}")
+        if mode != "bargain" or args.contract_theta is not None:
+            print(f"  replaying under theta={theta:g} {source}")
 
-    states, extras = rollout(
-        env, params, args.steps, args.seed, contract=contract, theta=theta
-    )
+    if bargain_cfg is not None:
+        # Parallel replay path: the one-shot arms keep `rollout` untouched.
+        states, extras = rollout_bargaining(
+            env, params, bargain_params, args.steps, args.seed, contract,
+            bargain_cfg, fixed_theta=args.contract_theta)
+        bargain_rounds = extras["rounds"]
+        settled = next((r for r in bargain_rounds if r["accepted"]), None)
+        if args.contract_theta is not None:
+            print(f"  --contract-theta given: bargaining bypassed, replaying at "
+                  f"theta={args.contract_theta:g} throughout")
+        elif settled:
+            print(f"  agreed in round {settled['round']} at theta="
+                  f"{settled['theta']:.4f} (proposed by agent {settled['proposer']}, "
+                  f"{settled['n_accept']}/{settled['quorum']} needed)")
+            contract_info = {"theta": settled["theta"], "source": "(bargained)"}
+        else:
+            print(f"  no agreement in {len(bargain_rounds)} rounds -- played "
+                  f"uncontracted")
+            contract_info = {"theta": contract.null, "source": "(no agreement)"}
+    else:
+        states, extras = rollout(
+            env, params, args.steps, args.seed, contract=contract, theta=theta
+        )
     print(f"Rolled out {len(states) - 1} steps ({'trained checkpoint' if params else 'random policy'}).")
 
     traces = [_agent_snapshot(s) for s in states]
@@ -1180,7 +1459,9 @@ def main():
               f"-- reopen with --replay {args.record}")
 
     if not args.no_panel and panel_data is not None:
-        frames = add_info_panels(frames, panel_data, colors, env, contract_info=contract_info)
+        frames = add_info_panels(frames, panel_data, colors, env,
+                                 contract_info=contract_info,
+                                 bargain_rounds=bargain_rounds)
         print("Added per-agent info panel.")
 
     if args.gif:
