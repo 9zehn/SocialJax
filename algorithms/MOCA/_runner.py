@@ -47,21 +47,22 @@ def single_run(config, make_train, *, wandb_name):
             save_params(out["bargain_state"][i],
                         f"./checkpoints/moca/{filename}_contract_{i}.pkl")
         m = out["metrics_joint"]
-        tail = max(len(np.array(m["joint/welfare"])) // 10, 1)
+        tail = max(len(np.array(m["joint/outcome/welfare"])) // 10, 1)
 
         def last(key):
             return float(np.array(m[key])[-tail:].mean())
 
         print("\n=== Rubinstein bargaining, joint training (last 10%) ===")
-        print(f"  agreement rate       : {last('joint/agreement_rate'):.3f}")
-        print(f"  agreement round      : {last('joint/agreement_round'):.2f} "
+        print(f"  agreement rate       : {last('joint/agree/rate'):.3f}")
+        print(f"  agreement round      : {last('joint/agree/round'):.2f} "
               f"of {config['BARGAIN_ROUNDS']}")
-        print(f"  steps lost to delay  : {last('joint/disagreement_steps'):.0f}")
-        print(f"  theta agreed         : {last('joint/theta_agreed'):.4f}")
-        print(f"  contract in force    : {last('joint/contract_in_force_rate'):.3f}")
-        print(f"  welfare / equality   : {last('joint/welfare'):.1f} / "
-              f"{last('joint/equality'):.3f}")
-        if last("joint/contract_in_force_rate") < 0.02:
+        print(f"  steps lost to delay  : "
+              f"{last('joint/agree/round') * config['BARGAIN_SEGMENT']:.0f}")
+        print(f"  theta agreed         : {last('joint/contract/theta_agreed'):.4f}")
+        print(f"  contract in force    : {last('joint/contract/in_force_rate'):.3f}")
+        print(f"  welfare / equality   : {last('joint/outcome/welfare'):.1f} / "
+              f"{last('joint/outcome/equality'):.3f}")
+        if last("joint/contract/in_force_rate") < 0.02:
             # The predictable failure of dropping MOCA: early on the gameplay policy
             # cannot clean, so a contract really is worthless and rational agents
             # reject everything -- after which the bargaining policy never observes a

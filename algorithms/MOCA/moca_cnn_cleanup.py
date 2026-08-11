@@ -174,26 +174,32 @@ STAGE2_NEGOTIATE_METRICS = (
 # above the contract threshold welfare is flat, so it cannot discriminate between
 # contracts, whereas every round of disagreement burns a measurable slice of the
 # episode. Equity is where in the range theta lands.
-JOINT_BARGAIN_METRICS = (
-    # Did the mechanism produce a contract, and how much did delay cost?
-    "agreement_rate",
-    "agreement_round",
-    "disagreement_steps",
-    "contract_in_force_rate",   # near zero for long = the cold-start failure
-    # What was agreed, versus what was asked for.
-    "theta_agreed",
-    "theta_offered",
-    "accept_count",
-    # Did it change behaviour, and for whom?
-    "cleaned_by_agent_mean",
-    "waste_cleared_mean",
-    "transfer_volume",
-    "welfare",
-    "equality",
-    "returned_episode_returns_mean",
-    "returned_episode_returns_std",
-    "shaped_rewards_mean",
-)
+#
+# Grouped into wandb sections by the "/" in the logged name, and pruned of anything
+# derivable from what is left: disagreement_steps is agreement_round *
+# BARGAIN_SEGMENT, returned_episode_returns_mean is welfare / num_agents, and
+# equality already carries what the spread across agents said.
+JOINT_BARGAIN_METRICS = {
+    # Efficiency, which here is SPEED OF AGREEMENT rather than welfare: above the
+    # contract threshold welfare is flat and cannot discriminate between contracts,
+    # while every round of disagreement burns a measurable slice of the episode.
+    "agreement_rate": "agree/rate",
+    "agreement_round": "agree/round",
+    # Is the mechanism doing anything, and what did it settle on? in_force_rate
+    # sitting near zero is the cold-start failure, not a bug -- see _runner.
+    "contract_in_force_rate": "contract/in_force_rate",
+    "theta_agreed": "contract/theta_agreed",
+    "theta_offered": "contract/theta_offered",
+    "accept_count": "contract/accept_count",
+    "transfer_volume": "contract/transfer_volume",
+    # Did behaviour actually change? Transfers are zero-sum, so welfare can only
+    # move if cleaning does.
+    "cleaned_by_agent_mean": "behaviour/cleaned_per_agent",
+    "waste_cleared_mean": "behaviour/waste_cleared",
+    # The two the result is stated in.
+    "welfare": "outcome/welfare",
+    "equality": "outcome/equality",
+}
 
 
 def _select(metrics: dict, allowed: Tuple[str, ...]) -> dict:
@@ -1492,15 +1498,22 @@ def make_train(config):
                                    axis=0)
             out["theta_agreed"] = (jnp.sum(agreed_theta) /
                                    jnp.maximum(agreed_any.sum(), 1.0))
-            out["theta_offered"] = rounds["theta_offer"].mean()
-            out["accept_count"] = (rounds["n_accept"] * rounds["active"]).sum() / jnp.maximum(
-                rounds["active"].sum(), 1.0)
-            out = {f"joint/{k}": v for k, v in _select(out, JOINT_BARGAIN_METRICS).items()}
+            # Masked by `active`: agents still emit an offer in rounds after
+            # agreement, but it is never read, so averaging it in would report
+            # untrained noise as the policy's asking price.
+            n_active = jnp.maximum(rounds["active"].sum(), 1.0)
+            out["theta_offered"] = (
+                rounds["theta_offer"] * rounds["active"]).sum() / n_active
+            out["accept_count"] = (
+                rounds["n_accept"] * rounds["active"]).sum() / n_active
+            out = {f"joint/{JOINT_BARGAIN_METRICS[k]}": v
+                   for k, v in _select(out, tuple(JOINT_BARGAIN_METRICS)).items()}
             out["phase"] = jnp.float32(3.0)
             out["update_step"] = update_step
             out["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
             jax.debug.callback(log_callback, out)
-            jax.debug.callback(progress_callback, update_step, out["joint/welfare"], 3)
+            jax.debug.callback(
+                progress_callback, update_step, out["joint/outcome/welfare"], 3)
 
             return (train_state, bargain_state, env_state, last_obs,
                     update_step, rng), out
