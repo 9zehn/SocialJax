@@ -167,13 +167,31 @@
 "BARGAIN_ACCEPT_BIAS": 1.0
 "BARGAIN_HIDDEN": 64
 # Exploration floor on the vote at ROLLOUT time: accept probability is clipped into
-# [eps, 1-eps] when sampling, annealed linearly to 0 over training. BARGAIN_ENT_COEF
-# alone did not stop either previous run saturating (one always-reject agent in the
-# first, every agent always-accept in the second), and saturation is self-sealing --
-# an agent that never refuses never observes what refusing would have bought it.
-# Unlike BARGAIN_ACCEPT_BIAS, which is only an initialisation and points one way,
-# this holds both branches open symmetrically for as long as it is on.
+# [eps, 1-eps] when sampling, annealed linearly from BARGAIN_VOTE_EPS down to
+# BARGAIN_VOTE_EPS_END over training. BARGAIN_ENT_COEF alone did not stop either
+# previous run saturating (one always-reject agent in the first, every agent
+# always-accept in the second), and saturation is self-sealing -- an agent that
+# never refuses never observes what refusing would have bought it. Unlike
+# BARGAIN_ACCEPT_BIAS, which is only an initialisation and points one way, this
+# holds both branches open symmetrically for as long as it is on.
 "BARGAIN_VOTE_EPS": 0.05
+# The floor the anneal ENDS at -- deliberately not 0. The fixesV1 run annealed to 0
+# and its proposers began walking theta back down at almost exactly the update where
+# the last sampled rejections disappeared: rejection is a policing strategy, and it
+# is only maintained while it is occasionally exercised. The floor shapes training
+# rollouts only; the checkpointed weights are the un-floored policy either way.
+# (Code default is 0.0 so pre-existing configs and tests replay unchanged; this file
+# carries the current experiment line.)
+"BARGAIN_VOTE_EPS_END": 0.02
+# Scripted probe offers: with this probability per round, the proposer's offer is
+# replaced by a theta drawn uniformly over the whole contract range, votes are cast
+# and trained on it as usual, and the proposal head is NOT trained on the round (it
+# did not choose the offer). The vote head only stays calibrated on offers it keeps
+# seeing: in the fixesV1 eval the converged proposers offered almost nothing between
+# 0.5 and 1.7, so any threshold in that band had gone stale. Probes keep testing the
+# whole range -- lowballs the cleaners must refuse AND exorbitant offers the
+# harvesters must refuse. (Code default is 0.0 = off, same reason as above.)
+"BARGAIN_PROBE_FRAC": 0.1
 
 # Skip phase-1 training and run phase 2 against saved gameplay policies (a glob
 # matching one file per agent). This is what makes a protocol comparison

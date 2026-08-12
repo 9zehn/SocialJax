@@ -322,14 +322,22 @@ def floored_vote(pi_vote, eps, key) -> Tuple[jnp.ndarray, jnp.ndarray]:
     return vote, log_p
 
 
-def vote_eps_at(base: float, update_step, num_updates: int):
-    """The vote floor at `update_step`, annealed linearly to 0 over training.
+def vote_eps_at(base: float, update_step, num_updates: int, end: float = 0.0):
+    """The vote floor at `update_step`, annealed linearly from `base` to `end`.
 
-    Exploration early, when saturation would be permanent; none at the end, so the
-    policy that gets checkpointed is the policy that gets replayed.
+    Exploration early, when saturation would be permanent. `end` is the floor that
+    REMAINS at the end of training, and it should usually not be 0: the fixesV1 run
+    annealed to 0 and showed why. Rejection is a policing strategy that pays only
+    when someone lowballs, so it is only ever maintained by being occasionally
+    sampled -- and the run's proposers began walking theta back down at almost
+    exactly the point the anneal extinguished the last rejections that would have
+    punished them. A persistent `end` keeps the threat alive for as long as
+    proposers are still learning. The floor only shapes the training rollouts; the
+    checkpointed weights are the un-floored policy either way.
     """
     frac = 1.0 - jnp.asarray(update_step, jnp.float32) / max(int(num_updates), 1)
-    return jnp.float32(base) * jnp.clip(frac, 0.0, 1.0)
+    return jnp.float32(end) + (jnp.float32(base) - jnp.float32(end)) * jnp.clip(
+        frac, 0.0, 1.0)
 
 
 # ------------------------------------------------------- checkpoint compatibility

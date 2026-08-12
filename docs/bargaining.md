@@ -101,15 +101,39 @@ saturates to always-accept without an entropy term.
 
 `BARGAIN_VOTE_EPS=0.05` is a harder guarantee than the entropy term, which did not
 hold: at **rollout** time the accept probability is clipped into `[ε, 1−ε]` before
-sampling, annealed linearly to 0 over training. Saturation is self-sealing — an agent
-that always accepts never observes what refusing would have bought it — and both
-prior runs saturated anyway, in opposite directions. The floor holds both branches
-open symmetrically, unlike `BARGAIN_ACCEPT_BIAS`, which is only an initialisation and
-points one way. The stored old log-prob is the **floored** one, so PPO's ratio is a
-proper importance weight against the distribution actually sampled from; the
-numerator stays the unfloored policy, or the clip would kill the gradient of exactly
-the saturated agents the floor exists to rescue. `evaluate_bargain` and the viewer
-replay at ε=0: it is a training device, not part of the mechanism.
+sampling, annealed linearly down to `BARGAIN_VOTE_EPS_END` over training. Saturation
+is self-sealing — an agent that always accepts never observes what refusing would
+have bought it — and both prior runs saturated anyway, in opposite directions. The
+floor holds both branches open symmetrically, unlike `BARGAIN_ACCEPT_BIAS`, which is
+only an initialisation and points one way. The stored old log-prob is the **floored**
+one, so PPO's ratio is a proper importance weight against the distribution actually
+sampled from; the numerator stays the unfloored policy, or the clip would kill the
+gradient of exactly the saturated agents the floor exists to rescue.
+`evaluate_bargain` and the viewer replay at ε=0: it is a training device, not part of
+the mechanism.
+
+`BARGAIN_VOTE_EPS_END=0.02` (base yaml; the code default is 0, the old behaviour) is
+the floor that **remains** at the end of training, and it exists because annealing to
+0 was watched failing: in the fixesV1 run, offered θ rose to ~1.9 while acceptance
+was still uncertain, then slid back toward ~1.3 — starting at almost exactly the
+update where the anneal extinguished the last sampled rejections. Rejection is a
+policing strategy; it pays only when someone lowballs, so it is only maintained while
+it is occasionally exercised. The persistent floor keeps the threat alive for as long
+as proposers are still learning. It shapes training rollouts only — the checkpointed
+weights are the un-floored policy either way.
+
+`BARGAIN_PROBE_FRAC=0.1` (base yaml; code default 0 = off) replaces the proposer's
+offer, in that fraction of rounds, with a **scripted probe** drawn uniformly over the
+whole contract range. Votes are cast and trained on it as on any offer — a probe that
+passes binds, which is what makes refusing it worth learning — while the proposal
+head is masked out of the round (it did not choose the offer), and the
+`theta_offered` metric excludes probes so it keeps reporting the policy's own asking
+price. The reason is calibration: a vote threshold only stays sharp on offers it
+keeps seeing, and converged proposers cluster (the seed-42 eval made almost no offers
+between 0.5 and 1.7, so any threshold there had gone stale — the opening the
+lowballers walked through). Probes keep testing the whole range: lowballs the
+cleaners must refuse, and — once the ceiling gives them a reason — exorbitant offers
+the harvesters must refuse.
 
 ### Features (`BARGAIN_FEATURES`)
 
@@ -173,7 +197,8 @@ python algorithms/train.py --algo MOCA --env cleanup reward=individual \
   TRAINING_MODE=joint PHASE2_MODE=bargain \
   BARGAIN_SEGMENT=100 BARGAIN_PROPOSER=rotate BARGAIN_ROTATE_START=random \
   BARGAIN_QUORUM=all BARGAIN_FEATURES=private \
-  CONTRACT_LOW=0.2 CONTRACT_HIGH=2.0 \
+  BARGAIN_VOTE_EPS_END=0.02 BARGAIN_PROBE_FRAC=0.1 \
+  CONTRACT_LOW=0.2 CONTRACT_HIGH=3.0 \
   SEED=55 +ENV_KWARGS.num_agents=7
 ```
 
@@ -205,6 +230,14 @@ python algorithms/MOCA/compare_arms.py \
 # the theta offered, who offered it, and how each agent voted
 python viz/interactive_viewer.py \
   --checkpoint 'runs/<run>/..._joint_[0-9].pkl'
+
+# sweep theta through the trained vote head directly -- no rollout, no sampling
+# noise. Exact at round 0, where the bargaining state is fully determined by
+# (theta, proposer). This is how to locate a reservation threshold that the
+# on-policy offer distribution never tests (converged proposers cluster, so
+# evaluate_bargain's middle theta bins are often nearly empty).
+python algorithms/MOCA/probe_votes.py \
+  --checkpoint 'runs/<run>/..._joint_[0-9].pkl'
 ```
 
 All three replay the **two-pass** round, at ε=0 on the vote floor. They have to: a
@@ -228,15 +261,23 @@ the *only* strategies the policy class contained. Nothing about the environment 
 the incentives was being measured. Every number from a bargaining run trained before
 the two-pass round is void for anything about voting behaviour.
 
-**The second cause is real and still open.** Individual rationality is far too slack
-for rejection to be credible: harvesters take ~530 under a contract against ~114
-under the null, so accepting almost anything genuinely *is* optimal. Compounding it,
-non-pivotal voters receive no gradient — their vote does not change the outcome, so
-nothing teaches them to refuse. Alternating offers cannot bite until the disagreement
-point is tight enough. Levers, in rough order of directness: raise `BARGAIN_SEGMENT`
-so rejection costs more; tighten the range floor; and note that the phase-1
-null-contract conditioning work is what makes the disagreement point sharp in the
-first place.
+**The second cause is behavioural, and the first post-fix run narrowed it.** The
+seed-42 evaluation (2026-08-12, [thesis_findings.md](thesis_findings.md)) showed
+offer-conditioned voting for the first time — p(accept) correlated +0.95 with θ,
+carried by the two heaviest cleaners — but the thresholds were **soft**: a θ=0.2
+lowball still passed 53% of the time, so lowballing retained positive expected
+value. Two causes were identified and are now countered in code: the exploration
+floor annealed to 0 exactly as rejection was becoming profitable
+(`BARGAIN_VOTE_EPS_END` keeps it alive), and thresholds go stale on offers the
+converged proposers no longer make (`BARGAIN_PROBE_FRAC` keeps testing the whole
+range). A third adjustment is the range ceiling: cleaner proposals sat *at* the old
+ceiling of 2.0 — a corner solution — and even there cleaners barely reached parity,
+so the ceiling, not bargaining, was setting the split. The ceiling should be high
+enough that the agreed θ settles in the interior (3.0 for the current line), which
+also gives harvesters a genuine rejection region of their own at the top of the
+range. Held in reserve if thresholds stay soft: a counterfactual (COMA-style) vote
+advantage, forced-null exposure, and the phase-1 reconstruction, which sharpens the
+disagreement point by construction.
 
 Distinguishing the two is now a table rather than an argument: the *voting vs the
 offer* block in `evaluate_bargain.py` reports accept rate and mean p(accept) binned

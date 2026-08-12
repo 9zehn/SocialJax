@@ -338,6 +338,17 @@ def test_vote_floor_anneals_to_zero():
     assert float(bargain.vote_eps_at(0.05, 150, 100)) == 0.0     # never negative
 
 
+def test_vote_floor_can_end_above_zero():
+    """Rejection is a policing strategy: it is only maintained while occasionally
+    sampled, so the anneal must be able to stop at a persistent floor instead of
+    extinguishing it (the fixesV1 run annealed to 0, and proposers began walking
+    theta back down as the last sampled rejections disappeared)."""
+    assert np.isclose(float(bargain.vote_eps_at(0.05, 0, 100, end=0.02)), 0.05)
+    assert np.isclose(float(bargain.vote_eps_at(0.05, 50, 100, end=0.02)), 0.035)
+    assert np.isclose(float(bargain.vote_eps_at(0.05, 100, 100, end=0.02)), 0.02)
+    assert np.isclose(float(bargain.vote_eps_at(0.05, 150, 100, end=0.02)), 0.02)
+
+
 # ------------------------------------------------------ checkpoint compatibility
 
 def test_stale_bargaining_checkpoints_are_refused_not_misread():

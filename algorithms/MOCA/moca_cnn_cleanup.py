@@ -384,13 +384,26 @@ def make_train(config):
                              ("BARGAIN_CLIP_EPS", 0.2), ("BARGAIN_ENT_COEF", 0.01),
                              ("BARGAIN_VF_COEF", 0.5), ("BARGAIN_ACCEPT_BIAS", 1.0),
                              ("BARGAIN_GAE_LAMBDA", 0.95), ("BARGAIN_HIDDEN", 64),
-                             ("BARGAIN_VOTE_EPS", 0.05)):
+                             ("BARGAIN_VOTE_EPS", 0.05),
+                             ("BARGAIN_VOTE_EPS_END", 0.0),
+                             ("BARGAIN_PROBE_FRAC", 0.0)):
             config.setdefault(key, default)
         if not 0.0 <= float(config["BARGAIN_VOTE_EPS"]) < 0.5:
             raise ValueError(
                 f"BARGAIN_VOTE_EPS must be in [0, 0.5) -- it is a floor on BOTH "
                 f"branches of the vote, so 0.5 is a coin flip and above it the floor "
                 f"inverts. Got {config['BARGAIN_VOTE_EPS']!r}.")
+        if not (0.0 <= float(config["BARGAIN_VOTE_EPS_END"])
+                <= float(config["BARGAIN_VOTE_EPS"])):
+            raise ValueError(
+                f"BARGAIN_VOTE_EPS_END is the floor the anneal ends at, so it must "
+                f"lie in [0, BARGAIN_VOTE_EPS={config['BARGAIN_VOTE_EPS']}]. Got "
+                f"{config['BARGAIN_VOTE_EPS_END']!r}.")
+        if not 0.0 <= float(config["BARGAIN_PROBE_FRAC"]) <= 0.5:
+            raise ValueError(
+                f"BARGAIN_PROBE_FRAC is the fraction of rounds whose offer is "
+                f"replaced by a scripted probe; above 0.5 the run is mostly probing "
+                f"rather than bargaining. Got {config['BARGAIN_PROBE_FRAC']!r}.")
         # Recorded so a replay tool can refuse a checkpoint it cannot read, rather
         # than reading it as a mechanism that was never trained.
         config["BARGAIN_FEATURE_VERSION"] = bargain.FEATURE_VERSION
@@ -1329,11 +1342,20 @@ def make_train(config):
                 clear = info["waste_cleared"][:, 0]                 # (E,)
                 return (env_state, obsv, theta, rng), (transition, cleaned, clear)
 
+            # Python-level, not traced: with probes off the round draws exactly the
+            # PRNG keys it always did, so existing runs and golden tests replay
+            # bit-for-bit.
+            probe_frac = float(config["BARGAIN_PROBE_FRAC"])
+
             def _round(carry, r):
                 (env_state, last_obs, rng, agreed, locked, cum_return, cum_clean,
                  last_theta_n, had_offer, n_reject, river,
                  last_votes, last_n_acc) = carry
-                rng, k_prop, k_theta, k_vote = jax.random.split(rng, 4)
+                if probe_frac > 0.0:
+                    (rng, k_prop, k_theta, k_vote,
+                     k_probe, k_probe_theta) = jax.random.split(rng, 6)
+                else:
+                    rng, k_prop, k_theta, k_vote = jax.random.split(rng, 4)
 
                 proposer = bargain.proposer_for_round(
                     r, num_agents, n_envs, config["BARGAIN_PROPOSER"],
@@ -1366,6 +1388,28 @@ def make_train(config):
                 theta_all = negotiate.unsquash(raw, contract.low, contract.high)
                 mine = bargain.is_proposer_mask(proposer, num_agents)
                 theta_offer = jnp.sum(jnp.where(mine, theta_all, 0.0), axis=0)   # (E,)
+
+                # Scripted probe offers. With probability BARGAIN_PROBE_FRAC the
+                # proposer's offer is replaced by a theta drawn uniformly over the
+                # whole contract range, and everything downstream -- the vote, the
+                # contract if it passes, the history it leaves -- treats it as a real
+                # offer. This exists because the vote head only stays calibrated on
+                # offers it keeps seeing: once the learned proposers settle into a
+                # narrow band, a responder's threshold outside that band stops
+                # receiving evidence, goes stale, and softens -- which is exactly the
+                # opening the fixesV1 lowballers walked through. Probes are a stream
+                # of offers the proposers no longer make, at both ends of the range.
+                # The PROPOSAL is not trained on probe rounds (the proposer did not
+                # choose the offer); the VOTE is trained normally, because voting on
+                # a probe is a genuine decision with genuine consequences.
+                if probe_frac > 0.0:
+                    is_probe = (jax.random.uniform(k_probe, (n_envs,)) < probe_frac)
+                    probe_theta = jax.random.uniform(
+                        k_probe_theta, (n_envs,),
+                        minval=contract.low, maxval=contract.high)
+                    theta_offer = jnp.where(is_probe, probe_theta, theta_offer)
+                else:
+                    is_probe = jnp.zeros((n_envs,), bool)
 
                 # ---- pass 2: vote, now that theta_r is on the table. The critic has
                 # to see it too: a theta-blind baseline cannot credit a rejection
@@ -1411,6 +1455,7 @@ def make_train(config):
                     "active": ~agreed, "newly": newly,
                     "is_proposer": mine, "theta_offer": theta_offer,
                     "n_accept": n_accept, "theta_eff": theta_eff,
+                    "is_probe": is_probe,
                 }
                 carry = (env_state, last_obs, rng,
                          agreed | newly,
@@ -1464,11 +1509,13 @@ def make_train(config):
             params_list = [ts.params for ts in train_state]
             b_params = [bs.params for bs in bargain_state]
 
-            # Exploration floor on the vote, annealed to 0: full strength while a
-            # saturated accept/reject habit would still be self-sealing, gone by the
-            # end so the checkpointed policy is the one that gets replayed.
+            # Exploration floor on the vote: full strength early, while a saturated
+            # accept/reject habit would still be self-sealing, annealed down to
+            # BARGAIN_VOTE_EPS_END -- and kept there, because rejection is only ever
+            # maintained by being occasionally sampled. See bargain.vote_eps_at.
             vote_eps = bargain.vote_eps_at(
-                config["BARGAIN_VOTE_EPS"], update_step, config["NUM_UPDATES"])
+                config["BARGAIN_VOTE_EPS"], update_step, config["NUM_UPDATES"],
+                end=config["BARGAIN_VOTE_EPS_END"])
 
             (traj_batch, rounds, env_state, last_obs, final_theta,
              rng) = rollout_bargaining(params_list, b_params, env_state, last_obs,
@@ -1531,7 +1578,13 @@ def make_train(config):
                 # leaves outside the mask never reaches a gradient.
                 a = bargain.masked_standardise(adv_b[:, i], act)
                 mine = rounds["is_proposer"][:, i].astype(jnp.float32)
-                w_prop, w_vote = act * mine, act * (1.0 - mine)
+                # A probe round replaced the proposer's offer with a scripted one,
+                # so its proposal was never acted on and must not be trained on --
+                # crediting it with the probe's consequences would teach the
+                # proposal head from offers it did not make. The votes on a probe
+                # were real decisions and train as usual.
+                not_probe = 1.0 - rounds["is_probe"].astype(jnp.float32)
+                w_prop, w_vote = act * mine * not_probe, act * (1.0 - mine)
                 eps = config["BARGAIN_CLIP_EPS"]
 
                 def clipped(logp, old_logp, w):
@@ -1603,10 +1656,14 @@ def make_train(config):
                                    jnp.maximum(agreed_any.sum(), 1.0))
             # Masked by `active`: agents still emit an offer in rounds after
             # agreement, but it is never read, so averaging it in would report
-            # untrained noise as the policy's asking price.
+            # untrained noise as the policy's asking price. Probe rounds are masked
+            # too -- their offer is scripted, and this series is meant to show what
+            # the POLICY is asking.
             n_active = jnp.maximum(rounds["active"].sum(), 1.0)
-            out["theta_offered"] = (
-                rounds["theta_offer"] * rounds["active"]).sum() / n_active
+            w_own_offer = rounds["active"] * (
+                1.0 - rounds["is_probe"].astype(jnp.float32))
+            out["theta_offered"] = ((rounds["theta_offer"] * w_own_offer).sum()
+                                    / jnp.maximum(w_own_offer.sum(), 1.0))
             out["accept_count"] = (
                 rounds["n_accept"] * rounds["active"]).sum() / n_active
             # Gameplay policy entropy, averaged over agents. Nothing else in this set
