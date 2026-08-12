@@ -1,4 +1,24 @@
 {
+  "bargain": {
+    "metrics_joint/env_step": 48.0,
+    "metrics_joint/joint/agree/rate": 0.875,
+    "metrics_joint/joint/agree/round": 1.0,
+    "metrics_joint/joint/behaviour/cleaned_per_agent": 0.010416666977107525,
+    "metrics_joint/joint/behaviour/waste_cleared": 68.15625,
+    "metrics_joint/joint/contract/accept_count": 1.4107142686843872,
+    "metrics_joint/joint/contract/in_force_rate": 0.5,
+    "metrics_joint/joint/contract/theta_agreed": 0.5583650767803192,
+    "metrics_joint/joint/contract/theta_offered": 0.5155296623706818,
+    "metrics_joint/joint/contract/transfer_volume": 0.02500000037252903,
+    "metrics_joint/joint/health/policy_entropy": 2.197211742401123,
+    "metrics_joint/joint/health/policy_entropy_min": 2.1972084045410156,
+    "metrics_joint/joint/health/vote_eps": 0.037500000558793545,
+    "metrics_joint/joint/outcome/equality": 0.9375,
+    "metrics_joint/joint/outcome/welfare": 0.0,
+    "metrics_joint/phase": 3.0,
+    "metrics_joint/update_step": 1.5,
+    "params_checksum": -19.76169708099701
+  },
   "negotiate": {
     "metrics_phase1/env_step": 32.0,
     "metrics_phase1/phase": 1.0,

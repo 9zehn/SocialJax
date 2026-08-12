@@ -166,6 +166,14 @@
 # never in force and the proposal head never sees a signal. 1.0 gives ~15%.
 "BARGAIN_ACCEPT_BIAS": 1.0
 "BARGAIN_HIDDEN": 64
+# Exploration floor on the vote at ROLLOUT time: accept probability is clipped into
+# [eps, 1-eps] when sampling, annealed linearly to 0 over training. BARGAIN_ENT_COEF
+# alone did not stop either previous run saturating (one always-reject agent in the
+# first, every agent always-accept in the second), and saturation is self-sealing --
+# an agent that never refuses never observes what refusing would have bought it.
+# Unlike BARGAIN_ACCEPT_BIAS, which is only an initialisation and points one way,
+# this holds both branches open symmetrically for as long as it is on.
+"BARGAIN_VOTE_EPS": 0.05
 
 # Skip phase-1 training and run phase 2 against saved gameplay policies (a glob
 # matching one file per agent). This is what makes a protocol comparison

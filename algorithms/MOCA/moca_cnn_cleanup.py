@@ -203,6 +203,9 @@ JOINT_BARGAIN_METRICS = {
     # until it has already happened, so this is the early-warning one.
     "policy_entropy": "health/policy_entropy",
     "policy_entropy_min": "health/policy_entropy_min",
+    # The vote's exploration floor, annealing to 0. Worth a series because it says
+    # how much of the accept rate above is still the floor rather than the policy.
+    "vote_eps": "health/vote_eps",
 }
 
 
@@ -380,8 +383,17 @@ def make_train(config):
         for key, default in (("BARGAIN_LR", 3e-4), ("BARGAIN_UPDATE_EPOCHS", 4),
                              ("BARGAIN_CLIP_EPS", 0.2), ("BARGAIN_ENT_COEF", 0.01),
                              ("BARGAIN_VF_COEF", 0.5), ("BARGAIN_ACCEPT_BIAS", 1.0),
-                             ("BARGAIN_GAE_LAMBDA", 0.95), ("BARGAIN_HIDDEN", 64)):
+                             ("BARGAIN_GAE_LAMBDA", 0.95), ("BARGAIN_HIDDEN", 64),
+                             ("BARGAIN_VOTE_EPS", 0.05)):
             config.setdefault(key, default)
+        if not 0.0 <= float(config["BARGAIN_VOTE_EPS"]) < 0.5:
+            raise ValueError(
+                f"BARGAIN_VOTE_EPS must be in [0, 0.5) -- it is a floor on BOTH "
+                f"branches of the vote, so 0.5 is a coin flip and above it the floor "
+                f"inverts. Got {config['BARGAIN_VOTE_EPS']!r}.")
+        # Recorded so a replay tool can refuse a checkpoint it cannot read, rather
+        # than reading it as a mechanism that was never trained.
+        config["BARGAIN_FEATURE_VERSION"] = bargain.FEATURE_VERSION
         # Not a free hyperparameter: impatience is already realised as reward lost to
         # disagreement in the environment, so discounting rounds on top would count
         # the same delay cost twice and hand the proposer an advantage it has not
@@ -1240,12 +1252,17 @@ def make_train(config):
                      - config["ENT_COEF"] * entropy)
             return total, entropy
 
-        def rollout_bargaining(gameplay_params, bargain_params, env_state, last_obs, rng):
+        def rollout_bargaining(gameplay_params, bargain_params, env_state, last_obs,
+                               vote_eps, rng):
             """One episode of alternating-offers bargaining interleaved with play.
 
             Scans over ROUNDS; each round makes one bargaining decision and then
             plays `BARGAIN_SEGMENT` steps under whatever contract is in force. A
             scan rather than a Python loop so only one segment body is compiled.
+
+            Each round is TWO forward passes over the same network: the proposer
+            decides with an empty table, then every responder decides having seen the
+            offer. `vote_eps` is the annealed exploration floor on the vote.
 
             Returns the gameplay trajectory reshaped to (NUM_STEPS, ...) -- so the
             existing GAE and loss consume it unchanged -- plus the per-round record
@@ -1314,36 +1331,67 @@ def make_train(config):
 
             def _round(carry, r):
                 (env_state, last_obs, rng, agreed, locked, cum_return, cum_clean,
-                 last_theta_n, had_offer, n_reject, river) = carry
+                 last_theta_n, had_offer, n_reject, river,
+                 last_votes, last_n_acc) = carry
                 rng, k_prop, k_theta, k_vote = jax.random.split(rng, 4)
 
                 proposer = bargain.proposer_for_round(
                     r, num_agents, n_envs, config["BARGAIN_PROPOSER"],
                     key=k_prop, contributions=cum_clean, start_offset=start_offset)
-                feats = bargain.bargaining_features(
-                    r, K, proposer, num_agents, last_theta_n, had_offer, n_reject,
-                    cum_return / ret_scale, cum_clean / clean_scale,
-                    river / river_scale, feat_mask)                  # (N, E, F)
 
-                raws, lp_t, votes, lp_v, vals = [], [], [], [], []
+                # Everything about the round except which phase it is. The two passes
+                # must agree on the history or the responders would be voting on a
+                # different game from the one the proposer played.
+                def feats_at(live_theta_n, live):
+                    return bargain.bargaining_features(
+                        r, K, proposer, num_agents, last_theta_n, had_offer, n_reject,
+                        live_theta_n, live, last_votes, last_n_acc,
+                        cum_return / ret_scale, cum_clean / clean_scale,
+                        river / river_scale, feat_mask)              # (N, E, F)
+
+                # ---- pass 1: propose, with nothing yet on the table.
+                nothing = jnp.zeros((n_envs,), jnp.float32)
+                feats_prop = feats_at(nothing, nothing)
+                raws, lp_t, v_prop = [], [], []
                 kt = jax.random.split(k_theta, num_agents)
-                kv = jax.random.split(k_vote, num_agents)
                 for i in range(num_agents):
-                    pi_theta, pi_vote, v = bargain_net[i].apply(bargain_params[i], feats[i])
+                    pi_theta, _, v = bargain_net[i].apply(
+                        bargain_params[i], feats_prop[i])
                     raw = pi_theta.sample(seed=kt[i])                # (E, 1)
-                    vote = pi_vote.sample(seed=kv[i])                # (E,)
                     raws.append(raw[:, 0])
                     lp_t.append(pi_theta.log_prob(raw))
-                    votes.append(vote)
-                    lp_v.append(pi_vote.log_prob(vote))
-                    vals.append(v)
+                    v_prop.append(v)
                 raw = jnp.stack(raws)                                # (N, E)
-                votes = jnp.stack(votes)
-                values = jnp.stack(vals)
 
                 theta_all = negotiate.unsquash(raw, contract.low, contract.high)
                 mine = bargain.is_proposer_mask(proposer, num_agents)
                 theta_offer = jnp.sum(jnp.where(mine, theta_all, 0.0), axis=0)   # (E,)
+
+                # ---- pass 2: vote, now that theta_r is on the table. The critic has
+                # to see it too: a theta-blind baseline cannot credit a rejection
+                # against the size of the offer that was refused.
+                feats_vote = feats_at(
+                    bargain.normalise_theta(theta_offer, contract.low, contract.high),
+                    jnp.ones((n_envs,), jnp.float32))
+                votes, lp_v, v_vote = [], [], []
+                kv = jax.random.split(k_vote, num_agents)
+                for i in range(num_agents):
+                    _, pi_vote, v = bargain_net[i].apply(
+                        bargain_params[i], feats_vote[i])
+                    vote, lp = bargain.floored_vote(pi_vote, vote_eps, kv[i])
+                    votes.append(vote)
+                    lp_v.append(lp)
+                    v_vote.append(v)
+                votes = jnp.stack(votes)
+
+                # Each agent's DECISION row and DECISION-POINT value: the proposer
+                # decided before the offer existed, the responders after. Those are
+                # the states their respective actions were taken from, so those are
+                # what the loss must recompute log-probs from and what GAE must
+                # bootstrap through.
+                feats = jnp.where(mine[..., None], feats_prop, feats_vote)
+                values = jnp.where(mine, jnp.stack(v_prop), jnp.stack(v_vote))
+
                 passed, n_accept = bargain.accepted(
                     votes.astype(bool), proposer, quorum_b, num_agents)
                 newly = passed & ~agreed
@@ -1369,11 +1417,16 @@ def make_train(config):
                          jnp.where(newly, theta_offer, locked),
                          cum_return + seg_return,
                          cum_clean + jnp.transpose(cleaned.sum(axis=0)),
-                         2.0 * (theta_offer - contract.low)
-                         / (contract.high - contract.low) - 1.0,
+                         bargain.normalise_theta(theta_offer, contract.low,
+                                                 contract.high),
                          jnp.ones_like(had_offer),
                          n_reject + (~agreed & ~passed).astype(jnp.int32),
-                         clear[-1].astype(jnp.float32))
+                         clear[-1].astype(jnp.float32),
+                         # Only COUNTED votes carry forward: the proposer's own vote
+                         # is ignored by the quorum, so recording it would read as a
+                         # refusal it never made.
+                         (votes.astype(bool) & ~mine).astype(jnp.float32),
+                         n_accept.astype(jnp.float32))
                 return carry, (record, traj)
 
             zeros_e = jnp.zeros((n_envs,), jnp.float32)
@@ -1382,7 +1435,8 @@ def make_train(config):
                     jnp.zeros((num_agents, n_envs), jnp.float32),
                     jnp.zeros((num_agents, n_envs), jnp.float32),
                     zeros_e, jnp.zeros((n_envs,), bool),
-                    jnp.zeros((n_envs,), jnp.int32), zeros_e)
+                    jnp.zeros((n_envs,), jnp.int32), zeros_e,
+                    jnp.zeros((num_agents, n_envs), jnp.float32), zeros_e)
             carry, (rounds, traj) = jax.lax.scan(_round, init, jnp.arange(K))
             env_state, last_obs, rng, agreed, locked = carry[0], carry[1], carry[2], carry[3], carry[4]
 
@@ -1410,8 +1464,15 @@ def make_train(config):
             params_list = [ts.params for ts in train_state]
             b_params = [bs.params for bs in bargain_state]
 
+            # Exploration floor on the vote, annealed to 0: full strength while a
+            # saturated accept/reject habit would still be self-sealing, gone by the
+            # end so the checkpointed policy is the one that gets replayed.
+            vote_eps = bargain.vote_eps_at(
+                config["BARGAIN_VOTE_EPS"], update_step, config["NUM_UPDATES"])
+
             (traj_batch, rounds, env_state, last_obs, final_theta,
-             rng) = rollout_bargaining(params_list, b_params, env_state, last_obs, rng)
+             rng) = rollout_bargaining(params_list, b_params, env_state, last_obs,
+                                       vote_eps, rng)
 
             # ---------------------------------------------------- gameplay PPO
             contract_obs = contract.to_obs(final_theta)
@@ -1457,11 +1518,18 @@ def make_train(config):
                 config["BARGAIN_GAMMA"], config["BARGAIN_GAE_LAMBDA"])
 
             def bargain_loss(params, i):
+                # rounds["feats"] holds each agent's DECISION-POINT state: the
+                # proposal pass for whoever proposed, the vote pass for everyone
+                # else. Recomputing log-probs from it is what keeps the PPO ratio
+                # exactly on-policy now that the two decisions are taken from
+                # different states.
                 pi_theta, pi_vote, value = bargain_net[i].apply(
                     params, rounds["feats"][:, i])                  # (K, E, ...)
-                a = adv_b[:, i]
-                a = (a - a.mean()) / (a.std() + 1e-8)
                 act = rounds["active"].astype(jnp.float32)          # (K, E)
+                # Over ACTIVE rounds only -- the rest of the block is structural
+                # zeros. Every term below is masked by `act`, so the garbage this
+                # leaves outside the mask never reaches a gradient.
+                a = bargain.masked_standardise(adv_b[:, i], act)
                 mine = rounds["is_proposer"][:, i].astype(jnp.float32)
                 w_prop, w_vote = act * mine, act * (1.0 - mine)
                 eps = config["BARGAIN_CLIP_EPS"]
@@ -1477,6 +1545,12 @@ def make_train(config):
                 # decision and are excluded from all three terms.
                 loss = clipped(pi_theta.log_prob(rounds["raw"][:, i][..., None]),
                                rounds["logp_theta"][:, i], w_prop)
+                # The stored vote log-prob is under the eps-FLOORED distribution the
+                # vote was drawn from, while this one is under the policy itself, so
+                # the ratio is a proper importance weight against the behaviour
+                # distribution. Evaluating the numerator through the floor instead
+                # would zero the gradient of exactly the saturated agents the floor
+                # exists to rescue.
                 loss = loss + clipped(pi_vote.log_prob(rounds["vote"][:, i]),
                                       rounds["logp_vote"][:, i], w_vote)
                 v_loss = (jnp.square(value - targ_b[:, i]) * act).sum() / (act.sum() + 1e-8)
@@ -1542,6 +1616,7 @@ def make_train(config):
             # one -- if it trends toward 0 the run is dying, whatever else says.
             out["policy_entropy"] = jnp.stack(entropies).mean()
             out["policy_entropy_min"] = jnp.stack(entropies).min()
+            out["vote_eps"] = vote_eps
             out = {f"joint/{JOINT_BARGAIN_METRICS[k]}": v
                    for k, v in _select(out, tuple(JOINT_BARGAIN_METRICS)).items()}
             out["phase"] = jnp.float32(3.0)

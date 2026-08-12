@@ -37,7 +37,7 @@ import numpy as np
 from PIL import Image
 
 import socialjax
-from algorithms.utils.io_utils import load_params
+from algorithms.utils.io_utils import load_params, load_run_config
 
 
 
@@ -122,13 +122,18 @@ def rollout(env, params, num_steps, seed, contract=None, theta=None):
 
 
 
-def infer_bargain_config(stem):
-    """Recover the bargaining settings from the run stem.
+def infer_bargain_config(stem, checkpoint=None):
+    """Recover the bargaining settings: the .run.yaml sidecar first, the stem second.
 
     checkpoint_filename encodes segment length always and the other three knobs when
     off-default, so the whole protocol is recoverable from the filename -- which
     matters because replaying under the wrong quorum or proposer rule silently
-    reproduces a DIFFERENT mechanism rather than failing.
+    reproduces a DIFFERENT mechanism rather than failing. The sidecar carries the
+    same settings plus the ones no filename could hold (network width, accept bias,
+    feature version), so it wins wherever both exist.
+
+    `checkpoint` is any path or glob naming the run's files; omit it to fall back to
+    the filename alone, as runs predating the sidecar must.
     """
     seg = re.search(r"_seg(\d+)", stem)
     quorum = re.search(r"_q(majority|\d+)", stem)
@@ -136,13 +141,33 @@ def infer_bargain_config(stem):
                 else "random" if "_random" in stem else "rotate")
     features = ("protocol" if "_protocol" in stem
                 else "public" if "_public" in stem else "private")
-    return {
+    cfg = {
         "segment": int(seg.group(1)) if seg else 100,
         "quorum": (quorum.group(1) if quorum else "all"),
         "proposer": proposer,
         "features": features,
         "rotate_start": "fixed" if "_fixedstart" in stem else "random",
+        # Not in any filename, so a run trained off these defaults is unreplayable
+        # without its sidecar -- the shape check in bargain.check_params_compatible
+        # is what turns that into an error rather than wrong numbers.
+        "hidden": 64,
+        "accept_bias": 1.0,
+        "feature_version": None,
     }
+    side = load_run_config(checkpoint) if checkpoint else None
+    for key, recorded in (("segment", "BARGAIN_SEGMENT"), ("quorum", "BARGAIN_QUORUM"),
+                          ("proposer", "BARGAIN_PROPOSER"),
+                          ("features", "BARGAIN_FEATURES"),
+                          ("rotate_start", "BARGAIN_ROTATE_START"),
+                          ("hidden", "BARGAIN_HIDDEN"),
+                          ("accept_bias", "BARGAIN_ACCEPT_BIAS"),
+                          ("feature_version", "BARGAIN_FEATURE_VERSION")):
+        if side is not None and side.get(recorded) is not None:
+            cfg[key] = side[recorded]
+    cfg["segment"] = int(cfg["segment"])
+    cfg["hidden"] = int(cfg["hidden"])
+    cfg["accept_bias"] = float(cfg["accept_bias"])
+    return cfg
 
 
 def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
@@ -188,6 +213,7 @@ def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
     cum_ret, cum_clean = np.zeros(n, np.float32), np.zeros(n, np.float32)
     agreed, locked = False, float(contract.null)
     last_tn, had_offer, n_reject, river = 0.0, False, 0, 0.0
+    last_votes, last_n_accept = np.zeros(n, np.float32), 0.0
     step = 0
     num_rounds = max(1, int(np.ceil(num_steps / seg)))
 
@@ -201,23 +227,42 @@ def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
             proposer = int(bg.proposer_for_round(
                 r, n, 1, cfg["proposer"], key=k_prop,
                 contributions=jnp.asarray(cum_clean)[:, None], start_offset=offset)[0])
-            feats = bg.bargaining_features(
-                r, num_rounds, jnp.array([proposer]), n,
-                jnp.array([last_tn], jnp.float32), jnp.array([had_offer]),
-                jnp.array([n_reject], jnp.int32),
-                jnp.asarray(cum_ret)[:, None] / ret_scale,
-                jnp.asarray(cum_clean)[:, None] / clean_scale,
-                jnp.array([river], jnp.float32) / river_scale, mask)
 
+            def feats_at(live_tn, live):
+                return bg.bargaining_features(
+                    r, num_rounds, jnp.array([proposer]), n,
+                    jnp.array([last_tn], jnp.float32), jnp.array([had_offer]),
+                    jnp.array([n_reject], jnp.int32),
+                    jnp.array([live_tn], jnp.float32), jnp.array([live], jnp.float32),
+                    jnp.asarray(last_votes)[:, None], jnp.array([last_n_accept]),
+                    jnp.asarray(cum_ret)[:, None] / ret_scale,
+                    jnp.asarray(cum_clean)[:, None] / clean_scale,
+                    jnp.array([river], jnp.float32) / river_scale, mask)
+
+            # Two passes, as in training: the offer is made, and only then voted on.
+            # One pass would hand the vote head an empty offer slot it never saw
+            # during training, so the replay would not be this policy at all.
             kt = jax.random.split(k_theta, n)
             kv = jax.random.split(k_vote, n)
-            raw, votes = [], []
+            feats_prop = feats_at(0.0, 0.0)
+            raw = []
             for i in range(n):
-                pi_theta, pi_vote, _ = bnet.apply(bargain_params[i], feats[i])
+                pi_theta, _, _ = bnet.apply(bargain_params[i], feats_prop[i])
                 raw.append(float(pi_theta.sample(seed=kt[i])[0, 0]))
-                votes.append(int(pi_vote.sample(seed=kv[i])[0]))
             theta_offer = float(neg.unsquash(
                 jnp.float32(raw[proposer]), contract.low, contract.high))
+
+            feats_vote = feats_at(
+                float(bg.normalise_theta(theta_offer, contract.low, contract.high)),
+                1.0)
+            votes, p_accept = [], []
+            for i in range(n):
+                _, pi_vote, _ = bnet.apply(bargain_params[i], feats_vote[i])
+                # eps=0: the exploration floor is a training device, so a replay
+                # shows the policy rather than the floor.
+                vote, _ = bg.floored_vote(pi_vote, 0.0, kv[i])
+                votes.append(int(vote[0]))
+                p_accept.append(float(pi_vote.probs[0, 1]))
             n_accept = sum(v for i, v in enumerate(votes) if i != proposer)
             passed = n_accept >= quorum
 
@@ -225,9 +270,14 @@ def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
                 "round": r, "step": step, "proposer": proposer,
                 "theta": theta_offer, "votes": list(votes), "accepted": bool(passed),
                 "n_accept": int(n_accept), "quorum": quorum,
+                "p_accept": p_accept,
             })
-            last_tn = 2.0 * (theta_offer - contract.low) / (contract.high - contract.low) - 1.0
+            last_tn = float(bg.normalise_theta(theta_offer, contract.low, contract.high))
             had_offer = True
+            # Only counted votes carry forward -- the proposer casts none.
+            last_votes = np.array([0.0 if i == proposer else float(v)
+                                   for i, v in enumerate(votes)], np.float32)
+            last_n_accept = float(n_accept)
             if passed:
                 agreed, locked = True, theta_offer
             else:
@@ -1384,10 +1434,20 @@ def main():
                   + ("  [the NULL contract -- nothing beat it]" if info["null"] else ""))
 
         if mode == "bargain":
-            bargain_cfg = infer_bargain_config(moca["stem"])
+            from algorithms.MOCA import bargain as bg
+
+            bargain_cfg = infer_bargain_config(moca["stem"],
+                                               checkpoint=args.checkpoint)
             if args.bargain_segment is not None:
                 bargain_cfg["segment"] = args.bargain_segment
             bargain_params = [load_params(p) for p in moca["contract_paths"]]
+            try:
+                bg.check_params_compatible(
+                    bargain_params[0], len(bargain_params),
+                    bargain_cfg.get("feature_version"),
+                    hidden=bargain_cfg["hidden"], label=moca["stem"])
+            except ValueError as e:
+                raise SystemExit(f"[incompatible checkpoint] {e}")
             print(f"  {len(bargain_params)} bargaining policies; "
                   f"segment={bargain_cfg['segment']}, "
                   f"proposer={bargain_cfg['proposer']} "

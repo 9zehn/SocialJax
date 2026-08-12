@@ -10,9 +10,12 @@ So: pin a checksum of a tiny deterministic run per arm. If one of these fails an
 you did not intend to change that arm's behaviour, stop -- the baselines moved.
 
 These are checksums, not correctness claims. Regenerate with --update after a
-DELIBERATE change (or a JAX/platform upgrade), and say so in the commit message:
+DELIBERATE change (or a JAX/platform upgrade), and say so in the commit message.
+Name the arms you meant to change -- repinning all four hides drift in the ones
+you did not touch:
 
-    python tests/test_golden_arms.py --update
+    python tests/test_golden_arms.py --update bargain
+    python tests/test_golden_arms.py --update              # all of them
 
 Runnable two ways:
     python tests/test_golden_arms.py
@@ -55,6 +58,13 @@ ARMS = {
                "SOLVER_DECISION_RULE": "majority"},
     "negotiate": {"PHASE2_MODE": "negotiate", "NEGOTIATE_UPDATE_EPOCHS": 1},
     "reinforce": {"PHASE2_MODE": "reinforce"},
+    # The joint bargaining path. Pinned like the rest, but for the opposite reason:
+    # the three above are published baselines that must not move, while this one is
+    # still being changed on purpose -- what it buys is that a change to the SHARED
+    # rollout or config plumbing shows up here as well as there, rather than only in
+    # whichever path the author happened to be thinking about.
+    "bargain": {"TRAINING_MODE": "joint", "PHASE2_MODE": "bargain",
+                "BARGAIN_SEGMENT": 4, "BARGAIN_UPDATE_EPOCHS": 1},
 }
 
 
@@ -70,7 +80,7 @@ def _signature(arm_overrides):
     out = jax.jit(make_train(config))(jax.random.PRNGKey(config["SEED"]))
 
     sig = {}
-    for phase in ("metrics_phase1", "metrics_phase2"):
+    for phase in ("metrics_phase1", "metrics_phase2", "metrics_joint"):
         if phase not in out:
             continue
         for key in sorted(out[phase]):
@@ -147,17 +157,33 @@ def test_reinforce_arm_is_unchanged():
     _compare("reinforce", _signature_isolated("reinforce"), _load()["reinforce"])
 
 
-def _update():
-    golden = {name: _signature_isolated(name) for name in ARMS}
+def test_bargain_arm_is_unchanged():
+    _compare("bargain", _signature_isolated("bargain"), _load()["bargain"])
+
+
+def _update(names=()):
+    """Repin `names` (default: all), leaving every other arm's values untouched.
+
+    Per-arm because the usual reason to be here is a deliberate change to ONE path,
+    and rewriting all four would quietly relabel drift in the others as intended.
+    """
+    golden = json.loads(GOLDEN_PATH.read_text()) if GOLDEN_PATH.exists() else {}
+    names = names or tuple(ARMS)
+    for name in names:
+        golden[name] = _signature_isolated(name)
     GOLDEN_PATH.write_text(json.dumps(golden, indent=2, sort_keys=True) + "\n")
-    print(f"wrote {GOLDEN_PATH} ({sum(len(v) for v in golden.values())} values)")
+    print(f"wrote {GOLDEN_PATH}: repinned {', '.join(names)}")
 
 
 ALL_TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 if __name__ == "__main__":
     if "--update" in sys.argv:
-        _update()
+        wanted = tuple(a for a in sys.argv[sys.argv.index("--update") + 1:]
+                       if not a.startswith("-"))
+        for bad in set(wanted) - set(ARMS):
+            raise SystemExit(f"unknown arm {bad!r} (have: {', '.join(ARMS)})")
+        _update(wanted)
         sys.exit(0)
     failed = 0
     for t in ALL_TESTS:

@@ -30,8 +30,8 @@ An episode of T steps splits into K = T / `BARGAIN_SEGMENT` segments.
 
 ```
 round r = 0 .. K−1, while no contract is in force:
-    proposer p(r) offers θ_r
-    every other agent casts a Bernoulli accept/reject vote
+    proposer p(r) offers θ_r                                 ← forward pass 1
+    every other agent SEES θ_r and casts a Bernoulli vote     ← forward pass 2
     if #accept ≥ quorum:  θ_r binds for ALL REMAINING segments — done
     else:                 θ = 0 for segment r, continue to round r+1
 never agreed → the null contract for the whole episode
@@ -40,6 +40,24 @@ never agreed → the null contract for the whole episode
 Rejection costs **one segment**, not the episode. At `BARGAIN_SEGMENT=100` of a
 1000-step episode that is roughly a tenth of the episode's welfare — the single lever
 on bargaining power.
+
+### Two passes per round, not one
+
+A round is two forward passes over the same network, sharing parameters and
+distinguished by a 0/1 "offer live" flag in the state. It has to be. Until
+`2026-08-12` both heads were driven by a single pass built *before* anyone moved, so
+the vote conditioned on (round, whose turn, last round's already-dead offer, own
+stats) and **not on θ_r**. A reservation value — "reject anything below what I could
+get by waiting" — was not merely unlearned, it was outside the policy class. The
+only expressible vote strategies were proposer-conditioned and constant, which is
+exactly the pair of degenerate equilibria both early runs found.
+
+Each agent's **decision-point state** is therefore different: the proposer decided
+before the offer existed, the responders after it did. Training records the row each
+agent actually acted from — pass 1 for the proposer, pass 2 for everyone else — and
+`bargain_loss` recomputes log-probs from that row, so the PPO ratio stays exactly
+on-policy. The critic value comes from the same pass for the same reason: a θ-blind
+baseline cannot credit a rejection against the size of the offer that was refused.
 
 ### Three departures from the reference
 
@@ -81,19 +99,39 @@ logit lifts that to ~15%.
 Gaussian supplies its own exploration through a learned scale. A Bernoulli vote
 saturates to always-accept without an entropy term.
 
+`BARGAIN_VOTE_EPS=0.05` is a harder guarantee than the entropy term, which did not
+hold: at **rollout** time the accept probability is clipped into `[ε, 1−ε]` before
+sampling, annealed linearly to 0 over training. Saturation is self-sealing — an agent
+that always accepts never observes what refusing would have bought it — and both
+prior runs saturated anyway, in opposite directions. The floor holds both branches
+open symmetrically, unlike `BARGAIN_ACCEPT_BIAS`, which is only an initialisation and
+points one way. The stored old log-prob is the **floored** one, so PPO's ratio is a
+proper importance weight against the distribution actually sampled from; the
+numerator stays the unfloored policy, or the clip would kill the gradient of exactly
+the saturated agents the floor exists to rescue. `evaluate_bargain` and the viewer
+replay at ε=0: it is a training device, not part of the mechanism.
+
 ### Features (`BARGAIN_FEATURES`)
 
-Handcrafted, `9 + N` dimensions, selected by a mask so the network shape is constant
-across tiers and the ablation is a one-value config change. Handcrafted state is
-standard in the learned-bargaining literature; the tiers exist because "handcrafted"
-is a fair criticism, and they separate the uncontroversial part from the contentious
-one.
+Handcrafted, `12 + 2N` dimensions, selected by a mask so the network shape is
+constant across tiers and the ablation is a one-value config change. Handcrafted
+state is standard in the learned-bargaining literature; the tiers exist because
+"handcrafted" is a fair criticism, and they separate the uncontroversial part from
+the contentious one.
 
 | tier | adds | rationale |
 |---|---|---|
-| `protocol` | rounds left, whose turn, standing offer, #rejections, proposer one-hot | the extensive form itself. The SPE of a finite alternating-offers game is Markov in (round, proposer), so this tier alone can in principle represent the equilibrium. |
+| `protocol` | rounds left, whose turn, **the offer on the table + a 0/1 live flag**, the standing rejected offer, #rejections, proposer one-hot, **last round's per-agent votes and accept count** | the extensive form itself. The SPE of a finite alternating-offers game is Markov in (round, proposer, offer), so this tier alone can in principle represent the equilibrium — but only with the offer in it. |
 | `private` *(default)* | own accumulated return, own cleaning | you know your own payoff history |
 | `public` | river stock, mean cleaning | **ablation only.** Telling an agent the average contribution is close to handing it the inequality signal the mechanism should discover for itself — so a fair split at `private` cannot be attributed to it. |
+
+Two details in the `protocol` tier earn their place. The live-offer flag is separate
+from the live-offer value so that "nothing has been offered yet" is distinguishable
+from "an offer worth 0" — θ=0 normalises to a real number, so without the flag the
+proposal pass and a midpoint offer are the same vector. And last round's votes are
+the concession signal: "5 of 6 accepted" and "0 of 6" call for very different next
+offers, and *which* agent refused tells the proposer whom it has to buy. The
+proposer's own slot reads 0, since the quorum does not count its vote.
 
 ## Reward signal and credit assignment
 
@@ -112,6 +150,12 @@ fixed-length steps.
 stay there: Rubinstein's discount factor models impatience, but here impatience is
 physically realised — disagreement burns real reward in the environment. Discounting
 rounds on top would count the delay cost twice and inflate the proposer's advantage.
+
+Advantages are standardised over **active rounds only** (`masked_standardise`). The
+K×E block is mostly structural zeros — agreement in round 0 is the SPE, and it is
+what the runs do — so normalising over the whole block would drag the mean toward 0
+and inflate the scale in proportion to how *quickly* the agents agreed, rather than
+how good the decision was.
 
 ## Training mode
 
@@ -139,17 +183,20 @@ interpretable later.
 
 ## Replaying and evaluating
 
-The contract range now comes from the sidecar, so these need no range flags:
+The protocol and the contract range both come from the sidecar now, so these need no
+flags (the paths below are illustrative — the `rubensteinV1` runs are version 1 and
+will be refused; see *Checkpoint compatibility*):
 
 ```bash
-# statistics + per-agent voting/proposal pattern, no rendering
+# statistics, per-agent voting/proposal pattern, and accept rate binned by the theta
+# on the table -- the table that says whether voting is offer-conditioned at all
 python algorithms/MOCA/evaluate_bargain.py \
-  --checkpoint 'runs/rubensteinV1/run3_step250/clean_up_seed55_reward_individual_agents7_bargain_seg100_joint_[0-9].pkl' \
+  --checkpoint 'runs/<run>/clean_up_seed55_..._bargain_seg100_joint_[0-9].pkl' \
   --episodes 20 --num-steps 1000
 
 # against the one-shot MOCA baseline and a null arm
 python algorithms/MOCA/compare_arms.py \
-  --run "bargain55=runs/rubensteinV1/run3_step250/clean_up_seed55_reward_individual_agents7_bargain_seg100_joint_[0-9].pkl" \
+  --run "bargain55=runs/<run>/clean_up_seed55_..._bargain_seg100_joint_[0-9].pkl" \
   --run "moca42=runs/moca_baseline/7agents/seed42/clean_up_seed42_reward_individual_agents7_negotiate_nu2_[0-9].pkl" \
   --run "moca44=runs/moca_baseline/7agents/seed44/clean_up_seed44_reward_individual_agents7_negotiate_nu2_[0-9].pkl" \
   --null --episodes 20 --num-steps 1000
@@ -157,8 +204,12 @@ python algorithms/MOCA/compare_arms.py \
 # interactive replay; the panel under the per-agent display shows, per round,
 # the theta offered, who offered it, and how each agent voted
 python viz/interactive_viewer.py \
-  --checkpoint 'runs/rubensteinV1/run3_step250/..._joint_[0-9].pkl'
+  --checkpoint 'runs/<run>/..._joint_[0-9].pkl'
 ```
+
+All three replay the **two-pass** round, at ε=0 on the vote floor. They have to: a
+single-pass replay would hand the vote head an empty offer slot it never saw in
+training, which is not the same policy.
 
 For a run with no sidecar the tools print `(fallback)` and warn. Pass
 `--range LABEL=LOW:HIGH` (compare_arms) or `--contract-low/--contract-high` and
@@ -166,17 +217,52 @@ believe the warning until you have recovered the real bounds from wandb.
 
 ## Known failure modes
 
-Both runs so far converged to **degenerate equilibria**, in opposite directions —
-a veto dictator (one agent always rejects, so only its offers pass) and a random
-dictator (everyone always accepts, so round-0 agreement hands θ to whoever opens).
-Details and diagnosis in [findings.md](findings.md).
+Both runs before `2026-08-12` converged to **degenerate equilibria**, in opposite
+directions — a veto dictator (one agent always rejects, so only its offers pass) and
+a random dictator (everyone always accepts, so round-0 agreement hands θ to whoever
+opens). Details in [findings.md](findings.md).
 
-The shared cause: individual rationality is far too slack for rejection to be
-credible, and non-pivotal voters receive no gradient. Alternating offers cannot bite
-until the disagreement point is tight enough. Levers, in rough order of directness:
-raise `BARGAIN_SEGMENT` so rejection costs more; tighten the range floor; and note
-that the phase-1 null-contract conditioning work is what makes the disagreement point
-sharp in the first place.
+**The first cause was structural, and is fixed.** The vote head never saw the offer
+it was voting on, so those two outcomes — proposer-conditioned and constant — were
+the *only* strategies the policy class contained. Nothing about the environment or
+the incentives was being measured. Every number from a bargaining run trained before
+the two-pass round is void for anything about voting behaviour.
+
+**The second cause is real and still open.** Individual rationality is far too slack
+for rejection to be credible: harvesters take ~530 under a contract against ~114
+under the null, so accepting almost anything genuinely *is* optimal. Compounding it,
+non-pivotal voters receive no gradient — their vote does not change the outcome, so
+nothing teaches them to refuse. Alternating offers cannot bite until the disagreement
+point is tight enough. Levers, in rough order of directness: raise `BARGAIN_SEGMENT`
+so rejection costs more; tighten the range floor; and note that the phase-1
+null-contract conditioning work is what makes the disagreement point sharp in the
+first place.
+
+Distinguishing the two is now a table rather than an argument: the *voting vs the
+offer* block in `evaluate_bargain.py` reports accept rate and mean p(accept) binned
+by the θ on the table. A flat row means the agents **chose** not to condition on the
+offer — which, post-fix, is evidence about incentives. A downward slope is a
+reservation value, which is the mechanism working.
+
+Also watch for the entropy-collapse signature (welfare and `waste_cleared` to zero in
+one step, agents spamming one action). The cause — a negative learning rate under a
+shortened budget — is fixed in `62bac84`, and policy entropy is now logged so it is
+visible in wandb rather than only post mortem. `joint/health/vote_eps` sits alongside
+it: while the floor is still non-zero, part of the accept rate is the floor rather
+than the policy.
+
+## Checkpoint compatibility
+
+The feature layout is versioned (`bargain.FEATURE_VERSION`, currently **2**) and
+written into each run's `.run.yaml` sidecar as `BARGAIN_FEATURE_VERSION`. The
+evaluator, `compare_arms` and the viewer all refuse a mismatch — by recorded version,
+or failing that by parameter shape — with an explicit error rather than replaying a
+checkpoint as a mechanism it was never trained on.
+
+Version 1 runs (everything in `runs/rubensteinV1/`) **cannot be loaded by this code**:
+the feature vector went from `9 + N` to `12 + 2N`, so the first layer's weights are
+the wrong shape. To replay one, check out the commit recorded in its sidecar. Nothing
+is lost, but nothing is silently reinterpreted either.
 
 Also watch for the entropy-collapse signature (welfare and `waste_cleared` to zero in
 one step, agents spamming one action). The cause — a negative learning rate under a

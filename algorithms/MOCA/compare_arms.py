@@ -183,10 +183,13 @@ def main():
               f"contract {{{contract.null:g}}} u [{lo:g}, {hi:g}]  ({source})",
               flush=True)
         if mode == "bargain":
-            cfg = infer_bargain_config(moca["stem"])
-            cfg.setdefault("hidden", 64)
-            cfg.setdefault("accept_bias", 1.0)
+            cfg = infer_bargain_config(moca["stem"], checkpoint=glob_)
             bp = [load_params(q) for q in moca["contract_paths"]]
+            try:
+                bg.check_params_compatible(bp[0], n, cfg.get("feature_version"),
+                                           hidden=cfg["hidden"], label=label)
+            except ValueError as e:
+                raise SystemExit(f"[{label}] incompatible checkpoint: {e}")
             rec, K = bargain_rollout(env, gp, bp, contract, cfg, args.episodes,
                                      args.num_steps, args.seed)
             ret = (rec["base"] + rec["transfer"]).sum(0)

@@ -114,12 +114,25 @@ split). Two runs, two different degenerate outcomes:
   1.000. Agreement always lands in round 0, and θ is set by whichever agent the
   random rotation happens to open with.
 
-**STANDS — the diagnosis.** Individual rationality is far too slack to discipline
-anyone: harvesters take ~530 under a contract against ~114 under the null, so
-accepting almost anything genuinely is optimal. Compounding it, non-pivotal
-voters receive no gradient — their vote does not change the outcome, so nothing
-teaches them to refuse. Alternating offers cannot bite until the disagreement
-point is tight enough that rejection is credible.
+**SUPERSEDED (2026-08-12) — the diagnosis was incomplete and led with the wrong
+cause.** The vote head never saw the offer it was voting on. Features were built
+once per round *before* anyone moved, from the previous round's rejected offer, and
+a single forward pass produced both the proposal and the vote. The only vote
+strategies in the policy class were therefore proposer-conditioned and constant —
+which are exactly these two outcomes. Neither run was measuring incentives; both
+were reading out the shape of the defect. Fixed by the two-pass round (propose,
+then vote on the live offer) in [bargaining.md](bargaining.md). Every voting number
+from a version-1 bargaining run is void.
+
+**STILL EXPECTED TO BITE — the incentive half of it.** Individual rationality is
+far too slack to discipline anyone: harvesters take ~530 under a contract against
+~114 under the null, so accepting almost anything genuinely is optimal. Compounding
+it, non-pivotal voters receive no gradient — their vote does not change the
+outcome, so nothing teaches them to refuse. Alternating offers cannot bite until
+the disagreement point is tight enough that rejection is credible. This is now
+testable rather than confounded: `evaluate_bargain` bins accept rate by the θ on
+the table, so a flat response post-fix is evidence about the incentives rather than
+about the code.
 
 ## 2026-08-11 — entropy collapse from a negative learning rate (commit `62bac84`)
 

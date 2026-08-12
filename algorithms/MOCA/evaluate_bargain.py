@@ -16,9 +16,14 @@ The questions it answers, in the order the tables come out:
   4. Do proposers concede over rounds?   offers by round index -- the Rubinstein
                                          signature. Offers should soften as the
                                          remaining episode shrinks.
-  5. Who wanted what?                    per agent: role, what it proposed, how it
+  5. Is the vote a REPLY to the offer?   accept rate and p(accept) binned by the
+                                         theta on the table, pooled and per agent.
+                                         A reservation value shows up here as a
+                                         slope; a flat row means the agents are not
+                                         conditioning on the offer at all.
+  6. Who wanted what?                    per agent: role, what it proposed, how it
                                          voted, whether its offers carried
-  6. Every episode                       one line each, so outliers are visible
+  7. Every episode                       one line each, so outliers are visible
                                          rather than averaged away
 
 Usage:
@@ -85,22 +90,46 @@ def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed):
                                         info["waste_cleared"][:, 0])
 
     def round_(carry, r):
-        (st, ob, rng, agreed, locked, cum_r, cum_c, last_tn, had, nrej, riv) = carry
+        (st, ob, rng, agreed, locked, cum_r, cum_c, last_tn, had, nrej, riv,
+         last_votes, last_nacc) = carry
         rng, kp, kt, kv = jax.random.split(rng, 4)
         prop = bg.proposer_for_round(r, n, num_envs, cfg["proposer"], key=kp,
                                      contributions=cum_c, start_offset=offset)
-        feats = bg.bargaining_features(r, K, prop, n, last_tn, had, nrej,
-                                       cum_r / ret_s, cum_c / cl_s, riv / riv_s, mask)
+
+        def feats_at(live_tn, live):
+            return bg.bargaining_features(r, K, prop, n, last_tn, had, nrej,
+                                          live_tn, live, last_votes, last_nacc,
+                                          cum_r / ret_s, cum_c / cl_s, riv / riv_s,
+                                          mask)
+
+        # Two passes, exactly as in training: propose first, then vote on what was
+        # proposed. Collapsing them back into one would replay a policy that had
+        # never been trained -- the votes would be reading an empty table.
+        zeros_e = jnp.zeros((num_envs,), jnp.float32)
+        feats_prop = feats_at(zeros_e, zeros_e)
         kts, kvs = jax.random.split(kt, n), jax.random.split(kv, n)
-        raw, votes = [], []
+        raw = []
         for i in range(n):
-            pt, pv, _ = bnet.apply(bp[i], feats[i])
+            pt, _, _ = bnet.apply(bp[i], feats_prop[i])
             raw.append(pt.sample(seed=kts[i])[:, 0])
-            votes.append(pv.sample(seed=kvs[i]))
-        raw, votes = jnp.stack(raw), jnp.stack(votes)
+        raw = jnp.stack(raw)
         theta_all = neg.unsquash(raw, contract.low, contract.high)
         mine = bg.is_proposer_mask(prop, n)
         offer = jnp.sum(jnp.where(mine, theta_all, 0.0), axis=0)
+
+        feats_vote = feats_at(bg.normalise_theta(offer, contract.low, contract.high),
+                              jnp.ones((num_envs,), jnp.float32))
+        votes, p_acc = [], []
+        for i in range(n):
+            _, pv, _ = bnet.apply(bp[i], feats_vote[i])
+            # eps=0: the exploration floor is a training device, so what is measured
+            # here is the policy itself. p_accept is kept as well -- it is the
+            # offer-conditioned quantity, and reading it off the distribution rather
+            # than the sampled votes gives a far less noisy picture per bin.
+            v, _ = bg.floored_vote(pv, 0.0, kvs[i])
+            votes.append(v)
+            p_acc.append(pv.probs[..., 1])
+        votes, p_acc = jnp.stack(votes), jnp.stack(p_acc)
         passed, n_acc = bg.accepted(votes.astype(bool), prop, quorum, n)
         newly = passed & ~agreed
         theta_eff = jnp.where(agreed, locked,
@@ -112,22 +141,87 @@ def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed):
 
         rec = {"proposer": prop, "offer": offer, "votes": votes, "accepted": passed,
                "newly": newly, "active": ~agreed, "n_accept": n_acc,
-               "theta_eff": theta_eff, "cleaned": seg_cl, "base": seg_base,
-               "transfer": seg_tr, "river": riv_t.mean(0)}
+               "p_accept": p_acc, "theta_eff": theta_eff, "cleaned": seg_cl,
+               "base": seg_base, "transfer": seg_tr, "river": riv_t.mean(0)}
         carry = (st, ob, rng, agreed | newly, jnp.where(newly, offer, locked),
                  cum_r + seg_base + seg_tr, cum_c + seg_cl,
-                 2.0 * (offer - contract.low) / (contract.high - contract.low) - 1.0,
+                 bg.normalise_theta(offer, contract.low, contract.high),
                  jnp.ones_like(had), nrej + (~agreed & ~passed).astype(jnp.int32),
-                 riv_t[-1].astype(jnp.float32))
+                 riv_t[-1].astype(jnp.float32),
+                 (votes.astype(bool) & ~mine).astype(jnp.float32),
+                 n_acc.astype(jnp.float32))
         return carry, rec
 
     z_e = jnp.zeros((num_envs,), jnp.float32)
     init = (st, obsv, key, jnp.zeros((num_envs,), bool),
             jnp.full((num_envs,), contract.null),
             jnp.zeros((n, num_envs), jnp.float32), jnp.zeros((n, num_envs), jnp.float32),
-            z_e, jnp.zeros((num_envs,), bool), jnp.zeros((num_envs,), jnp.int32), z_e)
+            z_e, jnp.zeros((num_envs,), bool), jnp.zeros((num_envs,), jnp.int32), z_e,
+            jnp.zeros((n, num_envs), jnp.float32), z_e)
     _, rec = jax.lax.scan(round_, init, jnp.arange(K))
     return jax.tree.map(np.asarray, rec), K
+
+
+def voting_vs_offer(rec, contract, n, blk, nbins=6):
+    """Accept rate as a function of the theta on the table.
+
+    The question this answers is whether the vote is a REPLY to the offer at all.
+    Under the one-pass round the vote head never saw theta_r, so the only voting
+    strategies it could express were "accept whoever proposed" and "always accept" --
+    which is precisely what both early runs converged to. A flat row here now means
+    the agents chose not to condition on the offer; a downward slope means a
+    reservation value, which is the strategy the whole mechanism rests on.
+
+    Two measures per bin, because they fail differently: the sampled vote rate is
+    what actually happened, and the mean accept PROBABILITY is the same quantity
+    with the sampling noise taken out (offers cluster, so some bins are thin).
+    """
+    act = rec["active"]                                            # (K, E)
+    if not act.any():
+        return
+    is_prop = rec["proposer"][:, None, :] == np.arange(n)[None, :, None]   # (K,N,E)
+    responder = act[:, None, :] & ~is_prop
+    edges = np.linspace(contract.low, contract.high, nbins + 1)
+    idx = np.clip(np.digitize(rec["offer"], edges) - 1, 0, nbins - 1)      # (K, E)
+
+    blk("voting vs the offer  (does the vote condition on theta at all?)")
+    print(f"  {'theta bin':>16}{'offers':>8}{'mean theta':>12}"
+          f"{'accept rate':>13}{'p(accept)':>11}{'passed':>8}")
+    rows = []
+    for b in range(nbins):
+        sel = act & (idx == b)
+        if not sel.any():
+            continue
+        m = responder & sel[:, None, :]
+        rate = rec["votes"][m].mean()
+        prob = rec["p_accept"][m].mean()
+        rows.append((rec["offer"][sel].mean(), rate, prob))
+        print(f"  [{edges[b]:>6.3f},{edges[b+1]:>6.3f}){int(sel.sum()):>8}"
+              f"{rec['offer'][sel].mean():>12.4f}{rate:>13.3f}{prob:>11.3f}"
+              f"{rec['newly'][sel].mean():>8.3f}")
+    if len(rows) >= 2:
+        probs = np.array([r[2] for r in rows])
+        thetas = np.array([r[0] for r in rows])
+        spread = probs.max() - probs.min()
+        corr = (np.corrcoef(thetas, probs)[0, 1] if probs.std() > 1e-9 else 0.0)
+        print(f"\n  spread in p(accept) across bins {spread:.3f}"
+              f"   correlation with theta {corr:+.3f}")
+        if spread < 0.02:
+            print("  -> voting is effectively CONSTANT in theta: whatever is being "
+                  "learned, it is not a reservation value.")
+
+    # Per agent, because a threshold that only one agent holds is invisible in the
+    # pooled row above -- and one holdout is exactly the seed-42 veto-dictator shape.
+    print("\n  p(accept) by agent and theta bin  ('--' = never a responder there)")
+    header = "".join(f"{edges[b]:>9.2f}" for b in range(nbins))
+    print(f"  {'agent':<7}{header}")
+    for i in range(n):
+        cells = []
+        for b in range(nbins):
+            m = responder[:, i, :] & act & (idx == b)
+            cells.append(f"{rec['p_accept'][:, i, :][m].mean():>9.3f}"
+                         if m.any() else f"{'--':>9}")
+        print(f"  A{i:<6}" + "".join(cells))
 
 
 def gini_equality(v, axis=0):
@@ -204,6 +298,8 @@ def report(rec, K, cfg, contract, n, num_steps):
         print(f"  {r:>6}{int(act.sum()):>8}{rec['offer'][r][act].mean():>12.4f}"
               f"{int(rec['newly'][r].sum()):>10}"
               f"{rec['newly'][r][act].mean():>13.3f}")
+
+    voting_vs_offer(rec, contract, n, blk)
 
     blk("per agent")
     cl_agent = rec["cleaned"].sum(0).mean(1) / num_steps         # (N,) cells/step
@@ -283,9 +379,12 @@ def main():
     if len(bp) != n:
         raise SystemExit(f"{n} gameplay but {len(bp)} bargaining policies")
 
-    cfg = infer_bargain_config(moca["stem"])
-    cfg.setdefault("hidden", 64)
-    cfg.setdefault("accept_bias", 1.0)
+    cfg = infer_bargain_config(moca["stem"], checkpoint=args.checkpoint)
+    try:
+        bg.check_params_compatible(bp[0], n, cfg.get("feature_version"),
+                                   hidden=cfg["hidden"], label=moca["stem"])
+    except ValueError as e:
+        raise SystemExit(f"[incompatible checkpoint] {e}")
     if args.bargain_segment:
         cfg["segment"] = args.bargain_segment
     if args.num_steps % cfg["segment"]:

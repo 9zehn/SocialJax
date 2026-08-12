@@ -18,11 +18,16 @@ yields an equitable split -- with no fairness axiom added anywhere.
 The game, over an episode of T steps split into K segments of `segment` steps:
 
     round r = 0..K-1, while no contract is in force:
-        proposer p(r) offers theta_r
-        every other agent votes accept/reject
+        proposer p(r) offers theta_r                         (forward pass 1)
+        every other agent sees theta_r and votes accept/reject   (forward pass 2)
         if #accept >= quorum:  theta_r binds for ALL REMAINING segments, done
         else:                  theta = 0 for segment r, continue to round r+1
     never agreed -> the null contract for the whole episode
+
+The round is TWO passes over the same network, not one, and that is load-bearing: a
+vote produced in the same pass as the proposal cannot condition on the offer, which
+leaves "reject anything below my reservation value" outside the policy class
+entirely. See the feature layout note below.
 
 Three deliberate departures from the reference, each with a reason:
 
@@ -42,7 +47,7 @@ Three deliberate departures from the reference, each with a reason:
     conflates "I accept" with "the contract passes". Here each responder emits a real
     Bernoulli vote and the contract passes on a count.
 """
-from typing import Tuple
+from typing import Any, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -52,6 +57,19 @@ PROPOSER_MODES = ("rotate", "random", "contribution")
 # result can be shown not to depend on handing agents the inequality signal --
 # see `feature_mask`.
 FEATURE_LEVELS = ("protocol", "private", "public")
+
+# Bumped whenever the feature layout or the round protocol changes, and recorded in
+# every run's .run.yaml sidecar. Weights are shaped by the feature dimension, so a
+# checkpoint from an older version cannot be loaded by this code at all -- but a
+# version number turns that into a clear message instead of a shape error six frames
+# down, and catches the case where the dimension coincidentally survives a change.
+#
+#   1  round / turn / standing (rejected) offer / rejection count / proposer one-hot,
+#      one forward pass per agent per round. The vote never saw the offer it was
+#      voting on, so a reservation-value strategy was unrepresentable.
+#   2  two-pass round (propose, then vote on the live offer), a live-offer slot with
+#      its own 0/1 flag, and last round's votes and accept count.
+FEATURE_VERSION = 2
 
 
 # ------------------------------------------------------------------ protocol
@@ -130,9 +148,46 @@ def accepted(vote_accept, proposer_idx, quorum: int, num_agents: int) -> Tuple:
 
 
 # ------------------------------------------------------------------ features
+#
+# Layout, for N agents (F = 12 + 2N). The tiers are contiguous and in this order so
+# `feature_mask` can select a prefix and the ablation stays a one-value change.
+#
+#   protocol (8 + 2N)
+#     0            rounds left, / num_rounds
+#     1            am I the proposer this round
+#     2            has any offer been made yet
+#     3            the standing REJECTED offer, normalised to [-1, 1]
+#     4            rejections so far, / num_rounds
+#     5            is there an offer on the table RIGHT NOW  (0 in the proposal pass)
+#     6            that live offer, normalised to [-1, 1]    (0 when none)
+#     7            last round's accept count, / (N - 1)
+#     8 .. 8+N-1   proposer one-hot
+#     8+N .. 7+2N  last round's per-agent accept votes (the proposer's slot is 0:
+#                  it casts no counted vote)
+#   private (2)
+#     8+2N         own accumulated return, scaled
+#     9+2N         own accumulated cleaning, scaled
+#   public (2)
+#     10+2N        river stock, scaled
+#     11+2N        mean cleaning across agents, scaled
+#
+# Slots 5 and 6 are the fix for the structural defect in version 1: a vote that
+# cannot see the offer can only condition on WHO proposed and WHEN, so "reject
+# anything below my reservation value" -- the strategy the whole mechanism rests on
+# -- was not in the policy class. Slot 5 is separate from slot 6 so the network can
+# distinguish "no offer yet" from "an offer of value 0".
 
 def feature_dim(num_agents: int) -> int:
-    return 9 + num_agents
+    return 12 + 2 * num_agents
+
+
+def normalise_theta(theta, low: float, high: float):
+    """A contract value on [low, high] -> [-1, 1], the scale the policy reads.
+
+    The same mapping `negotiate.unsquash` inverts, kept here so the training loop,
+    the evaluator and the viewer cannot drift apart on it.
+    """
+    return 2.0 * (theta - low) / (high - low) - 1.0
 
 
 def feature_mask(level: str, num_agents: int) -> jnp.ndarray:
@@ -141,10 +196,11 @@ def feature_mask(level: str, num_agents: int) -> jnp.ndarray:
     The tiers exist because "handcrafted features" is a fair criticism to level at a
     learned bargainer, and the tiers separate the fair part from the contentious one.
 
-    protocol  The extensive-form game itself: round, whose turn, the standing offer,
-              how many rounds have failed. Every bargaining model in the literature
+    protocol  The extensive-form game itself: round, whose turn, the offer on the
+              table, the standing rejected offer, how many rounds have failed, and
+              how last round's votes fell. Every bargaining model in the literature
               assumes players know these, and the SPE of a finite alternating-offers
-              game is Markov in (round, proposer) -- so this tier alone is in
+              game is Markov in (round, proposer, offer) -- so this tier alone is in
               principle sufficient to represent the equilibrium.
     private   ...plus the agent's OWN accumulated return and cleaning. Standard: you
               know your own payoff history.
@@ -160,7 +216,7 @@ def feature_mask(level: str, num_agents: int) -> jnp.ndarray:
     if level not in FEATURE_LEVELS:
         raise ValueError(f"BARGAIN_FEATURES must be one of "
                          f"{', '.join(FEATURE_LEVELS)}; got {level!r}")
-    n_protocol = 5 + num_agents
+    n_protocol = 8 + 2 * num_agents
     mask = jnp.zeros((feature_dim(num_agents),), dtype=jnp.float32)
     mask = mask.at[:n_protocol].set(1.0)
     if level in ("private", "public"):
@@ -172,8 +228,16 @@ def feature_mask(level: str, num_agents: int) -> jnp.ndarray:
 
 def bargaining_features(round_idx, num_rounds: int, proposer_idx, num_agents: int,
                         last_theta_norm, had_offer, n_reject,
+                        live_theta_norm, offer_live, last_votes, last_n_accept,
                         own_return, own_cleaning, river_stock, mask) -> jnp.ndarray:
     """(N, E, F) bargaining state, one row per agent.
+
+    Called TWICE per round, which is the point (see the layout note above). Once
+    before anyone has moved, with `offer_live=0`, to produce the proposal; then again
+    with the proposer's theta in `live_theta_norm` and `offer_live=1`, to produce the
+    responders' votes and each responder's critic value. Every other argument is the
+    same across the two passes, so the network reads one consistent history and only
+    the phase changes.
 
     Everything is pre-scaled to roughly unit range; a raw episode return of ~500
     alongside a 0/1 turn flag would make the first layer's job needlessly hard.
@@ -182,6 +246,15 @@ def bargaining_features(round_idx, num_rounds: int, proposer_idx, num_agents: in
         last_theta_norm: (E,) the standing (rejected) offer on [-1, 1], 0 if none.
         had_offer: (E,) bool, whether any offer has been made yet.
         n_reject: (E,) how many rounds have failed so far.
+        live_theta_norm: (E,) the offer currently on the table on [-1, 1]; 0 in the
+            proposal pass, where nothing has been offered yet.
+        offer_live: (E,) 0/1, whether that slot holds a real offer. Separate from the
+            value so "no offer" is distinguishable from "an offer of 0".
+        last_votes: (N, E) last round's accept votes, 0/1, zeros in round 0. Who
+            refused is what tells a proposer whom it has to appease.
+        last_n_accept: (E,) last round's RAW accept count; scaled here by the number
+            of responders. "5 of 6 accepted" and "0 of 6" call for very different
+            concessions and are otherwise indistinguishable.
         own_return: (N, E) each agent's accumulated episode return so far, scaled.
         own_cleaning: (N, E) accumulated cells cleaned, scaled.
         river_stock: (E,) clear cells in the river, scaled.
@@ -192,6 +265,9 @@ def bargaining_features(round_idx, num_rounds: int, proposer_idx, num_agents: in
                            dtype=jnp.float32)
     prop_onehot = jax.nn.one_hot(proposer_idx, num_agents, dtype=jnp.float32)  # (E, N)
     mine = is_proposer_mask(proposer_idx, num_agents).astype(jnp.float32)      # (N, E)
+    n_responders = max(num_agents - 1, 1)
+    last_votes = jnp.asarray(last_votes, jnp.float32)
+    accept_frac = jnp.asarray(last_n_accept, jnp.float32) / n_responders
 
     def per_agent(i):
         shared = [
@@ -200,8 +276,12 @@ def bargaining_features(round_idx, num_rounds: int, proposer_idx, num_agents: in
             had_offer.astype(jnp.float32),
             last_theta_norm,
             n_reject.astype(jnp.float32) / num_rounds,
+            jnp.asarray(offer_live, jnp.float32),
+            live_theta_norm,
+            accept_frac,
         ]
         cols = shared + [prop_onehot[:, a] for a in range(num_agents)]
+        cols += [last_votes[a] for a in range(num_agents)]
         cols += [own_return[i], own_cleaning[i], river_stock,
                  own_cleaning.mean(axis=0)]
         return jnp.stack(cols, axis=-1)                                        # (E, F)
@@ -210,7 +290,118 @@ def bargaining_features(round_idx, num_rounds: int, proposer_idx, num_agents: in
     return feats * mask
 
 
+# -------------------------------------------------------------- the vote itself
+
+def floored_vote(pi_vote, eps, key) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Sample an accept/reject vote from an eps-floored copy of `pi_vote`.
+
+    Both bargaining runs so far saturated -- one agent that always rejected in the
+    first, every agent always accepting in the second -- and BARGAIN_ENT_COEF=0.01
+    did not stop it. A saturated vote is self-sealing: once accept probability is
+    1.0 the policy never observes the outcome of refusing, so nothing can teach it
+    to. The floor keeps both branches sampled at rate `eps` regardless of what the
+    logits say, and anneals to 0 so the final policy is the learned one.
+
+    The returned log-prob is under the FLOORED distribution, because that is the
+    distribution the action was actually drawn from: PPO's ratio is then a proper
+    importance weight of the policy against the behaviour distribution. The loss
+    still evaluates the new log-prob under the UNfloored policy, so gradient reaches
+    a saturated agent instead of dying in the clip.
+
+    Args:
+        pi_vote: distrax.Categorical over [reject, accept].
+        eps: scalar floor on both branches; 0 recovers plain sampling.
+        key: PRNG key.
+
+    Returns:
+        (E,) int32 vote, (E,) float32 log-prob under the floor.
+    """
+    p = jnp.clip(pi_vote.probs[..., 1], eps, 1.0 - eps)
+    vote = (jax.random.uniform(key, p.shape) < p).astype(jnp.int32)
+    log_p = jnp.where(vote == 1, jnp.log(p), jnp.log1p(-p))
+    return vote, log_p
+
+
+def vote_eps_at(base: float, update_step, num_updates: int):
+    """The vote floor at `update_step`, annealed linearly to 0 over training.
+
+    Exploration early, when saturation would be permanent; none at the end, so the
+    policy that gets checkpointed is the policy that gets replayed.
+    """
+    frac = 1.0 - jnp.asarray(update_step, jnp.float32) / max(int(num_updates), 1)
+    return jnp.float32(base) * jnp.clip(frac, 0.0, 1.0)
+
+
+# ------------------------------------------------------- checkpoint compatibility
+
+def params_shape(params) -> Tuple[Optional[int], Optional[int]]:
+    """(input width, hidden width) of a saved bargaining policy's first layer."""
+    try:
+        kernel = params["params"]["Dense_0"]["kernel"]
+        return int(kernel.shape[0]), int(kernel.shape[1])
+    except (KeyError, IndexError, TypeError):
+        return None, None
+
+
+def check_params_compatible(params: Any, num_agents: int, recorded_version=None,
+                            hidden: Optional[int] = None, label: str = "") -> None:
+    """Refuse to replay a bargaining checkpoint this code cannot read.
+
+    The failure being prevented is not a crash -- it is the version of this that
+    does not crash. A stale checkpoint whose feature vector happens to line up gets
+    replayed as a mechanism that was never trained, and every number comes out
+    looking ordinary. That has already invalidated one full comparison here (the
+    contract-range episode in findings.md), so this is deliberately fatal.
+    """
+    where = f"{label}: " if label else ""
+    if recorded_version is not None and int(recorded_version) != FEATURE_VERSION:
+        raise ValueError(
+            f"{where}bargaining checkpoint was trained at feature/protocol version "
+            f"{int(recorded_version)}, this code is version {FEATURE_VERSION}. The "
+            f"round structure and feature layout both changed, so the weights cannot "
+            f"be read. Replay it by checking out the commit it was trained at (the "
+            f"run's .run.yaml sidecar records the commit), or retrain."
+        )
+    got, got_hidden = params_shape(params)
+    want = feature_dim(num_agents)
+    if got is not None and got != want:
+        raise ValueError(
+            f"{where}bargaining policy expects a {got}-dim feature vector, this code "
+            f"builds {want} for {num_agents} agents (feature version "
+            f"{FEATURE_VERSION}). The checkpoint predates the current layout -- "
+            f"check out the commit in its .run.yaml sidecar to replay it, or retrain."
+        )
+    if hidden is not None and got_hidden is not None and got_hidden != hidden:
+        raise ValueError(
+            f"{where}bargaining policy has a width-{got_hidden} hidden layer, but "
+            f"the network here was built with BARGAIN_HIDDEN={hidden}. Pass the "
+            f"width the run was trained at."
+        )
+    if recorded_version is None and got is not None:
+        print(f"  [warning] {where}no feature version in the run's .run.yaml sidecar "
+              f"(the run predates it). The parameter shapes match version "
+              f"{FEATURE_VERSION}, which is the strongest check available here.")
+
+
 # ------------------------------------------------- credit over the round MDP
+
+def masked_standardise(x, weights):
+    """Zero-mean, unit-variance over the entries `weights` selects.
+
+    The K x E advantage block is mostly STRUCTURAL zeros: `round_gae` zeroes every
+    round after agreement, and when agreement lands in round 0 -- which is the SPE,
+    and what both runs so far did -- that is nearly the whole block. Standardising
+    over all of it drags the mean toward 0 and inflates the scale by the fraction of
+    rounds that happened to be live, so the size of the update would track how
+    quickly the agents agreed rather than how good the decision was.
+
+    Entries outside the mask come out meaningless and must stay masked downstream.
+    """
+    total = weights.sum() + 1e-8
+    mean = (x * weights).sum() / total
+    var = (jnp.square(x - mean) * weights).sum() / total
+    return (x - mean) / (jnp.sqrt(var) + 1e-8)
+
 
 def round_gae(rewards, values, active, terminal, gamma: float, gae_lambda: float):
     """GAE over the K-round bargaining MDP, which is a SEMI-Markov process.

@@ -114,6 +114,76 @@ def test_proposer_never_votes_on_its_own_offer():
 
 # ------------------------------------------------------------------- features
 
+def _feats(n, envs=2, level="protocol", **over):
+    """bargaining_features with every argument at a neutral default."""
+    kw = dict(round_idx=0, num_rounds=4, num_agents=n,
+              proposer_idx=jnp.zeros((envs,), jnp.int32),
+              last_theta_norm=jnp.zeros((envs,)),
+              had_offer=jnp.zeros((envs,), bool),
+              n_reject=jnp.zeros((envs,), jnp.int32),
+              live_theta_norm=jnp.zeros((envs,)),
+              offer_live=jnp.zeros((envs,)),
+              last_votes=jnp.zeros((n, envs)),
+              last_n_accept=jnp.zeros((envs,)),
+              own_return=jnp.zeros((n, envs)), own_cleaning=jnp.zeros((n, envs)),
+              river_stock=jnp.zeros((envs,)))
+    kw.update(over)
+    kw.setdefault("mask", bargain.feature_mask(level, n))
+    return np.array(bargain.bargaining_features(**kw))
+
+
+def test_the_vote_sees_the_offer_it_is_voting_on():
+    """The defect this whole two-pass structure exists to fix.
+
+    With the offer absent from the state, the only voting strategies expressible are
+    "accept whoever proposed" and "always accept" -- a reservation value is not in
+    the policy class at all. Both degenerate runs in findings.md are exactly those
+    two. So: the live offer must reach the policy, and it must do so at the LOWEST
+    tier, since `protocol` is meant to be sufficient for the SPE on its own.
+    """
+    n, envs = 4, 2
+    low = _feats(n, envs, live_theta_norm=jnp.full((envs,), -0.9),
+                 offer_live=jnp.ones((envs,)))
+    high = _feats(n, envs, live_theta_norm=jnp.full((envs,), 0.9),
+                  offer_live=jnp.ones((envs,)))
+    assert not np.allclose(low, high), "theta on the table never reached the policy"
+    # Exactly one slot may differ: the offer's value. Anything else moving would mean
+    # the two passes disagree about the history as well as the phase.
+    differing = np.where(np.abs(low - high).max(axis=(0, 1)) > 0)[0]
+    assert list(differing) == [6], differing
+
+
+def test_offer_live_flag_separates_no_offer_from_an_offer_of_zero():
+    """theta=0 normalises to a real value, so without the flag "the midpoint of the
+    range is on the table" and "nothing is on the table" are the same vector."""
+    n = 4
+    none_yet = _feats(n, offer_live=jnp.zeros((2,)), live_theta_norm=jnp.zeros((2,)))
+    zero_offer = _feats(n, offer_live=jnp.ones((2,)), live_theta_norm=jnp.zeros((2,)))
+    assert not np.allclose(none_yet, zero_offer)
+
+
+def test_last_rounds_votes_and_count_are_visible():
+    """The concession signal. "5 of 6 accepted" and "0 of 6" call for very different
+    next offers, and WHICH agent refused says whom to appease."""
+    n = 4
+    base = _feats(n)
+    votes = np.zeros((n, 2), np.float32)
+    votes[2] = 1.0
+    with_votes = _feats(n, last_votes=jnp.asarray(votes),
+                        last_n_accept=jnp.ones((2,)))
+    assert not np.allclose(base, with_votes)
+    # The count is one slot, the per-agent votes are N slots, and they are distinct:
+    # a change in who accepted must be visible even at a fixed count.
+    other = np.zeros((n, 2), np.float32)
+    other[3] = 1.0
+    assert not np.allclose(with_votes, _feats(n, last_votes=jnp.asarray(other),
+                                              last_n_accept=jnp.ones((2,))))
+    # Every agent reads the same public record, so the vote block is identical
+    # across rows -- only the "am I the proposer" flag is private to a row.
+    block = with_votes[:, :, 8 + n:8 + 2 * n]
+    assert np.allclose(block, block[0]), "last round's votes must be public"
+
+
 def test_feature_tiers_are_nested_and_maskable():
     n = 7
     dim = bargain.feature_dim(n)
@@ -135,33 +205,18 @@ def test_private_tier_hides_commons_aggregates():
     attributable to it.
     """
     n = 3
-    common = dict(round_idx=0, num_rounds=4, num_agents=n,
-                  proposer_idx=jnp.zeros((2,), jnp.int32),
-                  last_theta_norm=jnp.zeros((2,)), had_offer=jnp.zeros((2,), bool),
-                  n_reject=jnp.zeros((2,), jnp.int32),
-                  own_return=jnp.ones((n, 2)), own_cleaning=jnp.ones((n, 2)))
-    quiet = bargain.bargaining_features(
-        river_stock=jnp.zeros((2,)), mask=bargain.feature_mask("private", n), **common)
-    loud = bargain.bargaining_features(
-        river_stock=jnp.full((2,), 99.0), mask=bargain.feature_mask("private", n),
-        **common)
-    assert np.allclose(np.array(quiet), np.array(loud)), \
+    common = dict(own_return=jnp.ones((n, 2)), own_cleaning=jnp.ones((n, 2)))
+    quiet = _feats(n, level="private", river_stock=jnp.zeros((2,)), **common)
+    loud = _feats(n, level="private", river_stock=jnp.full((2,), 99.0), **common)
+    assert np.allclose(quiet, loud), \
         "river stock reached the policy at the 'private' tier"
-    seen = bargain.bargaining_features(
-        river_stock=jnp.full((2,), 99.0), mask=bargain.feature_mask("public", n),
-        **common)
-    assert not np.allclose(np.array(quiet), np.array(seen)), \
-        "'public' must actually expose it"
+    seen = _feats(n, level="public", river_stock=jnp.full((2,), 99.0), **common)
+    assert not np.allclose(quiet, seen), "'public' must actually expose it"
 
 
 def test_proposer_sees_that_it_is_the_proposer():
     n = 3
-    feats = np.array(bargain.bargaining_features(
-        round_idx=1, num_rounds=4, proposer_idx=jnp.array([2, 0]), num_agents=n,
-        last_theta_norm=jnp.zeros((2,)), had_offer=jnp.zeros((2,), bool),
-        n_reject=jnp.zeros((2,), jnp.int32), own_return=jnp.zeros((n, 2)),
-        own_cleaning=jnp.zeros((n, 2)), river_stock=jnp.zeros((2,)),
-        mask=bargain.feature_mask("protocol", n)))
+    feats = _feats(n, round_idx=1, proposer_idx=jnp.array([2, 0]))
     # feature 1 is "am I the proposer"; env 0 -> agent 2, env 1 -> agent 0.
     assert feats[2, 0, 1] == 1.0 and feats[0, 0, 1] == 0.0
     assert feats[0, 1, 1] == 1.0 and feats[2, 1, 1] == 0.0
@@ -216,6 +271,102 @@ def test_discounting_rounds_shrinks_the_delayed_payoff():
     assert np.isclose(adv_1[0], 10.0) and np.isclose(adv_h[0], 5.0)
 
 
+def test_advantage_is_standardised_over_active_rounds_only():
+    """Agreement in round 0 is the SPE, so most of the K x E block is structural
+    zeros. Normalising over those would make the update size track how fast the
+    agents agreed rather than how good the decision was."""
+    a = jnp.array([[10.0, 12.0], [0.0, 0.0], [0.0, 0.0]])
+    w = jnp.array([[1.0, 1.0], [0.0, 0.0], [0.0, 0.0]])
+    out = np.array(bargain.masked_standardise(a, w))
+    assert np.isclose(out[0].mean(), 0.0, atol=1e-5)
+    assert np.isclose(out[0].std(), 1.0, atol=1e-3)
+    # The unmasked version is dragged off zero-mean by the inert rounds.
+    naive = np.array((a - a.mean()) / (a.std() + 1e-8))
+    assert not np.isclose(naive[0].mean(), 0.0, atol=1e-2)
+    # All-inactive must not divide by zero.
+    assert np.isfinite(np.array(bargain.masked_standardise(a, jnp.zeros_like(w)))).all()
+
+
+# ------------------------------------------------------------ the vote's floor
+
+def _vote_rate(bias, eps, draws=4000):
+    net = BargainingActorCritic(accept_bias=bias)
+    x = jnp.zeros((draws, bargain.feature_dim(3)))
+    p = net.init(jax.random.PRNGKey(0), x)
+    _, pi_vote, _ = net.apply(p, x)
+    vote, log_p = bargain.floored_vote(pi_vote, eps, jax.random.PRNGKey(1))
+    return np.array(vote), np.array(log_p), np.array(pi_vote.probs[..., 1])
+
+
+def test_vote_floor_keeps_both_branches_sampled():
+    """Saturation is self-sealing: an agent that never refuses never learns what
+    refusing would have bought it. ENT_COEF=0.01 did not stop either run saturating.
+    """
+    # A large accept bias is a saturated always-accept policy.
+    vote, _, prob = _vote_rate(bias=8.0, eps=0.1)
+    assert prob.mean() > 0.99, "the unfloored policy should be saturated here"
+    assert 0.05 < 1.0 - vote.mean() < 0.15, \
+        f"floor did not hold the reject branch open: {1 - vote.mean():.3f}"
+    # ...and symmetrically for a saturated always-REJECT policy, which is the other
+    # degenerate run (seed 42's veto dictator).
+    vote, _, prob = _vote_rate(bias=-8.0, eps=0.1)
+    assert prob.mean() < 0.01
+    assert 0.05 < vote.mean() < 0.15
+
+
+def test_floored_log_prob_is_the_distribution_actually_sampled_from():
+    """PPO's ratio is only a correct importance weight if the stored log-prob is the
+    behaviour policy's, so it must reflect the floor rather than the raw logits."""
+    vote, log_p, prob = _vote_rate(bias=8.0, eps=0.1, draws=64)
+    p_floor = np.clip(prob, 0.1, 0.9)
+    want = np.where(vote == 1, np.log(p_floor), np.log1p(-p_floor))
+    assert np.allclose(log_p, want, atol=1e-5)
+    assert not np.allclose(log_p, np.where(vote == 1, np.log(prob),
+                                           np.log1p(-prob)), atol=1e-3)
+    # eps=0 has to be exactly the policy again, so evaluation replays the policy.
+    vote, log_p, prob = _vote_rate(bias=1.0, eps=0.0, draws=64)
+    want = np.where(vote == 1, np.log(prob), np.log1p(-prob))
+    assert np.allclose(log_p, want, atol=1e-5)
+
+
+def test_vote_floor_anneals_to_zero():
+    """It is exploration, not part of the mechanism: the checkpointed policy has to
+    be the one a replay reproduces."""
+    assert np.isclose(float(bargain.vote_eps_at(0.05, 0, 100)), 0.05)
+    assert np.isclose(float(bargain.vote_eps_at(0.05, 50, 100)), 0.025)
+    assert float(bargain.vote_eps_at(0.05, 100, 100)) == 0.0
+    assert float(bargain.vote_eps_at(0.05, 150, 100)) == 0.0     # never negative
+
+
+# ------------------------------------------------------ checkpoint compatibility
+
+def test_stale_bargaining_checkpoints_are_refused_not_misread():
+    """A feature layout change makes old weights unreadable. The failure to prevent
+    is the silent one -- replaying a checkpoint as a mechanism it was never trained
+    on, which has already invalidated one comparison in this project."""
+    n = 7
+    net = BargainingActorCritic()
+    good = net.init(jax.random.PRNGKey(0), jnp.zeros((1, bargain.feature_dim(n))))
+    bargain.check_params_compatible(good, n, bargain.FEATURE_VERSION)   # no raise
+
+    stale = net.init(jax.random.PRNGKey(0), jnp.zeros((1, 9 + n)))      # version 1
+    for args in ((stale, n, bargain.FEATURE_VERSION), (stale, n, None),
+                 (good, n, bargain.FEATURE_VERSION - 1)):
+        try:
+            bargain.check_params_compatible(*args)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"should have refused: {args[2]!r}")
+    # A width mismatch is the same class of error and equally silent.
+    try:
+        bargain.check_params_compatible(good, n, bargain.FEATURE_VERSION, hidden=32)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("wrong BARGAIN_HIDDEN should be refused")
+
+
 # --------------------------------------------------------------------- network
 
 def test_accept_bias_lifts_unanimity_off_the_floor():
@@ -234,6 +385,43 @@ def test_accept_bias_lifts_unanimity_off_the_floor():
     # What matters is the joint event, not the single vote: unanimity has to clear
     # the floor by enough that phase-2 signal exists at all. 0.5**6 = 1.6% does not.
     assert probs[0.0] ** 6 < 0.02 < 0.10 < probs[1.0] ** 6
+
+
+def test_a_reservation_value_is_representable():
+    """The end-to-end version of the two-pass fix: p(accept) has to be a FUNCTION of
+    the theta on the table, all the way through the network to the vote head.
+
+    Under the one-pass round this was flat by construction, whatever the weights --
+    which is why `evaluate_bargain`'s accept-rate-by-theta table could only ever
+    have come out constant.
+    """
+    n = 3
+    net = BargainingActorCritic()
+    params = net.init(jax.random.PRNGKey(0),
+                      jnp.zeros((1, bargain.feature_dim(n))))
+
+    def p_accept(theta_norm, params):
+        feats = jnp.asarray(_feats(n, envs=1, live_theta_norm=jnp.array([theta_norm]),
+                                   offer_live=jnp.ones((1,))))
+        _, pi_vote, _ = net.apply(params, feats[1])          # a responder's row
+        return float(pi_vote.probs[0, 1])
+
+    assert p_accept(-1.0, params) != p_accept(1.0, params), \
+        "the vote head cannot see the offer at all"
+
+    # And the dependence can be made SHARP -- a threshold is inside the policy
+    # class, not just a numerical wobble at init. Slot 6 is the live offer; Dense_3
+    # is the vote head, whose orthogonal(0.01) init is what keeps the swing small
+    # until something has been learned.
+    sharp = dict(params)
+    layers = dict(params["params"])
+    k0 = layers["Dense_0"]["kernel"]
+    layers["Dense_0"] = {**layers["Dense_0"], "kernel": k0.at[6].set(k0[6] * 50.0)}
+    layers["Dense_3"] = {**layers["Dense_3"],
+                         "kernel": layers["Dense_3"]["kernel"] * 50.0}
+    sharp["params"] = layers
+    lo, hi = p_accept(-1.0, sharp), p_accept(1.0, sharp)
+    assert abs(hi - lo) > 0.4, f"no threshold reachable: {lo:.3f} -> {hi:.3f}"
 
 
 def test_heads_are_shaped_for_their_decisions():
