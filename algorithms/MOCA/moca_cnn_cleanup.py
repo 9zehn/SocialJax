@@ -43,7 +43,7 @@ from socialjax.wrappers.baselines import LogWrapper
 import wandb
 
 from algorithms.utils import checkpoint_filename, load_params, save_params, save_train_state
-from algorithms.MOCA import bargain, negotiate, solver
+from algorithms.MOCA import bargain, negotiate, reporting, solver
 from algorithms.MOCA.contracts import AGREE, PROPOSE, make_contract
 from algorithms.MOCA.networks import (
     BargainingActorCritic, ContractActorCritic, NegotiationActorCritic,
@@ -218,6 +218,14 @@ JOINT_BARGAIN_METRICS = {
     #               the vote head is being trained on very little.
     "cf_gap": "cf/gap",
     "cf_pivotal_rate": "cf/pivotal_rate",
+    # Claims and audits (reporting.py). Zero when REPORT_ENABLE is off.
+    #   report/overclaim  mean chosen overclaim per claim, over in-force windows.
+    #                     Honest agents sit at 0; watch it against the analytic
+    #                     honesty boundary lam* = (1-p)/p.
+    #   report/leakage    overclaimed reward actually PAID per episode (unaudited
+    #                     lies x theta) -- the enforcement leak, in reward units.
+    "report_overclaim": "report/overclaim",
+    "report_leakage": "report/leakage",
 }
 
 # How the vote head's advantage is computed. See bargain.counterfactual_vote_advantage.
@@ -425,6 +433,29 @@ def make_train(config):
                 f"BARGAIN_PROBE_NULL_FRAC is the fraction OF PROBES that offer the "
                 f"null contract, so it must be in [0, 1]. Got "
                 f"{config['BARGAIN_PROBE_NULL_FRAC']!r}.")
+        # Claims and audits (reporting.py): contract payment on REPORTED cleaning.
+        # Off by default -- transfers stay perfectly enforced unless asked.
+        config.setdefault("REPORT_ENABLE", False)
+        for key, default in (("REPORT_AUDIT_P", 0.25), ("REPORT_FINE_MULT", 2.0),
+                             ("REPORT_MAX_OVERCLAIM", 20.0), ("REPORT_LR", 3e-4)):
+            config.setdefault(key, default)
+        if config["REPORT_ENABLE"]:
+            p_audit = float(config["REPORT_AUDIT_P"])
+            if not 0.0 < p_audit <= 1.0:
+                raise ValueError(
+                    f"REPORT_AUDIT_P must be in (0, 1] -- at 0 the cap is the only "
+                    f"limit on overclaiming and the run measures nothing. Got "
+                    f"{config['REPORT_AUDIT_P']!r}.")
+            if float(config["REPORT_FINE_MULT"]) < 0.0:
+                raise ValueError(f"REPORT_FINE_MULT must be >= 0, got "
+                                 f"{config['REPORT_FINE_MULT']!r}.")
+            if float(config["REPORT_MAX_OVERCLAIM"]) <= 0.0:
+                raise ValueError(f"REPORT_MAX_OVERCLAIM must be > 0, got "
+                                 f"{config['REPORT_MAX_OVERCLAIM']!r}.")
+            print(f"[MOCA] reporting on: audit p={p_audit}, fine x"
+                  f"{config['REPORT_FINE_MULT']} (honesty needs > "
+                  f"{reporting.honesty_threshold(p_audit):.2f}), overclaim cap "
+                  f"{config['REPORT_MAX_OVERCLAIM']}", flush=True)
         # How the VOTE head is credited. The proposal head keeps the GAE advantage
         # either way -- a proposal has no pivotality and no branch structure.
         config.setdefault("BARGAIN_VOTE_ADVANTAGE", "gae")
@@ -679,6 +710,27 @@ def make_train(config):
             )
             for i in range(num_agents)
         ]
+
+        # Claim policies (reporting.py), built only when reporting is on. The init
+        # reuses `_rng` like every network above rather than splitting a fresh key,
+        # so the main PRNG stream is identical whether or not reporting exists.
+        report_on = bool(config.get("REPORT_ENABLE", False))
+        claim_net, claim_state = None, None
+        if report_on:
+            claim_net = [reporting.ClaimPolicy() for _ in range(num_agents)]
+            init_cl = jnp.zeros((1, reporting.FEATURE_DIM))
+            claim_tx = optax.chain(
+                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                optax.adam(config.get("REPORT_LR") or 3e-4, eps=1e-5),
+            )
+            claim_state = [
+                TrainState.create(
+                    apply_fn=claim_net[i].apply,
+                    params=claim_net[i].init(_rng, init_cl),
+                    tx=claim_tx,
+                )
+                for i in range(num_agents)
+            ]
 
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
@@ -1303,8 +1355,8 @@ def make_train(config):
                      - config["ENT_COEF"] * entropy)
             return total, entropy
 
-        def rollout_bargaining(gameplay_params, bargain_params, env_state, last_obs,
-                               vote_eps, rng):
+        def rollout_bargaining(gameplay_params, bargain_params, claim_params,
+                               env_state, last_obs, vote_eps, rng):
             """One episode of alternating-offers bargaining interleaved with play.
 
             Scans over ROUNDS; each round makes one bargaining decision and then
@@ -1389,16 +1441,25 @@ def make_train(config):
             def _round(carry, r):
                 (env_state, last_obs, rng, agreed, locked, cum_return, cum_clean,
                  last_theta_n, had_offer, n_reject, river,
-                 last_votes, last_n_acc) = carry
+                 last_votes, last_n_acc, last_rejecters) = carry
+                # Key budget is decided at trace time from static config, and the
+                # first keys are always assigned in the same order, so switching a
+                # feature OFF reproduces the exact stream it had before the feature
+                # existed.
+                n_keys = 4 + (2 if probe_frac > 0.0 else 0) + (2 if report_on else 0)
+                keys = jax.random.split(rng, n_keys)
+                rng, k_prop, k_theta, k_vote = keys[0], keys[1], keys[2], keys[3]
+                nxt = 4
                 if probe_frac > 0.0:
-                    (rng, k_prop, k_theta, k_vote,
-                     k_probe, k_probe_theta) = jax.random.split(rng, 6)
-                else:
-                    rng, k_prop, k_theta, k_vote = jax.random.split(rng, 4)
+                    k_probe, k_probe_theta = keys[4], keys[5]
+                    nxt = 6
+                if report_on:
+                    k_claim, k_audit = keys[nxt], keys[nxt + 1]
 
                 proposer = bargain.proposer_for_round(
                     r, num_agents, n_envs, config["BARGAIN_PROPOSER"],
-                    key=k_prop, contributions=cum_clean, start_offset=start_offset)
+                    key=k_prop, contributions=cum_clean, start_offset=start_offset,
+                    holdouts=last_rejecters)
 
                 # Everything about the round except which phase it is. The two passes
                 # must agree on the history or the responders would be voting on a
@@ -1502,6 +1563,35 @@ def make_train(config):
                 (env_state, last_obs, _, rng), (traj, cleaned, clear) = jax.lax.scan(
                     _seg_step, (env_state, last_obs, theta_eff, rng), None, x)
 
+                # Claims and audits (reporting.py). After the window has been
+                # played, each agent files an overclaim on its cleaning; audited
+                # claims are voided and fined. The settlement lands on the window's
+                # LAST step like any transfer, so it flows into gameplay returns,
+                # the bargaining round rewards (agents negotiating theta feel the
+                # enforcement leakage) and every welfare metric without a second
+                # reward path. Zero under the null contract by construction.
+                if report_on:
+                    window_clean = jnp.transpose(cleaned.sum(axis=0))         # (N,E)
+                    feats_claim = reporting.claim_features(
+                        window_clean, theta_eff, x, contract.low, contract.high)
+                    kc = jax.random.split(k_claim, num_agents)
+                    raws_c = []
+                    for i in range(num_agents):
+                        pi_c = claim_net[i].apply(claim_params[i], feats_claim[i])
+                        raws_c.append(pi_c.sample(seed=kc[i])[:, 0])
+                    raw_claim = jnp.stack(raws_c)                             # (N,E)
+                    overclaim = negotiate.unsquash(
+                        raw_claim, 0.0, float(config["REPORT_MAX_OVERCLAIM"]))
+                    audit = jax.random.uniform(
+                        k_audit, (num_agents, n_envs)) < float(config["REPORT_AUDIT_P"])
+                    settle, claim_own = reporting.settle_claims(
+                        theta_eff, overclaim, audit,
+                        float(config["REPORT_FINE_MULT"]), num_agents)
+                    traj = [
+                        traj[i]._replace(reward=traj[i].reward.at[-1].add(settle[i]))
+                        for i in range(num_agents)
+                    ]
+
                 seg_return = jnp.stack(
                     [traj[i].reward.sum(axis=0) for i in range(num_agents)])     # (N,E)
                 record = {
@@ -1513,6 +1603,16 @@ def make_train(config):
                     "n_accept": n_accept, "theta_eff": theta_eff,
                     "is_probe": is_probe, "offer_null": offer_null,
                 }
+                if report_on:
+                    # The claim bandit's training record. `claim_own` (not the full
+                    # zero-sum settlement) is the reward: the funding share of
+                    # OTHERS' claims does not depend on this agent's action.
+                    record.update({
+                        "claim_feats": feats_claim, "claim_raw": raw_claim,
+                        "claim_reward": claim_own, "overclaim": overclaim,
+                        "audited": audit,
+                        "claim_w": (theta_eff > contract.null).astype(jnp.float32),
+                    })
                 carry = (env_state, last_obs, rng,
                          agreed | newly,
                          jnp.where(newly, theta_offer, locked),
@@ -1527,7 +1627,11 @@ def make_train(config):
                          # is ignored by the quorum, so recording it would read as a
                          # refusal it never made.
                          (votes.astype(bool) & ~mine).astype(jnp.float32),
-                         n_accept.astype(jnp.float32))
+                         n_accept.astype(jnp.float32),
+                         # Who refused, for BARGAIN_PROPOSER=holdout: counted
+                         # rejections only. Consumed next round; zeros mean random
+                         # recognition there.
+                         (~votes.astype(bool) & ~mine).astype(jnp.float32))
                 return carry, (record, traj)
 
             zeros_e = jnp.zeros((n_envs,), jnp.float32)
@@ -1537,7 +1641,8 @@ def make_train(config):
                     jnp.zeros((num_agents, n_envs), jnp.float32),
                     zeros_e, jnp.zeros((n_envs,), bool),
                     jnp.zeros((n_envs,), jnp.int32), zeros_e,
-                    jnp.zeros((num_agents, n_envs), jnp.float32), zeros_e)
+                    jnp.zeros((num_agents, n_envs), jnp.float32), zeros_e,
+                    jnp.zeros((num_agents, n_envs), jnp.float32))
             carry, (rounds, traj) = jax.lax.scan(_round, init, jnp.arange(K))
             env_state, last_obs, rng, agreed, locked = carry[0], carry[1], carry[2], carry[3], carry[4]
 
@@ -1561,7 +1666,14 @@ def make_train(config):
             return traj_batch, rounds, env_state, last_obs, final_theta, rng
 
         def _update_step_joint_bargain(runner_state, unused):
-            (train_state, bargain_state, env_state, last_obs, update_step, rng) = runner_state
+            if report_on:
+                (train_state, bargain_state, claim_state, env_state, last_obs,
+                 update_step, rng) = runner_state
+                c_params = [cs.params for cs in claim_state]
+            else:
+                (train_state, bargain_state, env_state, last_obs,
+                 update_step, rng) = runner_state
+                claim_state, c_params = None, None
             params_list = [ts.params for ts in train_state]
             b_params = [bs.params for bs in bargain_state]
 
@@ -1574,8 +1686,8 @@ def make_train(config):
                 end=config["BARGAIN_VOTE_EPS_END"])
 
             (traj_batch, rounds, env_state, last_obs, final_theta,
-             rng) = rollout_bargaining(params_list, b_params, env_state, last_obs,
-                                       vote_eps, rng)
+             rng) = rollout_bargaining(params_list, b_params, c_params,
+                                       env_state, last_obs, vote_eps, rng)
 
             # ---------------------------------------------------- gameplay PPO
             contract_obs = contract.to_obs(final_theta)
@@ -1682,7 +1794,14 @@ def make_train(config):
                     pivotal = rounds["pivotal"][:, i].astype(jnp.float32)
                     w_vote_pg = bargain.vote_credit_mask(
                         act, mine, rounds["offer_null"], pivotal)
-                    vote_adv = bargain.masked_standardise(
+                    # Scale-only, NOT standardised: the counterfactual advantage is
+                    # already measured against its own baseline (the other branch),
+                    # so its batch mean is signal, not artefact. Centering it
+                    # stripped the level and left only the slope -- the cf-vote
+                    # run's harvesters believed "reject" at every theta while
+                    # their acceptance level sat untrained at ~0.9. See
+                    # bargain.masked_scale.
+                    vote_adv = bargain.masked_scale(
                         bargain.counterfactual_vote_advantage(
                             rounds["vote"][:, i], lock_v, cont_v, pivotal),
                         w_vote_pg)
@@ -1726,9 +1845,30 @@ def make_train(config):
             bargain_state, _ = jax.lax.scan(
                 _bargain_epoch, bargain_state, None, config["BARGAIN_UPDATE_EPOCHS"])
 
+            # ------------------------------------------------- claim bandit
+            # Exogenous audits make the claim a contextual bandit: the settlement
+            # lands immediately and nothing carries over, so plain REINFORCE
+            # against a batch-standardised baseline is the whole update. Windows
+            # with no contract in force are masked -- their settlement is
+            # identically zero whatever the claim, so they carry only noise.
+            if report_on:
+                def claim_loss(params, i):
+                    pi_c = claim_net[i].apply(params, rounds["claim_feats"][:, i])
+                    logp = pi_c.log_prob(rounds["claim_raw"][:, i][..., None])
+                    w = rounds["claim_w"]                                # (K, E)
+                    adv = bargain.masked_standardise(
+                        rounds["claim_reward"][:, i], w)
+                    return -(logp * adv * w).sum() / (w.sum() + 1e-8)
+
+                for i in range(num_agents):
+                    g = jax.grad(claim_loss)(claim_state[i].params, i)
+                    claim_state[i] = claim_state[i].apply_gradients(grads=g)
+
             update_step = update_step + 1
             jax.debug.callback(checkpoint_callback, train_state, update_step)
             jax.debug.callback(bargain_checkpoint_callback, bargain_state, update_step)
+            if report_on:
+                jax.debug.callback(claim_checkpoint_callback, claim_state, update_step)
 
             # ------------------------------------------------------- metrics
             metric = jax.tree.map(
@@ -1799,8 +1939,27 @@ def make_train(config):
                 out["cf_pivotal_rate"] = (
                     rounds["pivotal"].astype(jnp.float32) * w_vote_all
                 ).sum() / total_w
+            # Reporting series, zero when the mechanism is off (same convention as
+            # the cf/ pair: always present, so one wandb view covers both modes).
+            out["report_overclaim"] = jnp.float32(0.0)
+            out["report_leakage"] = jnp.float32(0.0)
+            if report_on:
+                w_claim = rounds["claim_w"]                              # (K, E)
+                n_claims = jnp.maximum((w_claim.sum() * num_agents), 1.0)
+                out["report_overclaim"] = (
+                    rounds["overclaim"] * w_claim[:, None, :]).sum() / n_claims
+                # Reward that left honest pockets: overclaims PAID (unaudited),
+                # per episode. The mechanism's leak rate in reward units.
+                paid = (rounds["overclaim"]
+                        * (1.0 - rounds["audited"].astype(jnp.float32))
+                        * rounds["theta_eff"][:, None, :])
+                out["report_leakage"] = paid.sum() / config["NUM_ENVS"]
+
             out = {f"joint/{JOINT_BARGAIN_METRICS[k]}": v
                    for k, v in _select(out, tuple(JOINT_BARGAIN_METRICS)).items()}
+            # Un-namespaced duplicate so welfare is findable at the top level of a
+            # wandb run rather than only inside the joint/ section.
+            out["welfare"] = out["joint/outcome/welfare"]
             out["phase"] = jnp.float32(3.0)
             out["update_step"] = update_step
             out["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
@@ -1808,6 +1967,9 @@ def make_train(config):
             jax.debug.callback(
                 progress_callback, update_step, out["joint/outcome/welfare"], 3)
 
+            if report_on:
+                return (train_state, bargain_state, claim_state, env_state,
+                        last_obs, update_step, rng), out
             return (train_state, bargain_state, env_state, last_obs,
                     update_step, rng), out
 
@@ -1867,6 +2029,17 @@ def make_train(config):
                             f"./checkpoints/moca/{filename}_contract_{i}.pkl")
             print(f"[checkpoint] bargaining policies at update {update_step}")
 
+        def claim_checkpoint_callback(claim_state, update_step):
+            update_step = int(update_step)
+            every = config.get("CHECKPOINT_EVERY", 20)
+            if every <= 0 or update_step % every != 0:
+                return
+            filename = checkpoint_filename(config, latest=True)
+            for i in range(num_agents):
+                save_params(claim_state[i],
+                            f"./checkpoints/moca/{filename}_claim_{i}.pkl")
+            print(f"[checkpoint] claim policies at update {update_step}")
+
         def progress_callback(update_step, mean_val, phase):
             update_step = int(update_step)
             now = time.time()
@@ -1900,17 +2073,22 @@ def make_train(config):
             # One loop, nothing frozen: gameplay and bargaining learn together for
             # the whole budget. Returns early -- there is no phase 1 or phase 2 here,
             # so the two-phase bookkeeping below does not apply.
-            runner_state = (train_state, bargain_state, env_state, obsv,
-                            jnp.array(0), _rng)
+            runner_state = ((train_state, bargain_state, claim_state, env_state,
+                             obsv, jnp.array(0), _rng) if report_on else
+                            (train_state, bargain_state, env_state, obsv,
+                             jnp.array(0), _rng))
             runner_state, metric_j = jax.lax.scan(
                 _update_step_joint_bargain, runner_state, None, config["NUM_UPDATES"]
             )
-            return {
+            result = {
                 "runner_state": (runner_state[0],),
                 "bargain_state": runner_state[1],
                 "contract_grid": contract_grid,
                 "metrics_joint": metric_j,
             }
+            if report_on:
+                result["claim_state"] = runner_state[2]
+            return result
 
         if config["NUM_UPDATES_PHASE1"] == 0:
             # PHASE1_FROM: the policy is already trained, so there is nothing to

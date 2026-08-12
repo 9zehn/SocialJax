@@ -52,7 +52,7 @@ from typing import Any, Optional, Tuple
 import jax
 import jax.numpy as jnp
 
-PROPOSER_MODES = ("rotate", "random", "contribution")
+PROPOSER_MODES = ("rotate", "random", "contribution", "holdout")
 # Which slice of the bargaining state the policy may see. Tiered so the headline
 # result can be shown not to depend on handing agents the inequality signal --
 # see `feature_mask`.
@@ -91,7 +91,8 @@ def quorum_size(spec, num_agents: int) -> int:
 
 
 def proposer_for_round(round_idx, num_agents: int, num_envs: int, mode: str,
-                       key=None, contributions=None, start_offset=None) -> jnp.ndarray:
+                       key=None, contributions=None, start_offset=None,
+                       holdouts=None) -> jnp.ndarray:
     """(num_envs,) index of the proposing agent, per env.
 
     rotate       round r is agent (r + start_offset) mod N -- alternating offers.
@@ -110,6 +111,16 @@ def proposer_for_round(round_idx, num_agents: int, num_envs: int, mode: str,
     contribution sampled proportional to cumulative cleaning, so proposal power
                  accrues to whoever provisions the public good (Ostrom's
                  proportional equivalence). The only way to game it is to clean more.
+    holdout      drawn uniformly among LAST round's rejecters (`holdouts`, (N, E)),
+                 falling back to uniform-over-all when there are none (round 0, or
+                 a null offer that passed). This is the multilateral analogue of
+                 Rubinstein's alternation, where the player who refuses is exactly
+                 the one who speaks next: it collapses the credit path from
+                 "reject, then hope the rotation reaches you" -- two coordinated
+                 moves -- to "reject and you may hold the pen". The strategic risk
+                 is its point: rejecting to seize proposal power is priced by the
+                 segment the rejection burns, so the pen goes to whoever values
+                 changing the offer more than a tenth of the episode.
     """
     if mode == "rotate":
         if start_offset is None:
@@ -122,6 +133,12 @@ def proposer_for_round(round_idx, num_agents: int, num_envs: int, mode: str,
         # than NaN, which is the state at the very start of every episode.
         w = jnp.transpose(contributions) + 1e-6
         return jax.random.categorical(key, jnp.log(w), axis=-1).astype(jnp.int32)
+    if mode == "holdout":
+        w = jnp.transpose(jnp.asarray(holdouts, jnp.float32))        # (E, N)
+        # No holdouts (round 0, or a passed null offer) -> random recognition.
+        has_any = w.sum(axis=-1, keepdims=True) > 0
+        w = jnp.where(has_any, w, jnp.ones_like(w))
+        return jax.random.categorical(key, jnp.log(w + 1e-9), axis=-1).astype(jnp.int32)
     raise ValueError(f"unknown BARGAIN_PROPOSER {mode!r} "
                      f"(available: {', '.join(PROPOSER_MODES)})")
 
@@ -543,6 +560,27 @@ def masked_standardise(x, weights):
     mean = (x * weights).sum() / total
     var = (jnp.square(x - mean) * weights).sum() / total
     return (x - mean) / (jnp.sqrt(var) + 1e-8)
+
+
+def masked_scale(x, weights):
+    """Unit RMS over the entries `weights` selects -- scaling WITHOUT centering.
+
+    For the counterfactual vote advantage, and deliberately not for anything else.
+    A GAE advantage needs centering because its baseline is an estimate; the
+    counterfactual advantage lock - continue is already measured AGAINST its
+    baseline -- the other branch -- so its mean over a batch is not an artefact to
+    remove, it is the signal. An agent whose policy is systematically wrong has a
+    one-signed advantage; subtracting the batch mean strips exactly that level and
+    leaves only the slope. The cf-vote run showed the resulting failure precisely:
+    harvesters holding 'locking is worse than bargaining on' beliefs at every
+    theta (gap < 0 across the grid) while their acceptance LEVEL sat untrained at
+    ~0.9, with only a slope forming. Scale to unit RMS so the PPO clip sees a
+    well-sized update, and leave the sign structure alone.
+    """
+    w = weights.astype(jnp.float32)
+    total = w.sum() + 1e-8
+    mean_sq = (jnp.square(x) * w).sum() / total
+    return x / (jnp.sqrt(mean_sq) + 1e-8)
 
 
 def round_gae(rewards, values, active, terminal, gamma: float, gae_lambda: float):

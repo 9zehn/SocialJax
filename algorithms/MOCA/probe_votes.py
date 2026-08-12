@@ -24,6 +24,10 @@ Usage:
     # later-round state, custom grid, per-proposer detail
     python algorithms/MOCA/probe_votes.py --checkpoint '...' \
         --round 2 --last-theta 0.4 --grid 13 --by-proposer
+
+    # ...plus evaluate_bargain's full episode report underneath, so the swept
+    # thresholds can be read against the offers the proposers actually made
+    python algorithms/MOCA/probe_votes.py --checkpoint '...' --episodes 40
 """
 import argparse
 import sys
@@ -80,6 +84,15 @@ def main():
                    help="theta bounds; read from the .run.yaml sidecar when present")
     p.add_argument("--by-proposer", action="store_true",
                    help="also print each (proposer, responder) pair separately")
+    p.add_argument("--episodes", type=int, default=0,
+                   help="also roll out this many episodes and print "
+                        "evaluate_bargain's full report underneath the sweep. The "
+                        "two answer different questions and are worth reading "
+                        "together: the sweep says what the policy WOULD do at every "
+                        "theta, the rollout says what actually happened at the "
+                        "thetas the proposers really offered. 0 (default) skips it "
+                        "and keeps this tool rollout-free.")
+    p.add_argument("--env-kwarg", action="append", default=[], metavar="KEY=VALUE")
     args = p.parse_args()
 
     from viz.interactive_viewer import detect_moca, infer_bargain_config
@@ -215,6 +228,59 @@ def main():
                     f"{p_acc[i, pr, g]:>8.3f}" for i in range(n) if i != pr)
                 pp = pass_probability(p_acc[resp[:, pr], pr, g], quorum)
                 print(f"  {th:5.2f} {cells}{pp:>9.3f}")
+
+    if args.episodes:
+        episode_report(args, moca, cfg, contract=(lo, hi), n=n, bp=bp)
+
+
+def episode_report(args, moca, cfg, contract, n, bp):
+    """evaluate_bargain's rollout and report, underneath the sweep.
+
+    The sweep above is what the policy WOULD do at every theta; this is what it
+    actually did at the thetas the proposers really offered, and what that bought.
+    Neither substitutes for the other -- a threshold at theta=0.6 means nothing if
+    every realised offer is 2.4, and a good welfare number means nothing if the vote
+    turns out to be unconditional.
+
+    Delegates rather than reimplements, so the two tools cannot drift apart on the
+    feature scales or the protocol.
+    """
+    import socialjax
+    from socialjax.wrappers.baselines import LogWrapper
+    from algorithms.MOCA.contracts import CleanupContract
+    from algorithms.MOCA.evaluate_bargain import report, rollout
+    from viz.interactive_viewer import _gameplay_checkpoints, _parse_env_kwarg_value
+
+    lo, hi = contract
+    if args.num_steps % cfg["segment"]:
+        raise SystemExit(f"--num-steps {args.num_steps} must be a multiple of the "
+                         f"segment length {cfg['segment']}")
+    gp = [load_params(q) for q in _gameplay_checkpoints(args.checkpoint)]
+    if len(gp) != n:
+        raise SystemExit(f"{len(gp)} gameplay but {n} bargaining policies")
+    # A claims-and-audits run replays under its own enforcement regime, which needs
+    # parameters this tool does not take. Refuse rather than quietly report a
+    # perfectly-enforced version of a run that was never perfectly enforced.
+    if any(Path(q.replace("_contract_", "_claim_")).exists()
+           for q in moca["contract_paths"]):
+        raise SystemExit(
+            "this run has _claim_ checkpoints (claims and audits). Run "
+            "evaluate_bargain.py for the episode statistics -- it takes the audit "
+            "probability and fine that the replay needs.")
+
+    env_kwargs = {"num_agents": n, "shared_rewards": False, "cnn": True, "jit": True,
+                  "apple_reward": 1.0, "num_inner_steps": args.num_steps}
+    for kv in args.env_kwarg:
+        k, _, raw = kv.partition("=")
+        env_kwargs[k] = _parse_env_kwarg_value(raw)
+    env = LogWrapper(socialjax.make("clean_up", **env_kwargs), replace_info=False)
+    contract_obj = CleanupContract(n, lo, hi)
+
+    print(f"\n{'=' * 72}")
+    print(f"rollout: {args.episodes} episodes x {args.num_steps} steps")
+    rec, K = rollout(env, gp, bp, contract_obj, cfg, args.episodes, args.num_steps,
+                     seed=0)
+    report(rec, K, cfg, contract_obj, n, args.num_steps)
 
 
 if __name__ == "__main__":

@@ -43,21 +43,26 @@ import numpy as np
 
 import socialjax
 from socialjax.wrappers.baselines import LogWrapper
-from algorithms.utils import contract_range, load_params
+from algorithms.utils import contract_range, load_params, load_run_config
 from algorithms.MOCA import bargain as bg
 from algorithms.MOCA import negotiate as neg
+from algorithms.MOCA import reporting
 from algorithms.MOCA.contracts import CleanupContract
 from algorithms.MOCA.networks import BargainingActorCritic, ContractActorCritic
 
 
-def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed):
+def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed, cp=None):
     """`num_envs` full episodes in parallel. Returns per-round and per-segment records.
 
     Mirrors the training rollout exactly -- same feature scales, same proposer rule,
     same quorum -- because a policy evaluated on a differently-scaled state is not
-    the policy that was trained.
+    the policy that was trained. When `cp` (claim policies) is given, the claims-
+    and-audits layer replays too, with the run's audit probability and fine, since
+    a reporting run evaluated with perfect enforcement is not the run that trained.
     """
     n = env.num_agents
+    report = cp is not None
+    cnet = reporting.ClaimPolicy() if report else None
     net = ContractActorCritic(env.action_space().n, activation="relu")
     # Whether the run trained the counterfactual branch heads is read off the
     # weights, not off a flag: flax needs the module structure to match the params,
@@ -95,10 +100,14 @@ def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed):
 
     def round_(carry, r):
         (st, ob, rng, agreed, locked, cum_r, cum_c, last_tn, had, nrej, riv,
-         last_votes, last_nacc) = carry
-        rng, kp, kt, kv = jax.random.split(rng, 4)
+         last_votes, last_nacc, last_rej) = carry
+        if report:
+            rng, kp, kt, kv, kc, ka = jax.random.split(rng, 6)
+        else:
+            rng, kp, kt, kv = jax.random.split(rng, 4)
         prop = bg.proposer_for_round(r, n, num_envs, cfg["proposer"], key=kp,
-                                     contributions=cum_c, start_offset=offset)
+                                     contributions=cum_c, start_offset=offset,
+                                     holdouts=last_rej)
 
         def feats_at(live_tn, live):
             return bg.bargaining_features(r, K, prop, n, last_tn, had, nrej,
@@ -145,17 +154,37 @@ def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed):
             seg_step, (st, ob, theta_eff, rng), None, x)
         seg_cl, seg_base, seg_tr = cl.sum(0), rew.sum(0), tr.sum(0)      # (N, E)
 
+        # Claims and audits, as in training: file after the window, audit against
+        # ground truth, settle zero-sum. Identically zero under the null contract.
+        overclaim = jnp.zeros((n, num_envs), jnp.float32)
+        audited = jnp.zeros((n, num_envs), bool)
+        settle = jnp.zeros((n, num_envs), jnp.float32)
+        if report:
+            feats_claim = reporting.claim_features(
+                seg_cl, theta_eff, x, contract.low, contract.high)
+            kcs = jax.random.split(kc, n)
+            raw_c = jnp.stack([
+                cnet.apply(cp[i], feats_claim[i]).sample(seed=kcs[i])[:, 0]
+                for i in range(n)
+            ])
+            overclaim = neg.unsquash(raw_c, 0.0, cfg["report_max_overclaim"])
+            audited = jax.random.uniform(ka, (n, num_envs)) < cfg["report_audit_p"]
+            settle, _ = reporting.settle_claims(
+                theta_eff, overclaim, audited, cfg["report_fine_mult"], n)
+
         rec = {"proposer": prop, "offer": offer, "votes": votes, "accepted": passed,
                "newly": newly, "active": ~agreed, "n_accept": n_acc,
                "p_accept": p_acc, "theta_eff": theta_eff, "cleaned": seg_cl,
-               "base": seg_base, "transfer": seg_tr, "river": riv_t.mean(0)}
+               "base": seg_base, "transfer": seg_tr, "river": riv_t.mean(0),
+               "overclaim": overclaim, "audited": audited, "report_tr": settle}
         carry = (st, ob, rng, agreed | newly, jnp.where(newly, offer, locked),
-                 cum_r + seg_base + seg_tr, cum_c + seg_cl,
+                 cum_r + seg_base + seg_tr + settle, cum_c + seg_cl,
                  bg.normalise_theta(offer, contract.low, contract.high),
                  jnp.ones_like(had), nrej + (~agreed & ~passed).astype(jnp.int32),
                  riv_t[-1].astype(jnp.float32),
                  (votes.astype(bool) & ~mine).astype(jnp.float32),
-                 n_acc.astype(jnp.float32))
+                 n_acc.astype(jnp.float32),
+                 (~votes.astype(bool) & ~mine).astype(jnp.float32))
         return carry, rec
 
     z_e = jnp.zeros((num_envs,), jnp.float32)
@@ -163,7 +192,8 @@ def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed):
             jnp.full((num_envs,), contract.null),
             jnp.zeros((n, num_envs), jnp.float32), jnp.zeros((n, num_envs), jnp.float32),
             z_e, jnp.zeros((num_envs,), bool), jnp.zeros((num_envs,), jnp.int32), z_e,
-            jnp.zeros((n, num_envs), jnp.float32), z_e)
+            jnp.zeros((n, num_envs), jnp.float32), z_e,
+            jnp.zeros((n, num_envs), jnp.float32))
     _, rec = jax.lax.scan(round_, init, jnp.arange(K))
     return jax.tree.map(np.asarray, rec), K
 
@@ -237,7 +267,9 @@ def gini_equality(v, axis=0):
 
 def report(rec, K, cfg, contract, n, num_steps):
     x = cfg["segment"]
-    ret = (rec["base"] + rec["transfer"]).sum(0)               # (N, E) episode return
+    # Episode return includes the claim settlements when the run has them --
+    # rec["report_tr"] is identically zero otherwise.
+    ret = (rec["base"] + rec["transfer"] + rec["report_tr"]).sum(0)    # (N, E)
     welfare = ret.sum(0)                                        # (E,)
     equality = gini_equality(ret, axis=0)
     contracted = rec["theta_eff"] > contract.null + 1e-9        # (K, E)
@@ -294,6 +326,31 @@ def report(rec, K, cfg, contract, n, num_steps):
         print(f"  theta agreed      {t.mean():.4f} +- {t.std():.4f}   "
               f"[{t.min():.3f}, {t.max():.3f}]")
     print(f"  steps uncontracted {(~contracted).sum(0).mean() * x:.0f} of {num_steps}")
+
+    if cfg.get("report"):
+        p_a, lam = cfg["report_audit_p"], cfg["report_fine_mult"]
+        lam_star = reporting.honesty_threshold(p_a)
+        side = "lying has NEGATIVE EV" if lam > lam_star else "lying has POSITIVE EV"
+        blk("claims and audits  (payment on reported cleaning)")
+        print(f"  audit p={p_a:g}  fine x{lam:g}  honesty needs fine > "
+              f"{lam_star:.2f}  ->  {side}")
+        w = contracted.astype(np.float32)                        # (K, E) in force
+        n_claims = np.maximum(w.sum(), 1.0)
+        oc = rec["overclaim"]                                    # (K, N, E)
+        paid = oc * ~rec["audited"] * rec["theta_eff"][:, None, :]
+        fined = (oc * rec["audited"] * rec["theta_eff"][:, None, :]
+                 * lam)
+        print(f"  mean overclaim/claim  {(oc * w[:, None, :]).sum() / (n_claims * n):.3f}"
+              f"   (cap {cfg['report_max_overclaim']:g})")
+        print(f"  leakage /episode      {paid.sum() / oc.shape[-1]:.1f}   "
+              f"fines /episode {fined.sum() / oc.shape[-1]:.1f}")
+        print(f"  {'agent':<7}{'overclaim':>11}{'true clean/win':>15}{'caught rate':>13}")
+        for i in range(n):
+            oc_i = (oc[:, i] * w).sum() / n_claims
+            cl_i = (rec["cleaned"][:, i] * w).sum() / n_claims
+            lied = (oc[:, i] > 0.5) & (w > 0)
+            caught = (lied & rec["audited"][:, i]).sum() / max(lied.sum(), 1)
+            print(f"  A{i:<6}{oc_i:>11.3f}{cl_i:>15.2f}{caught:>13.3f}")
 
     blk("offers by round  (do proposers concede as the episode shrinks?)")
     print(f"  {'round':>6}{'offers':>8}{'mean theta':>12}{'accepted':>10}{'accept rate':>13}")
@@ -367,6 +424,13 @@ def main():
                         "supply them explicitly for those.")
     p.add_argument("--bargain-segment", type=int, default=None,
                    help="override the _seg<N> read from the checkpoint name")
+    p.add_argument("--report-audit-p", type=float, default=None)
+    p.add_argument("--report-fine-mult", type=float, default=None)
+    p.add_argument("--report-max-overclaim", type=float, default=None,
+                   help="claims-and-audits parameters, needed only for runs with "
+                        "_claim_ checkpoints. Read from the .run.yaml sidecar when "
+                        "it has one; these flags override it. A mismatch replays a "
+                        "different enforcement regime than the one trained.")
     p.add_argument("--env-kwarg", action="append", default=[], metavar="KEY=VALUE")
     args = p.parse_args()
 
@@ -413,7 +477,33 @@ def main():
         print("  [warning] no .run.yaml sidecar and no --contract-low/--contract-high: "
               "this is a GUESS. If the run was not trained on this range, every theta "
               "below is rescaled and the numbers are wrong.")
-    rec, K = rollout(env, gp, bp, contract, cfg, args.episodes, args.num_steps, args.seed)
+
+    # Claims-and-audits runs leave `_claim_` checkpoints beside the others. When
+    # they exist the enforcement layer replays too -- silently evaluating such a
+    # run under perfect enforcement would report a mechanism it never trained.
+    claim_paths = [q.replace("_contract_", "_claim_") for q in moca["contract_paths"]]
+    cp = None
+    if all(Path(q).exists() for q in claim_paths):
+        run_cfg = load_run_config(args.checkpoint) or {}
+        report_params = {}
+        for key, flag in (("report_audit_p", args.report_audit_p),
+                          ("report_fine_mult", args.report_fine_mult),
+                          ("report_max_overclaim", args.report_max_overclaim)):
+            val = flag if flag is not None else run_cfg.get(key.upper())
+            if val is None:
+                raise SystemExit(
+                    f"this run has _claim_ checkpoints but {key.upper()} is not in "
+                    f"its .run.yaml sidecar and --{key.replace('_', '-')} was not "
+                    f"given. Refusing to guess an enforcement regime.")
+            report_params[key] = float(val)
+        cfg.update(report_params, report=True)
+        cp = [load_params(q) for q in claim_paths]
+        print(f"claims: audit p={cfg['report_audit_p']:g}, fine x"
+              f"{cfg['report_fine_mult']:g}, overclaim cap "
+              f"{cfg['report_max_overclaim']:g}")
+
+    rec, K = rollout(env, gp, bp, contract, cfg, args.episodes, args.num_steps,
+                     args.seed, cp=cp)
     report(rec, K, cfg, contract, n, args.num_steps)
 
 

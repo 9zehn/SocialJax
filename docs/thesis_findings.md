@@ -242,6 +242,39 @@ probes (10%, of which 20% null), null offers never lock, range [0, 3]. **[OURS]*
   lottery widening with the range, not the mechanism regressing — per-proposer
   outcomes, not means, are the informative view.
 
+### Counterfactual-vote run ([0,3], cf advantage + bias 0.5) — 2026-08-12
+
+**[OURS, from wandb + probe_votes + evaluate_bargain, 40 episodes]**
+
+- **First genuine bargaining dynamics.** Mid-training crisis (updates ~60–90):
+  a rejection wave crashed accept_count to 4 and in_force to ~0.3, and offers
+  were forced UP from ~1.5 to ~2.4, where acceptance recovered — rejection-driven
+  concession, the alternating-offers mechanism visibly functioning for the first
+  time. Eval: R0 acceptance 0.60 (was 0.725), 40% of episodes reach R1–R4,
+  lowball locks down to 12% pass. Agreement still 100%.
+- **But it settled past the welfare peak, and the rent dissipated by entry.**
+  θ̄≈2.1–2.4 pulled a FOURTH agent into cleaning (A3/A4/A5/A6; welfare 2167 vs
+  ~2500–2650 in interior-θ episodes; welfare peaks at θ∈[1,2] where A6 harvests
+  instead). The transfer pool is capped (θ·~1.02 cells/step) so entry splits it
+  more ways while foregone harvest shrinks the pie: cleaners earn 300 vs
+  harvesters' 322 — ratio 0.934, BELOW parity despite high θ. Classic
+  Gordon/Ostrom rent dissipation: high θ doesn't help cleaners as a class once
+  occupational entry is free. The agents' own interest should favour interior θ.
+- **Beliefs learned, policy didn't follow (the pre-registered failure mode).**
+  The lock−continue heads are coherent: harvesters A0/A2 hold NEGATIVE gaps at
+  every θ (locking worse than bargaining on) yet vote accept 0.86–0.92 —
+  belief/action mismatch 100% of the θ grid; the other five agents' positive
+  gaps are consistent with the now-brutal disagreement point (uncontracted
+  welfare/step 0.025). Mechanical suspect: `masked_standardise` CENTERS the
+  counterfactual advantage, but COMA's advantage is already self-baselined —
+  centering a one-signed advantage (policy systematically wrong) strips most of
+  the level signal and leaves only the slope, exactly matching the data (slopes
+  formed, acceptance level stuck ~0.9, and PPO's clip caps the rare big
+  reject-reinforcements that centering creates). Fix: scale by std only.
+- **Unanimity verdict:** it is not muting anyone — it grants A0/A2 a full veto
+  they are not using. Majority quorum would WEAKEN harvester vetoes (cleaner
+  offers pass 4/6 without them). Keep unanimity; fix the mismatch.
+
 ## D. The vote-blindness defect and the fix (2026-08-12)
 
 - **Root cause of both degenerate equilibria:** features are built *before* the

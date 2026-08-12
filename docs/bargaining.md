@@ -86,6 +86,15 @@ baseline cannot credit a rejection against the size of the offer that was refuse
   Gaussian's rather than a Bernoulli's, and the product over ν voters conflates "I
   accept" with "the contract passes".
 
+`BARGAIN_PROPOSER=holdout` is the arm that sharpens the rotation further: the next
+proposer is drawn uniformly among **last round's rejecters** (random recognition
+when there are none — round 0, or a passed null offer). In Rubinstein's two-player
+game the refuser *is* the next proposer; rotation only approximates that with seven
+players, leaving rejection's payoff two coordinated moves away (reject, then hope
+the rotation reaches you). Holdout collapses it to one: reject and you may hold the
+pen. Rejecting purely to farm proposal power is priced by the segment the rejection
+burns.
+
 ### Randomised first mover
 
 `BARGAIN_ROTATE_START=random` draws the opening proposer once per episode per env.
@@ -245,6 +254,15 @@ on the rest (null-offer rounds included; they are pure continuation samples) —
 `BARGAIN_VF_COEF`, with `stop_gradient` between them and the policy. This is COMA's
 counterfactual baseline, specialised: with a binary action and a known pivot rule the
 marginalisation over the action space collapses to one comparison.
+
+The advantage is **scaled to unit RMS, never centred** (`bargain.masked_scale`).
+A GAE advantage needs centring because its baseline is an estimate; the
+counterfactual advantage is already measured against its baseline — the other
+branch — so its batch mean is signal. The first cf run demonstrated the failure
+centring causes: harvesters held `lock − cont < 0` at every θ (correct beliefs)
+while their acceptance *level* sat untrained at ~0.9 with only a slope forming —
+centring a one-signed advantage strips exactly the level and leaves the slope,
+and PPO's clip truncates the rare large reject-reinforcements centring creates.
 
 Three consequences worth stating plainly:
 

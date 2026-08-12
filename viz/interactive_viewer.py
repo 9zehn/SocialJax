@@ -138,6 +138,7 @@ def infer_bargain_config(stem, checkpoint=None):
     seg = re.search(r"_seg(\d+)", stem)
     quorum = re.search(r"_q(majority|\d+)", stem)
     proposer = ("contribution" if "_contribution" in stem
+                else "holdout" if "_holdout" in stem
                 else "random" if "_random" in stem else "rotate")
     features = ("protocol" if "_protocol" in stem
                 else "public" if "_public" in stem else "private")
@@ -217,6 +218,7 @@ def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
     agreed, locked = False, float(contract.null)
     last_tn, had_offer, n_reject, river = 0.0, False, 0, 0.0
     last_votes, last_n_accept = np.zeros(n, np.float32), 0.0
+    last_rejecters = np.zeros(n, np.float32)
     step = 0
     num_rounds = max(1, int(np.ceil(num_steps / seg)))
 
@@ -229,7 +231,8 @@ def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
             rng, k_prop, k_theta, k_vote = jax.random.split(rng, 4)
             proposer = int(bg.proposer_for_round(
                 r, n, 1, cfg["proposer"], key=k_prop,
-                contributions=jnp.asarray(cum_clean)[:, None], start_offset=offset)[0])
+                contributions=jnp.asarray(cum_clean)[:, None], start_offset=offset,
+                holdouts=jnp.asarray(last_rejecters)[:, None])[0])
 
             def feats_at(live_tn, live):
                 return bg.bargaining_features(
@@ -281,6 +284,8 @@ def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
             last_votes = np.array([0.0 if i == proposer else float(v)
                                    for i, v in enumerate(votes)], np.float32)
             last_n_accept = float(n_accept)
+            last_rejecters = np.array([0.0 if i == proposer else 1.0 - float(v)
+                                       for i, v in enumerate(votes)], np.float32)
             if passed and theta_offer > contract.null + 1e-6:
                 agreed, locked = True, theta_offer
             elif passed:

@@ -491,6 +491,45 @@ def test_vote_floor_can_end_above_zero():
     assert np.isclose(float(bargain.vote_eps_at(0.05, 150, 100, end=0.02)), 0.02)
 
 
+def test_masked_scale_keeps_the_level():
+    """The counterfactual advantage is self-baselined, so a one-signed batch --
+    a policy that is systematically wrong -- carries its signal in the MEAN.
+    Scaling must leave the sign structure alone; standardising removes it, which
+    is the failure the cf-vote run exhibited."""
+    x = jnp.array([-7.0, -8.0, -6.0, -9.0, 123.0])
+    w = jnp.array([1.0, 1.0, 1.0, 1.0, 0.0])          # the 123 is masked out
+    scaled = np.asarray(bargain.masked_scale(x, w))
+    assert scaled[np.asarray(w) > 0].max() < 0.0, \
+        "one-signed input must stay one-signed"
+    rms = float(jnp.sqrt((jnp.square(scaled) * w).sum() / w.sum()))
+    assert np.isclose(rms, 1.0, atol=1e-3)
+    centred = bargain.masked_standardise(x, w)
+    assert abs(float((centred * w).sum())) < 1e-3, \
+        "standardise zeroes the mean -- the contrast this test documents"
+
+
+def test_holdout_proposer_draws_from_last_rounds_rejecters():
+    """Rejecting buys (a chance at) the pen: only last round's rejecters may
+    propose, and every rejecter can."""
+    n, envs = 5, 512
+    holdouts = jnp.zeros((n, envs)).at[1].set(1.0).at[3].set(1.0)
+    p = np.asarray(bargain.proposer_for_round(
+        2, n, envs, "holdout", key=jax.random.PRNGKey(0), holdouts=holdouts))
+    assert set(np.unique(p)) <= {1, 3}, np.unique(p)
+    assert (p == 1).any() and (p == 3).any()
+
+
+def test_holdout_without_rejecters_is_random_recognition():
+    """Round 0, or a passed null offer, leaves no holdouts: recognition falls
+    back to uniform rather than crashing or freezing on one agent."""
+    n, envs = 5, 2000
+    p = np.asarray(bargain.proposer_for_round(
+        0, n, envs, "holdout", key=jax.random.PRNGKey(1),
+        holdouts=jnp.zeros((n, envs))))
+    counts = np.bincount(p, minlength=n)
+    assert (counts > envs / n * 0.7).all(), counts
+
+
 # ------------------------------------------------------ checkpoint compatibility
 
 def test_stale_bargaining_checkpoints_are_refused_not_misread():
