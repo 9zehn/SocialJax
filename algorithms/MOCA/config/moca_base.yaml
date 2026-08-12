@@ -164,7 +164,15 @@
 # Initial logit on ACCEPT. Unanimity among 6 responders at an unbiased init fires
 # with probability 0.5**6 = 1.6%, so without a positive prior the contract is almost
 # never in force and the proposal head never sees a signal. 1.0 gives ~15%.
-"BARGAIN_ACCEPT_BIAS": 1.0
+# ABLATION (code default stays 1.0): halved, because its original job is now done
+# better elsewhere. It exists so unanimity is not stuck at 0.5^6 = 1.6% at a cold
+# start -- but scripted probes now supply offers to vote on regardless of what the
+# proposers do, and the null-pass rule means a rejected round is one segment rather
+# than a dead episode, so the proposal head no longer starves for want of signings.
+# What the +1.0 prior does still do is point the vote at exactly the always-accept
+# failure this whole line of work is trying to escape. 0.5 keeps a mild positive
+# prior without leaning on the outcome under investigation.
+"BARGAIN_ACCEPT_BIAS": 0.5
 "BARGAIN_HIDDEN": 64
 # Exploration floor on the vote at ROLLOUT time: accept probability is clipped into
 # [eps, 1-eps] when sampling, annealed linearly from BARGAIN_VOTE_EPS down to
@@ -198,6 +206,19 @@
 # keeps meeting theta=0 even once every episode agrees early, which is what keeps
 # the disagreement point (and with it the meaning of rejection) behaviourally real.
 "BARGAIN_PROBE_NULL_FRAC": 0.2
+# How the VOTE head is credited (the proposal head always uses the round GAE).
+#   "gae"            the shared round advantage. Everything up to 2026-08-12.
+#   "counterfactual" pivotality x (value if this offer locks - value of continuing),
+#                    COMA's counterfactual baseline specialised to a binary vote
+#                    under a counting quorum. Adds two value heads to the network,
+#                    so its checkpoints carry extra params (detected on load).
+# Why the switch: with the offer visible, exploration persistent and probes running,
+# the [0, 3] run's acceptance curves STILL flattened to a 0.021 spread. What was
+# left is credit assignment -- the shared advantage is dominated by the lump-sum
+# agreement reward and never isolates what one vote changed, and because the eps
+# floor mostly samples rejections of GOOD offers it actively teaches "rejecting is
+# bad". (Code default is "gae", same reason as the two knobs above.)
+"BARGAIN_VOTE_ADVANTAGE": "counterfactual"
 
 # Skip phase-1 training and run phase 2 against saved gameplay policies (a glob
 # matching one file per agent). This is what makes a protocol comparison

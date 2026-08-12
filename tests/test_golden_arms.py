@@ -67,6 +67,19 @@ ARMS = {
                 "BARGAIN_SEGMENT": 4, "BARGAIN_UPDATE_EPOCHS": 1},
 }
 
+# Run but NOT pinned: configurations whose numbers are expected to move while the
+# mechanism is being worked on, where the thing worth guarding is only that the path
+# runs and produces finite values. Pinning these would mean regenerating a golden
+# every time the experiment line changes, which trains the reflex the goldens exist
+# to prevent.
+SMOKE_ARMS = {
+    # Counterfactual vote credit, with probes on so that pivotality, null offers and
+    # scripted offers are all exercised in the same two updates.
+    "bargain_cf": {**ARMS["bargain"], "BARGAIN_VOTE_ADVANTAGE": "counterfactual",
+                   "BARGAIN_PROBE_FRAC": 0.5},
+}
+ALL_ARMS = {**ARMS, **SMOKE_ARMS}
+
 
 def _signature(arm_overrides):
     """A few scalars that depend on the whole pipeline: rollout, GAE, optimiser."""
@@ -106,8 +119,8 @@ def _signature_isolated(arm):
     """
     code = (
         "import json, sys; sys.path.insert(0, %r);"
-        "from tests.test_golden_arms import _signature, ARMS;"
-        "print('@@' + json.dumps(_signature(ARMS[%r])))" % (ROOT, arm)
+        "from tests.test_golden_arms import _signature, ALL_ARMS;"
+        "print('@@' + json.dumps(_signature(ALL_ARMS[%r])))" % (ROOT, arm)
     )
     env = {**os.environ, "OMP_NUM_THREADS": "1", "PYTHONPATH": ROOT}
     p = subprocess.run([sys.executable, "-c", code], capture_output=True,
@@ -161,6 +174,21 @@ def test_bargain_arm_is_unchanged():
     _compare("bargain", _signature_isolated("bargain"), _load()["bargain"])
 
 
+def test_counterfactual_vote_credit_runs_end_to_end():
+    """Smoke, not a pin: the counterfactual path has two extra value heads, a
+    different advantage and a narrower mask, and all three only meet in a real
+    update. NaN is the realistic failure -- an empty pivotal mask divides by its own
+    weight sum -- so finiteness is the assertion that matters."""
+    sig = _signature_isolated("bargain_cf")
+    bad = {k: v for k, v in sig.items() if not np.isfinite(v)}
+    assert not bad, f"non-finite series under counterfactual credit: {bad}"
+    for key in ("metrics_joint/joint/cf/gap", "metrics_joint/joint/cf/pivotal_rate"):
+        assert key in sig, f"{key} was not logged: {sorted(sig)}"
+    # Under unanimity almost every consequential vote is pivotal, so a zero rate
+    # would mean the mask is wrong and the vote head is being trained on nothing.
+    assert sig["metrics_joint/joint/cf/pivotal_rate"] > 0.0
+
+
 def _update(names=()):
     """Repin `names` (default: all), leaving every other arm's values untouched.
 
@@ -182,7 +210,11 @@ if __name__ == "__main__":
         wanted = tuple(a for a in sys.argv[sys.argv.index("--update") + 1:]
                        if not a.startswith("-"))
         for bad in set(wanted) - set(ARMS):
-            raise SystemExit(f"unknown arm {bad!r} (have: {', '.join(ARMS)})")
+            extra = (" -- that is a SMOKE arm: it is run for finiteness, not pinned, "
+                     "because its numbers are expected to move"
+                     if bad in SMOKE_ARMS else "")
+            raise SystemExit(
+                f"cannot pin {bad!r}{extra} (pinnable: {', '.join(ARMS)})")
         _update(wanted)
         sys.exit(0)
     failed = 0

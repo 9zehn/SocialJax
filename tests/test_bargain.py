@@ -287,6 +287,148 @@ def test_advantage_is_standardised_over_active_rounds_only():
     assert np.isfinite(np.array(bargain.masked_standardise(a, jnp.zeros_like(w)))).all()
 
 
+# -------------------------------------------------- counterfactual vote credit
+
+def _pivotal(votes, proposer, quorum, n=None):
+    """pivotal_mask from a python vote list for one env. votes[i] in {0, 1}."""
+    n = n or len(votes)
+    v = jnp.array(votes, jnp.int32)[:, None]                     # (N, 1)
+    prop = jnp.array([proposer], jnp.int32)
+    is_prop = bargain.is_proposer_mask(prop, n)
+    _, n_accept = bargain.accepted(v.astype(bool), prop, quorum, n)
+    return np.array(bargain.pivotal_mask(n_accept, v, is_prop, quorum))[:, 0]
+
+
+def test_pivotality_under_unanimity():
+    """Under quorum=all every responder is a veto, so a responder is pivotal
+    exactly when all the OTHER responders accepted -- whichever way it voted."""
+    quorum = 3                             # unanimity among 4 agents' 3 responders
+    # A0 proposes; all three responders accept. Each of them is one-short-decisive:
+    # any single defection would have killed it.
+    assert list(_pivotal([0, 1, 1, 1], proposer=0, quorum=quorum)) == \
+        [False, True, True, True]
+    # A1 rejects, A2/A3 accept. A1 is still pivotal (its accept would have carried
+    # the offer); A2 and A3 are not -- the offer fails whatever they do.
+    assert list(_pivotal([0, 0, 1, 1], proposer=0, quorum=quorum)) == \
+        [False, True, False, False]
+    # Two rejections: nobody is pivotal, because no single vote changes the outcome.
+    assert not _pivotal([0, 0, 0, 1], proposer=0, quorum=quorum).any()
+    # The proposer is never pivotal even when it votes and its vote would tip a
+    # naive count -- `accepted` does not count it.
+    assert not _pivotal([1, 1, 1, 1], proposer=0, quorum=quorum)[0]
+
+
+def test_pivotality_at_an_integer_quorum():
+    """With quorum < all, being pivotal is a margin condition, not unanimity: it is
+    the voters at exactly quorum-1 others who decide, and nobody else."""
+    quorum = 3                             # 3 of 6 agents' 5 responders needed
+    # Exactly at the margin: 3 accepts. Each ACCEPTER is pivotal (withdrawing drops
+    # it to 2); the rejecters are not (joining would only take it to 4).
+    piv = _pivotal([0, 1, 1, 1, 0, 0], proposer=0, quorum=quorum)
+    assert list(piv) == [False, True, True, True, False, False]
+    # One BELOW the margin: 2 accepts. Now the rejecters are the pivotal ones --
+    # any of them could carry it -- and the accepters are not.
+    piv = _pivotal([0, 1, 1, 0, 0, 0], proposer=0, quorum=quorum)
+    assert list(piv) == [False, False, False, True, True, True]
+    # Comfortably above the margin: 5 accepts, quorum 3. No single vote matters.
+    assert not _pivotal([0, 1, 1, 1, 1, 1], proposer=0, quorum=quorum).any()
+
+
+def test_only_consequential_votes_reach_the_gradient():
+    """Four exclusions, and the vote loss weights every term by this mask, so a zero
+    here is a gradient of exactly zero -- not a small one."""
+    on = dict(active=1.0, is_proposer=0.0, offer_null=0.0, pivotal=1.0)
+    assert float(bargain.vote_credit_mask(**on)) == 1.0
+    for excluded, value in (("active", 0.0),        # round is post-agreement
+                            ("is_proposer", 1.0),   # proposer casts no counted vote
+                            ("offer_null", 1.0),    # both votes lead to the same place
+                            ("pivotal", 0.0)):      # the vote changed nothing
+        assert float(bargain.vote_credit_mask(**{**on, excluded: value})) == 0.0, \
+            excluded
+    # Pivotality is opt-in: the `gae` mode passes no pivotal and keeps every
+    # consequential vote, which is the behaviour every run before this change had.
+    assert float(bargain.vote_credit_mask(active=1.0, is_proposer=0.0,
+                                          offer_null=0.0)) == 1.0
+
+
+def test_counterfactual_advantage_signs_the_action_by_its_own_branch():
+    """The whole point: accepting an offer that is worse than bargaining on must
+    produce a NEGATIVE advantage, which is what pushes p(accept) down. The
+    correlational advantage could not express this -- it only knew the round went
+    well or badly on average."""
+    piv = jnp.ones((4, 1))
+    lock, cont = jnp.full((4, 1), 3.0), jnp.full((4, 1), 5.0)   # lock is worse
+    vote = jnp.array([[1], [0], [1], [0]])                      # accept/reject/...
+    adv = np.array(bargain.counterfactual_vote_advantage(vote, lock, cont, piv))
+    # Accepting a bad offer is punished; refusing it is rewarded, by the same size.
+    assert adv[0, 0] == -2.0 and adv[1, 0] == +2.0
+    # Flip which branch is better and every sign flips with it.
+    adv = np.array(bargain.counterfactual_vote_advantage(vote, cont, lock, piv))
+    assert adv[0, 0] == +2.0 and adv[1, 0] == -2.0
+
+
+def test_non_pivotal_votes_carry_no_credit():
+    """A vote that changed nothing has a true counterfactual of exactly zero, so any
+    credit it collects is noise fitted to what other agents happened to do."""
+    lock, cont = jnp.full((3, 1), 10.0), jnp.zeros((3, 1))
+    vote = jnp.ones((3, 1), jnp.int32)
+    piv = jnp.array([[1.0], [0.0], [1.0]])
+    adv = np.array(bargain.counterfactual_vote_advantage(vote, lock, cont, piv))
+    assert adv[1, 0] == 0.0 and adv[0, 0] == 10.0 and adv[2, 0] == 10.0
+
+
+def test_the_branch_heads_get_no_policy_gradient():
+    """They are fitted by their own regression targets. If the policy gradient
+    reached them, an agent could lower its loss by revising its beliefs about what
+    an offer is worth instead of revising what it does about it."""
+    def loss(values):
+        lock, cont = values
+        return bargain.counterfactual_vote_advantage(
+            jnp.ones((2, 1), jnp.int32), lock, cont, jnp.ones((2, 1))).sum()
+
+    g = jax.grad(loss)((jnp.zeros((2, 1)), jnp.ones((2, 1))))
+    assert np.array(g[0]).sum() == 0.0 and np.array(g[1]).sum() == 0.0
+
+
+def test_return_to_go_is_exact_at_the_round_that_locks():
+    """The lock head's target. At an agreeing round the semi-MDP reward already
+    holds every remaining segment and later rounds are inactive, so the sum from
+    there is that round's reward -- a realised sample of the lock branch."""
+    # Rounds 0-1 active, agreement at 1 (reward 30 = its segment + all the rest).
+    rewards = jnp.array([[1.0], [30.0], [0.0], [0.0]])
+    active = jnp.array([[1.0], [1.0], [0.0], [0.0]])
+    rtg = np.array(bargain.return_to_go(rewards, active))[:, 0]
+    assert rtg[1] == 30.0, "the locking round's target is its own lump sum"
+    assert rtg[0] == 31.0, "before it, the realised continuation includes it"
+    assert rtg[2] == 0.0 and rtg[3] == 0.0, "inactive rounds contribute nothing"
+
+
+def test_aux_heads_are_absent_unless_asked_for():
+    """The compatibility guarantee the golden arms rest on: with the flag off the
+    module is what it was before the heads were written, parameter for parameter."""
+    x = jnp.zeros((1, bargain.feature_dim(3)))
+    plain = BargainingActorCritic().init(jax.random.PRNGKey(0), x)
+    withaux = BargainingActorCritic(aux_heads=True).init(jax.random.PRNGKey(0), x)
+    assert not bargain.params_have_aux_heads(plain)
+    assert bargain.params_have_aux_heads(withaux)
+    # Every pre-existing parameter is bit-identical, so an old checkpoint loads into
+    # the new module and a new one is detectable by key alone.
+    for key, leaf in plain["params"].items():
+        assert key in withaux["params"], f"{key} vanished"
+        assert jax.tree_util.tree_all(jax.tree.map(
+            lambda p, q: bool((p == q).all()), leaf, withaux["params"][key])), key
+    assert set(withaux["params"]) - set(plain["params"]) == {
+        "lock_hidden", "lock_out", "cont_hidden", "cont_out"}
+    # And asking for values a module was not built with fails loudly rather than
+    # silently unpacking the wrong thing.
+    try:
+        BargainingActorCritic().apply(plain, x, return_aux=True)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("return_aux without aux_heads should raise")
+
+
 # ------------------------------------------------------------ the vote's floor
 
 def _vote_rate(bias, eps, draws=4000):

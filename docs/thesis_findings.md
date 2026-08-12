@@ -202,6 +202,46 @@ mechanism *did* learn offer-conditioned voting. **[OURS, from evaluate_bargain]*
   checkpoint stem collides with the pre-fix seed-42 veto-dictator run — keep
   directories separated in runs/notes.yaml.
 
+### The [0, 3] run with floor + probes + null-pass rule (40 episodes) — 2026-08-12
+
+Same protocol plus: persistent vote floor (`BARGAIN_VOTE_EPS_END=0.02`), scripted
+probes (10%, of which 20% null), null offers never lock, range [0, 3]. **[OURS]**
+
+- **Parity reached for the first time: cleaner:harvester return ratio 1.011**
+  (0.890 → 0.909 → 1.011 across the three runs) at agreed θ̄=2.42. With room
+  above the old ceiling, negotiated redistribution fully compensates cleaning —
+  no fairness axiom anywhere.
+- **First bilateral discipline signal**: harvesters A0/A3/A4 now show a
+  *downward* p(accept) slope toward θ=3 (~0.99 → 0.97) while cleaners slope up —
+  both rejection regions predicted for a widened range exist, in the right
+  agents.
+- **The θ-welfare relationship inverted at the top: θ=3 overshoots.** θ=3
+  episodes average ~2,500 welfare; interior-θ episodes (0.67–1.9) reach
+  2,800–2,870. Cleaning is capped either way (~1.03); the cost is labour
+  diversion — at θ=3 a fourth agent (A3, 0.127 clean/step) is pulled toward the
+  river to chase transfer income, and foregone harvesting rots. Meanwhile
+  equality is best near θ≈2–3 and collapses at low θ (0.57–0.78). **The contract
+  space now brackets a genuine welfare/equality trade-off, and the agreed
+  θ̄=2.42 sits on the equality side of it.** Role composition responds to θ: A6
+  flipped harvester→cleaner between runs.
+- **But the vote FLATTENED: spread 0.021 (was 0.054), minimum p(accept) 0.893.**
+  Correlation with θ stays +0.97, magnitude shrank. Floor and probes supplied
+  the data (13 sub-0.5 offers in the eval alone), so *exploration and
+  representation are no longer the constraint — credit assignment is*: the vote
+  advantage is correlational, swamped by the lump-sum agreement reward, and
+  never isolates "what did MY vote change". Proposers remain a random
+  dictatorship over a wider, costlier range: cleaners corner at 3.0 (27 carried),
+  harvesters lowball (13 carried), welfare 2555±219 and equality 0.834±0.101
+  both below the [0.2, 2] run.
+- **New exploit at the null boundary**: exact θ=0 is a no-lock pass, but θ=0+ε
+  locks — and locks happened at θ=0.021 and 0.071 (episodes 17, 39; equality
+  0.57–0.59). One notch above the pass move buys an episode of uncompensated
+  cleaning. The principled fix is a vote that rejects it (the stake is the
+  largest in the whole range); the design wart should be named in the write-up.
+- Aggregate caution as before: the welfare/equality dip vs run4 is the dictator
+  lottery widening with the range, not the mechanism regressing — per-proposer
+  outcomes, not means, are the informative view.
+
 ## D. The vote-blindness defect and the fix (2026-08-12)
 
 - **Root cause of both degenerate equilibria:** features are built *before* the
@@ -247,9 +287,23 @@ mechanism *did* learn offer-conditioned voting. **[OURS, from evaluate_bargain]*
 - **Reserve levers if round-0 unanimity survives the fix:** recognition-by-holdout
   (rejecters draw the next proposal slot), curriculum opponents (scripted tough
   responders / lowball proposers, annealed out), sequential polled voting (kills
-  the all-reject equilibrium and non-pivotality), COMA-style counterfactual vote
-  baseline (cheap under unanimity: flipping one vote deterministically flips the
-  outcome), a grounded counteroffer signal attached to rejections.
+  the all-reject equilibrium and non-pivotality), a grounded counteroffer signal
+  attached to rejections.
+- **COMA-style counterfactual vote credit — no longer in reserve, built
+  2026-08-12** (`BARGAIN_VOTE_ADVANTAGE=counterfactual`). The [0, 3] run above
+  isolated credit assignment as the remaining binding constraint, so this was
+  commissioned rather than held: each vote is now credited with
+  pivotality × (value if this offer locks − value of continuing), from two learned
+  branch heads, and non-pivotal votes are masked out of the policy gradient
+  entirely. Cheap under unanimity exactly as anticipated — one comparison, no
+  marginalisation. Shipped alongside the `BARGAIN_ACCEPT_BIAS` 1.0 → 0.5 ablation,
+  since probes and the null-pass rule now do most of what the accept prior was
+  for, while the prior itself leans toward the failure under study. Success
+  signature to check on the next run: θ-sweep curves with genuine 0.5 crossings
+  (cleaners low, harvesters high at [0, 3]), and `joint/cf/gap` turning negative on
+  lowballs. Failure signature worth naming in advance: p(accept) flat while the
+  believed gap is correctly signed would mean the branch heads learned the right
+  thing and the policy still did not act on it.
 
 ## F. Standing methodological cautions
 

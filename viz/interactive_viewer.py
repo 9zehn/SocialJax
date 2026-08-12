@@ -191,8 +191,11 @@ def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
 
     n = env.num_agents
     net = ContractActorCritic(action_dim=env.action_space().n, activation="relu")
+    # aux_heads comes from the weights themselves: a counterfactual-trained run has
+    # extra params, and flax needs the module to match what it is handed.
     bnet = BargainingActorCritic(hidden=cfg.get("hidden", 64), activation="relu",
-                                 accept_bias=cfg.get("accept_bias", 1.0))
+                                 accept_bias=cfg.get("accept_bias", 1.0),
+                                 aux_heads=bg.params_have_aux_heads(bargain_params[0]))
     mask = bg.feature_mask(cfg["features"], n)
     quorum = bg.quorum_size(cfg["quorum"], n)
     seg = int(cfg["segment"])

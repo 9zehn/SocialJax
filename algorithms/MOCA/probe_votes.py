@@ -106,8 +106,11 @@ def main():
     if not 0 <= args.round < K:
         raise SystemExit(f"--round must be in [0, {K - 1}] for {K} rounds")
     quorum = bg.quorum_size(cfg["quorum"], n)
+    # Read from the weights, so both a gae-trained and a counterfactual-trained
+    # checkpoint sweep with no flag from the user.
+    has_aux = bg.params_have_aux_heads(bp[0])
     bnet = BargainingActorCritic(hidden=cfg["hidden"], activation="relu",
-                                 accept_bias=cfg["accept_bias"])
+                                 accept_bias=cfg["accept_bias"], aux_heads=has_aux)
     mask = bg.feature_mask(cfg["features"], n)
 
     # One feature row per (proposer, theta) combination; e = p * G + g.
@@ -137,8 +140,14 @@ def main():
         zeros_e, mask)                                                    # (N, E, F)
 
     p_acc = np.zeros((n, n, G))                     # [responder, proposer, theta]
+    gap = np.zeros((n, n, G)) if has_aux else None  # lock value - continue value
     for i in range(n):
-        _, pi_vote, _ = bnet.apply(bp[i], feats[i])
+        if has_aux:
+            _, pi_vote, _, lock_v, cont_v = bnet.apply(bp[i], feats[i],
+                                                       return_aux=True)
+            gap[i] = np.asarray(lock_v - cont_v).reshape(n, G)
+        else:
+            _, pi_vote, _ = bnet.apply(bp[i], feats[i])
         p_acc[i] = np.asarray(pi_vote.probs[..., 1]).reshape(n, G)
 
     print(f"run: {moca['stem']}")
@@ -166,6 +175,35 @@ def main():
         print(f"  A{i}: p(accept) {curve.min():.3f}..{curve.max():.3f}  "
               f"slope {'+' if curve[-1] >= curve[0] else '-'}"
               f"{abs(curve[-1] - curve[0]):.3f}  crosses 0.5 at: {cross_s}")
+
+    if has_aux:
+        # What the agent BELIEVES the vote is worth, next to what it does about it.
+        # The gap is (value if this offer locks now) - (value of one more null
+        # segment and reopening), so its sign is the whole reservation-value
+        # question: negative means "I am better off bargaining on". Printed beside
+        # p(accept) because the two together separate wrong beliefs from right
+        # beliefs acted on wrongly -- an agent that knows a lowball hurts it and
+        # accepts anyway has a policy problem, not a value problem.
+        print("\nbelieved lock-continue value gap (negative = better to keep "
+              "bargaining), averaged over proposers")
+        print("  theta " + "".join(f"{f'A{i}':>8}" for i in range(n)))
+        for g, th in enumerate(thetas):
+            cells = "".join(f"{gap[i, resp[i], g].mean():>8.2f}" for i in range(n))
+            print(f"  {th:5.2f} {cells}")
+        print("\n  agreement between belief and vote, per responder")
+        for i in range(n):
+            curve = p_acc[i, resp[i], :].mean(axis=0)
+            gcurve = gap[i, resp[i], :].mean(axis=0)
+            wants = gcurve > 0
+            # Where belief and action disagree: it thinks continuing is better yet
+            # still accepts (or the reverse). This is the quantity the
+            # counterfactual advantage is meant to drive to zero.
+            mismatch = np.mean(wants != (curve > 0.5))
+            zero = crossings(thetas, gcurve, level=0.0)
+            zero_s = ", ".join(f"{c:.2f}" for c in zero) if zero else "none"
+            print(f"  A{i}: gap {gcurve.min():+.2f}..{gcurve.max():+.2f}  "
+                  f"indifferent at: {zero_s}   "
+                  f"belief/action mismatch {mismatch:.0%} of the grid")
 
     if args.by_proposer:
         for pr in range(n):

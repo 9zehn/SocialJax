@@ -340,7 +340,141 @@ def vote_eps_at(base: float, update_step, num_updates: int, end: float = 0.0):
         frac, 0.0, 1.0)
 
 
+# ------------------------------------------- counterfactual credit for the vote
+#
+# The vote head was trained on the shared round-GAE advantage, and that advantage
+# answers the wrong question. It is dominated by the lump-sum agreement reward --
+# the round that locks books every remaining segment at once -- so it says "this
+# round went well", not "MY vote made it go well". A responder whose vote changed
+# nothing collects the same credit as the one who was actually pivotal.
+#
+# It is worse than merely noisy, because the noise has a sign. The eps floor
+# samples rejections uniformly, but the offers on the table are not uniform: most
+# rounds carry an offer good enough to be accepted by everyone else, so a floored
+# rejection usually lands on a GOOD offer, delays it by a segment, and is punished.
+# Correlational credit therefore teaches "rejecting is bad" from the exploration
+# that was supposed to teach when rejecting is good -- which is what the theta
+# sweep saw: every slope the right sign, all of them ~5-10x too flat to discipline
+# a proposer.
+#
+# The counterfactual is exact and cheap here, because the vote is binary and the
+# quorum is a counting rule: agent i changes the outcome iff exactly quorum-1 of
+# the OTHERS accepted, and what it changes is the whole branch -- lock this offer
+# now, or play a null segment and reopen. Two learned branch values give the
+# difference directly. This is COMA's counterfactual baseline, specialised: with a
+# binary action and a known pivot rule the marginalisation is a single comparison
+# rather than a sum over the action space.
+
+def pivotal_mask(n_accept, vote, is_proposer, quorum: int) -> jnp.ndarray:
+    """(N, E) bool: whose vote actually decided the round.
+
+    Agent i is pivotal iff the other counted votes sit exactly one short of the
+    quorum -- then i accepting carries the offer and i rejecting kills it. Under
+    `BARGAIN_QUORUM=all` that means every other responder accepted, which is the
+    common case precisely because unanimity makes everyone a veto.
+
+    The proposer is never pivotal: its vote is not counted (see `accepted`).
+
+    Args:
+        n_accept: (..., E) counted accepts in the round, from `accepted`.
+        vote: (..., N, E) each agent's vote, 0/1.
+        is_proposer: (..., N, E) bool, from `is_proposer_mask`.
+        quorum: how many non-proposers must accept.
+
+    Returns:
+        (..., N, E) bool. Leading axes broadcast, so this takes one round or a
+        whole (K, N, E) block of them.
+    """
+    counted = jnp.asarray(vote, jnp.int32) * (~is_proposer).astype(jnp.int32)
+    others = jnp.expand_dims(jnp.asarray(n_accept, jnp.int32), -2) - counted
+    return (others == quorum - 1) & ~is_proposer
+
+
+def vote_credit_mask(active, is_proposer, offer_null, pivotal=None):
+    """Weight on each agent's vote in the policy gradient. Zero means EXCLUDED.
+
+    Every exclusion here is a case where the vote had no consequence, so training on
+    it would fit noise:
+
+      inactive round   the contract was already agreed; nobody decided anything.
+      proposer         its vote is not counted (see `accepted`).
+      null offer       accepting and rejecting lead to the same place -- one
+                       uncontracted segment, negotiation reopens -- so the vote is
+                       outcome-free by construction.
+      not pivotal      (counterfactual credit only) the outcome is identical either
+                       way, so the true counterfactual is exactly zero.
+
+    Everything is elementwise and broadcasts, so this serves both the per-agent
+    (K, E) slice the loss works in and a whole (K, N, E) block for diagnostics.
+    """
+    w = (jnp.asarray(active, jnp.float32)
+         * (1.0 - jnp.asarray(is_proposer, jnp.float32))
+         * (1.0 - jnp.asarray(offer_null, jnp.float32)))
+    if pivotal is not None:
+        w = w * jnp.asarray(pivotal, jnp.float32)
+    return w
+
+
+def counterfactual_vote_advantage(vote, lock_value, cont_value,
+                                  pivotal) -> jnp.ndarray:
+    """What each agent's vote was worth to it, in its own returns.
+
+    A_i = 1{pivotal} * direction * (lock - cont), where direction is +1 if i voted
+    accept (its action selected the lock branch) and -1 if it rejected (it selected
+    the continue branch). Reinforcing an action by its own branch difference is the
+    whole point: accepting a lowball where lock < cont now yields a NEGATIVE
+    advantage, so the accept probability falls -- the gradient the correlational
+    advantage never supplied.
+
+    Non-pivotal votes are zeroed rather than merely down-weighted. Their true
+    counterfactual really is zero (the outcome is identical either way), so any
+    non-zero credit they carry is pure noise fitted to other agents' choices.
+
+    Both branch values are stop-gradiented: this is a policy gradient for the vote,
+    and the heads are fitted separately by their own regression targets. Letting it
+    flow back would let the policy lower its loss by moving its beliefs.
+    """
+    gap = jax.lax.stop_gradient(lock_value - cont_value)
+    direction = 2.0 * jnp.asarray(vote, jnp.float32) - 1.0
+    return direction * gap * jnp.asarray(pivotal, jnp.float32)
+
+
+def return_to_go(rewards, active):
+    """(K, ...) realised remaining return from each round on, gamma = 1.
+
+    The regression target for both branch heads. The semi-MDP structure makes this
+    exact rather than an approximation at the only rounds that matter: at a round
+    that LOCKS, `rewards` already carries every remaining segment and every later
+    round is inactive, so the sum from there is that round's reward alone -- a
+    realised sample of the lock branch. At a round that does not lock, the sum is
+    the realised continuation.
+
+    Args:
+        rewards: (K, ...) per-round reward, from the semi-MDP construction.
+        active: (K, ...) broadcastable mask of rounds where a decision was made.
+    """
+    masked = rewards * jnp.asarray(active, rewards.dtype)
+    return jnp.flip(jnp.cumsum(jnp.flip(masked, axis=0), axis=0), axis=0)
+
+
 # ------------------------------------------------------- checkpoint compatibility
+
+AUX_HEAD_KEY = "lock_out"     # the named Dense that only exists with aux heads
+
+
+def params_have_aux_heads(params) -> bool:
+    """Does this checkpoint carry the counterfactual branch value heads?
+
+    Read from the parameter tree rather than from a config flag or the sidecar, so
+    a checkpoint replays correctly with no user input either way -- flax needs the
+    module structure to match the params it is given, and getting that from the
+    params themselves is the only way that cannot be told a lie.
+    """
+    try:
+        return AUX_HEAD_KEY in params["params"]
+    except (KeyError, TypeError):
+        return False
+
 
 def params_shape(params) -> Tuple[Optional[int], Optional[int]]:
     """(input width, hidden width) of a saved bargaining policy's first layer."""

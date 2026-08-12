@@ -101,10 +101,20 @@ three heads: a Gaussian θ proposal, a Bernoulli vote, and a critic. Deliberatel
 **parallel to** the existing MOCA networks, not a modification of them: every
 pre-bargaining checkpoint keeps its exact load and replay path.
 
-`BARGAIN_ACCEPT_BIAS=1.0` puts a positive prior on accept. Unanimity among 6
-responders at an unbiased init fires with probability 0.5⁶ = 1.6%, so without it the
-contract is almost never in force and the proposal head never sees a signal. A +1.0
-logit lifts that to ~15%.
+Under `BARGAIN_VOTE_ADVANTAGE=counterfactual` it grows two more: `lock_value` and
+`cont_value`, off the same trunk. They are built **only** in that mode and appended
+after the critic, so with the default the parameter tree and its initialisation are
+bit-for-bit what they were before the heads were written. Which kind a checkpoint is
+gets read off the weights (`bargain.params_have_aux_heads`), never off a flag.
+
+`BARGAIN_ACCEPT_BIAS` puts a positive prior on accept. Unanimity among 6 responders
+at an unbiased init fires with probability 0.5⁶ = 1.6%, so without it the contract is
+almost never in force and the proposal head never sees a signal; +1.0 lifts that to
+~15%. The base yaml now runs it at **0.5** as an ablation: probes supply offers to
+vote on whatever the proposers do, and the null-pass rule means a failed round costs
+one segment rather than the episode, so the cold-start problem this was for is mostly
+handled elsewhere — while the prior itself points at exactly the always-accept
+failure under investigation. The code default stays 1.0.
 
 `BARGAIN_ENT_COEF=0.01` is non-zero, unlike the reference's negotiation stage, whose
 Gaussian supplies its own exploration through a learned scale. A Bernoulli vote
@@ -199,6 +209,74 @@ what the runs do — so normalising over the whole block would drag the mean tow
 and inflate the scale in proportion to how *quickly* the agents agreed, rather than
 how good the decision was.
 
+### Counterfactual credit for the vote (`BARGAIN_VOTE_ADVANTAGE`)
+
+The round advantage above answers the wrong question for a *vote*. It is dominated by
+the lump-sum agreement reward — the locking round books every remaining segment at
+once — so it says "this round went well", not "**my vote** made it go well". Every
+responder in a round collects the same signal, including the ones whose vote changed
+nothing.
+
+Worse, the noise has a sign. The ε floor samples rejections uniformly, but offers are
+not uniform: most rounds carry an offer good enough that everyone else accepts, so a
+floored rejection usually lands on a *good* offer, delays it by a segment, and is
+punished. The exploration meant to teach *when* refusing pays instead teaches that
+refusing costs. That is the [0, 3] run in
+[thesis_findings.md](thesis_findings.md): offer visible, exploration persistent,
+probes running, and the acceptance curves still flattened to a 0.021 spread with
+every slope the right sign and none of them steep enough to discipline anyone.
+
+`BARGAIN_VOTE_ADVANTAGE=counterfactual` replaces it with what the vote actually
+changed. The binary action and the counting quorum make the counterfactual exact
+rather than estimated:
+
+```
+others_accept = n_accept − (my own counted vote)
+pivotal_i     = (others_accept == quorum − 1)     # my vote decides, and only then
+direction_i   = +1 if I accepted, −1 if I rejected
+A_i           = pivotal_i · direction_i · (lock_value_i − cont_value_i)
+```
+
+`lock_value` and `cont_value` are two extra heads on the same trunk as the vote,
+estimating agent i's remaining return if this offer binds now versus if the round
+plays a null segment and bargaining reopens. Each is regressed on the return-to-go of
+the rounds where **that branch was realised** — `lock` on rounds that locked, `cont`
+on the rest (null-offer rounds included; they are pure continuation samples) — under
+`BARGAIN_VF_COEF`, with `stop_gradient` between them and the policy. This is COMA's
+counterfactual baseline, specialised: with a binary action and a known pivot rule the
+marginalisation over the action space collapses to one comparison.
+
+Three consequences worth stating plainly:
+
+- **Non-pivotal votes are masked out of the policy gradient entirely**, not
+  down-weighted. Their true counterfactual is zero, so any credit they carried was
+  noise fitted to what other agents happened to do. The entropy term keeps the wider
+  mask: a non-pivotal vote is still a vote the agent will cast again, and letting it
+  saturate for want of regularisation is how the always-accept equilibrium formed.
+- **Accepting a lowball now yields a negative advantage**, because `lock < cont` at a
+  bad offer, so the accept probability falls. This is the gradient the correlational
+  advantage could not express in any weight configuration.
+- **The branch values are only as good as their generalisation across branches.** At
+  a round that locked, the continuation value is a counterfactual never observed
+  there. What makes it estimable is that the *same* (θ, round) region gets visited in
+  both branches — which is exactly what the ε floor and the probes supply. The three
+  mechanisms are load-bearing together, and turning off the floor or the probes
+  degrades this too.
+
+The proposal head keeps the GAE advantage unchanged: a proposal has no pivotality and
+no branch structure. `round_gae` and the main critic are untouched.
+
+`BARGAIN_VOTE_ADVANTAGE=gae` is the code default and is exactly the pre-2026-08-12
+behaviour, down to the parameter tree — the branch heads are not built at all, so
+checkpoints from either mode load, and `params_have_aux_heads` tells the eval tools
+which they are holding.
+
+**Expected experimental signature** (not testable in CI): the θ-sweep curves in
+`probe_votes.py` steepen into genuine 0.5 crossings — cleaners refusing low, and at
+the [0, 3] range harvesters refusing high. `probe_votes` also prints the believed
+lock-continue gap beside p(accept), which separates *wrong beliefs* from *right
+beliefs acted on wrongly*.
+
 ## Training mode
 
 `TRAINING_MODE=joint` — one loop, nothing frozen, gameplay and bargaining learning
@@ -216,9 +294,16 @@ python algorithms/train.py --algo MOCA --env cleanup reward=individual \
   BARGAIN_SEGMENT=100 BARGAIN_PROPOSER=rotate BARGAIN_ROTATE_START=random \
   BARGAIN_QUORUM=all BARGAIN_FEATURES=private \
   BARGAIN_VOTE_EPS_END=0.02 BARGAIN_PROBE_FRAC=0.1 BARGAIN_PROBE_NULL_FRAC=0.2 \
+  BARGAIN_VOTE_ADVANTAGE=counterfactual BARGAIN_ACCEPT_BIAS=0.5 \
   CONTRACT_LOW=0.0 CONTRACT_HIGH=3.0 \
   SEED=55 +ENV_KWARGS.num_agents=7
 ```
+
+Everything on the third and fourth lines is the base yaml's current default, spelled
+out so the run's wandb config shows what it was. The code defaults are the *old*
+behaviour in every case (`gae`, no floor at the end, no probes, accept bias 1.0), so
+the yaml is what carries the experiment line and a config built in code — a test, a
+golden arm — is unaffected by it.
 
 The resolved config is written to `./checkpoints/moca/<stem>.run.yaml` at run start.
 **Download it along with the `.pkl` files** — it is what makes the run
@@ -293,15 +378,28 @@ ceiling of 2.0 — a corner solution — and even there cleaners barely reached 
 so the ceiling, not bargaining, was setting the split. The ceiling should be high
 enough that the agreed θ settles in the interior (3.0 for the current line), which
 also gives harvesters a genuine rejection region of their own at the top of the
-range. Held in reserve if thresholds stay soft: a counterfactual (COMA-style) vote
-advantage, forced-null exposure, and the phase-1 reconstruction, which sharpens the
-disagreement point by construction.
+range. Held in reserve if thresholds stay soft: forced-null exposure, and the phase-1
+reconstruction, which sharpens the disagreement point by construction.
 
-Distinguishing the two is now a table rather than an argument: the *voting vs the
+**The third cause is credit assignment, and it is what the [0, 3] run isolated.**
+With the offer visible, the floor persistent and probes running, the acceptance
+curves *still* flattened — spread 0.021, correlation with θ a healthy +0.97, slopes
+5–10× too small to make lowballing unprofitable. Since the data was there (13
+sub-0.5 offers in the eval alone), neither exploration nor representation was the
+binding constraint: the vote was being credited with the round's shared outcome
+rather than with its own effect, and the ε floor's rejections landed mostly on good
+offers, so correlational credit actively taught that refusing costs. That is what
+`BARGAIN_VOTE_ADVANTAGE=counterfactual` addresses — see *Counterfactual credit for
+the vote* above.
+
+Distinguishing these is now a table rather than an argument: the *voting vs the
 offer* block in `evaluate_bargain.py` reports accept rate and mean p(accept) binned
-by the θ on the table. A flat row means the agents **chose** not to condition on the
-offer — which, post-fix, is evidence about incentives. A downward slope is a
-reservation value, which is the mechanism working.
+by the θ on the table, `probe_votes.py` sweeps the vote head directly, and under
+counterfactual credit it also prints the believed lock-continue gap. A flat p(accept)
+row with a **correctly signed gap** is a policy that knows better and does not act on
+it — a credit or optimisation problem. A flat row with a flat gap is an agent that
+does not believe the offer matters, which points back at the environment and the
+disagreement point.
 
 Also watch for the entropy-collapse signature (welfare and `waste_cleared` to zero in
 one step, agents spamming one action). The cause — a negative learning rate under a
@@ -323,10 +421,13 @@ the feature vector went from `9 + N` to `12 + 2N`, so the first layer's weights 
 the wrong shape. To replay one, check out the commit recorded in its sidecar. Nothing
 is lost, but nothing is silently reinterpreted either.
 
-Also watch for the entropy-collapse signature (welfare and `waste_cleared` to zero in
-one step, agents spamming one action). The cause — a negative learning rate under a
-shortened budget — is fixed in `62bac84`, and policy entropy is now logged so it is
-visible in wandb rather than only post mortem.
+The counterfactual branch heads are **not** a version bump — the feature layout and
+the protocol are unchanged, only the loss and the parameter tree. A
+counterfactual-trained checkpoint simply carries four extra parameter groups, and
+every replay tool infers their presence from the weights themselves
+(`params_have_aux_heads`) before building the network. So both kinds of checkpoint
+replay with no flags, in either direction, and there is nothing for a user to get
+wrong.
 
 ## Related literature
 

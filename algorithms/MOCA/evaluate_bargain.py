@@ -59,8 +59,12 @@ def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed):
     """
     n = env.num_agents
     net = ContractActorCritic(env.action_space().n, activation="relu")
+    # Whether the run trained the counterfactual branch heads is read off the
+    # weights, not off a flag: flax needs the module structure to match the params,
+    # and the params are the one source that cannot be out of date.
     bnet = BargainingActorCritic(hidden=cfg["hidden"], activation="relu",
-                                 accept_bias=cfg["accept_bias"])
+                                 accept_bias=cfg["accept_bias"],
+                                 aux_heads=bg.params_have_aux_heads(bp[0]))
     mask = bg.feature_mask(cfg["features"], n)
     quorum = bg.quorum_size(cfg["quorum"], n)
     x, K = cfg["segment"], num_steps // cfg["segment"]

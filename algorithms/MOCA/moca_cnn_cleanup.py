@@ -206,7 +206,22 @@ JOINT_BARGAIN_METRICS = {
     # The vote's exploration floor, annealing to 0. Worth a series because it says
     # how much of the accept rate above is still the floor rather than the policy.
     "vote_eps": "health/vote_eps",
+    # Counterfactual credit for the vote. Always logged (0 under
+    # BARGAIN_VOTE_ADVANTAGE=gae, where no branch heads exist) rather than
+    # conditionally present, so one wandb view covers both modes and a run that
+    # silently fell back to gae is visible as a flat zero.
+    #   cf/gap      believed lock-minus-continue value, over consequential votes.
+    #               Its SIGN is the mechanism: negative means "this offer is worse
+    #               for me than bargaining on", which is what a rejection needs.
+    #   cf/pivotal_rate  fraction of those votes that actually decided the round.
+    #               Under unanimity this is high by construction; if it collapses,
+    #               the vote head is being trained on very little.
+    "cf_gap": "cf/gap",
+    "cf_pivotal_rate": "cf/pivotal_rate",
 }
+
+# How the vote head's advantage is computed. See bargain.counterfactual_vote_advantage.
+VOTE_ADVANTAGE_MODES = ("gae", "counterfactual")
 
 
 def _select(metrics: dict, allowed: Tuple[str, ...]) -> dict:
@@ -410,6 +425,18 @@ def make_train(config):
                 f"BARGAIN_PROBE_NULL_FRAC is the fraction OF PROBES that offer the "
                 f"null contract, so it must be in [0, 1]. Got "
                 f"{config['BARGAIN_PROBE_NULL_FRAC']!r}.")
+        # How the VOTE head is credited. The proposal head keeps the GAE advantage
+        # either way -- a proposal has no pivotality and no branch structure.
+        config.setdefault("BARGAIN_VOTE_ADVANTAGE", "gae")
+        if config["BARGAIN_VOTE_ADVANTAGE"] not in VOTE_ADVANTAGE_MODES:
+            raise ValueError(
+                f"BARGAIN_VOTE_ADVANTAGE must be one of "
+                f"{', '.join(VOTE_ADVANTAGE_MODES)}; got "
+                f"{config['BARGAIN_VOTE_ADVANTAGE']!r}. 'gae' is the shared round "
+                f"advantage (the default, and what every run before 2026-08-12 "
+                f"used); 'counterfactual' credits each vote with pivotality x "
+                f"(lock value - continue value) and adds two value heads to the "
+                f"bargaining network.")
         # Recorded so a replay tool can refuse a checkpoint it cannot read, rather
         # than reading it as a mechanism that was never trained.
         config["BARGAIN_FEATURE_VERSION"] = bargain.FEATURE_VERSION
@@ -626,11 +653,16 @@ def make_train(config):
 
         # Rubinstein bargaining policies. Built unconditionally (cheap, and keeps the
         # PRNG stream identical across modes) but only trained under TRAINING_MODE=joint.
+        # The branch value heads exist only where they are used: with
+        # BARGAIN_VOTE_ADVANTAGE=gae the module is exactly what it was before they
+        # were written, down to the parameter tree.
+        cf_vote = config.get("BARGAIN_VOTE_ADVANTAGE", "gae") == "counterfactual"
         bargain_net = [
             BargainingActorCritic(
                 hidden=int(config.get("BARGAIN_HIDDEN", 64)),
                 activation=config["ACTIVATION"],
                 accept_bias=float(config.get("BARGAIN_ACCEPT_BIAS", 1.0)),
+                aux_heads=cf_vote,
             )
             for _ in range(num_agents)
         ]
@@ -1588,14 +1620,30 @@ def make_train(config):
                 rounds["terminal"][:, None, :],
                 config["BARGAIN_GAMMA"], config["BARGAIN_GAE_LAMBDA"])
 
+            # Realised remaining return per round, the regression target for both
+            # branch heads, and who was actually pivotal. Only built in the mode
+            # that uses them, so the `gae` path is untouched arithmetic-for-
+            # arithmetic.
+            rtg = None
+            if cf_vote:
+                rtg = bargain.return_to_go(rounds["reward"],
+                                           rounds["active"][:, None, :])
+                rounds["pivotal"] = bargain.pivotal_mask(
+                    rounds["n_accept"], rounds["vote"], rounds["is_proposer"],
+                    quorum_b)
+
             def bargain_loss(params, i):
                 # rounds["feats"] holds each agent's DECISION-POINT state: the
                 # proposal pass for whoever proposed, the vote pass for everyone
                 # else. Recomputing log-probs from it is what keeps the PPO ratio
                 # exactly on-policy now that the two decisions are taken from
                 # different states.
-                pi_theta, pi_vote, value = bargain_net[i].apply(
-                    params, rounds["feats"][:, i])                  # (K, E, ...)
+                if cf_vote:
+                    pi_theta, pi_vote, value, lock_v, cont_v = bargain_net[i].apply(
+                        params, rounds["feats"][:, i], return_aux=True)
+                else:
+                    pi_theta, pi_vote, value = bargain_net[i].apply(
+                        params, rounds["feats"][:, i])              # (K, E, ...)
                 act = rounds["active"].astype(jnp.float32)          # (K, E)
                 # Over ACTIVE rounds only -- the rest of the block is structural
                 # zeros. Every term below is masked by `act`, so the garbage this
@@ -1605,28 +1653,39 @@ def make_train(config):
                 # A probe round replaced the proposer's offer with a scripted one,
                 # so its proposal was never acted on and must not be trained on --
                 # crediting it with the probe's consequences would teach the
-                # proposal head from offers it did not make. The votes on a probe
-                # were real decisions and train as usual -- EXCEPT on a null offer,
-                # where accepting and rejecting lead to the same place (one
-                # uncontracted segment, negotiation reopens), so the vote is
-                # outcome-free and training it would credit pure noise.
+                # proposal head from offers it did not make. Votes on a probe were
+                # real decisions and train as usual; what the VOTE excludes is in
+                # `vote_credit_mask`.
                 not_probe = 1.0 - rounds["is_probe"].astype(jnp.float32)
-                consequential = 1.0 - rounds["offer_null"].astype(jnp.float32)
                 w_prop = act * mine * not_probe
-                w_vote = act * (1.0 - mine) * consequential
+                w_vote = bargain.vote_credit_mask(act, mine, rounds["offer_null"])
                 eps = config["BARGAIN_CLIP_EPS"]
 
-                def clipped(logp, old_logp, w):
+                def clipped(logp, old_logp, w, adv):
                     ratio = jnp.exp(logp - old_logp)
                     obj = jnp.minimum(
-                        ratio * a, jnp.clip(ratio, 1.0 - eps, 1.0 + eps) * a)
+                        ratio * adv, jnp.clip(ratio, 1.0 - eps, 1.0 + eps) * adv)
                     return -(obj * w).sum() / (w.sum() + 1e-8)
 
                 # An agent proposes OR votes in a given round, never both, so the two
                 # heads are trained on disjoint masks. Rounds after agreement carry no
                 # decision and are excluded from all three terms.
                 loss = clipped(pi_theta.log_prob(rounds["raw"][:, i][..., None]),
-                               rounds["logp_theta"][:, i], w_prop)
+                               rounds["logp_theta"][:, i], w_prop, a)
+
+                # The vote's advantage, and the mask it is averaged over. Under
+                # `counterfactual` both narrow: only pivotal votes carry signal, and
+                # what they carry is their own branch difference rather than the
+                # round's shared outcome.
+                vote_adv, w_vote_pg = a, w_vote
+                if cf_vote:
+                    pivotal = rounds["pivotal"][:, i].astype(jnp.float32)
+                    w_vote_pg = bargain.vote_credit_mask(
+                        act, mine, rounds["offer_null"], pivotal)
+                    vote_adv = bargain.masked_standardise(
+                        bargain.counterfactual_vote_advantage(
+                            rounds["vote"][:, i], lock_v, cont_v, pivotal),
+                        w_vote_pg)
                 # The stored vote log-prob is under the eps-FLOORED distribution the
                 # vote was drawn from, while this one is under the policy itself, so
                 # the ratio is a proper importance weight against the behaviour
@@ -1634,8 +1693,26 @@ def make_train(config):
                 # would zero the gradient of exactly the saturated agents the floor
                 # exists to rescue.
                 loss = loss + clipped(pi_vote.log_prob(rounds["vote"][:, i]),
-                                      rounds["logp_vote"][:, i], w_vote)
+                                      rounds["logp_vote"][:, i], w_vote_pg, vote_adv)
                 v_loss = (jnp.square(value - targ_b[:, i]) * act).sum() / (act.sum() + 1e-8)
+                if cf_vote:
+                    # Each branch head regresses on the rounds where that branch was
+                    # REALISED: lock on the rounds that locked, continue on the rest
+                    # (including null offers, which are pure continuation samples).
+                    # Both are restricted to responder rows -- a proposer's decision
+                    # state has no offer on the table, so a branch value there would
+                    # be fitted to a state the counterfactual never asks about.
+                    responder = act * (1.0 - mine)
+                    newly = rounds["newly"].astype(jnp.float32)
+                    for head, w_head in ((lock_v, responder * newly),
+                                         (cont_v, responder * (1.0 - newly))):
+                        v_loss = v_loss + (
+                            jnp.square(head - rtg[:, i]) * w_head
+                        ).sum() / (w_head.sum() + 1e-8)
+                # Entropy stays on the WIDER mask: a non-pivotal vote earns no
+                # policy gradient, but it is still a vote the agent will cast again,
+                # and letting it saturate for want of regularisation is how the
+                # always-accept equilibrium formed in the first place.
                 entropy = (pi_vote.entropy() * w_vote).sum() / (w_vote.sum() + 1e-8)
                 return (loss + config["BARGAIN_VF_COEF"] * v_loss
                         - config["BARGAIN_ENT_COEF"] * entropy)
@@ -1703,6 +1780,25 @@ def make_train(config):
             out["policy_entropy"] = jnp.stack(entropies).mean()
             out["policy_entropy_min"] = jnp.stack(entropies).min()
             out["vote_eps"] = vote_eps
+            # Counterfactual diagnostics, read off the params that GENERATED the
+            # rollout rather than the just-updated ones, so they describe the
+            # beliefs the logged votes were actually cast under.
+            out["cf_gap"] = jnp.float32(0.0)
+            out["cf_pivotal_rate"] = jnp.float32(0.0)
+            if cf_vote:
+                w_vote_all = bargain.vote_credit_mask(
+                    rounds["active"][:, None, :], rounds["is_proposer"],
+                    rounds["offer_null"][:, None, :])                  # (K, N, E)
+                gaps = []
+                for i in range(num_agents):
+                    _, _, _, lock_v, cont_v = bargain_net[i].apply(
+                        b_params[i], rounds["feats"][:, i], return_aux=True)
+                    gaps.append(lock_v - cont_v)
+                total_w = jnp.maximum(w_vote_all.sum(), 1.0)
+                out["cf_gap"] = (jnp.stack(gaps, axis=1) * w_vote_all).sum() / total_w
+                out["cf_pivotal_rate"] = (
+                    rounds["pivotal"].astype(jnp.float32) * w_vote_all
+                ).sum() / total_w
             out = {f"joint/{JOINT_BARGAIN_METRICS[k]}": v
                    for k, v in _select(out, tuple(JOINT_BARGAIN_METRICS)).items()}
             out["phase"] = jnp.float32(3.0)

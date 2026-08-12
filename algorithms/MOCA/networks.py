@@ -215,13 +215,21 @@ class BargainingActorCritic(nn.Module):
             without a positive prior the contract is almost never in force and the
             proposal head sees no signal to learn from. Annealing the quorum is the
             other lever; this one is free.
+        aux_heads: build the two BRANCH value heads the counterfactual vote
+            advantage needs (`lock_value`, `cont_value`; see bargain.py). Off by
+            default and skipped entirely when off, so the parameter tree, the
+            initialisation RNG and therefore every existing checkpoint are
+            bit-for-bit what they were before the heads existed. They are appended
+            AFTER the critic so the automatic Dense_N numbering of everything above
+            is untouched, and named, so a loader can detect them by key.
     """
     hidden: int = 64
     activation: str = "relu"
     accept_bias: float = 1.0
+    aux_heads: bool = False
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, return_aux: bool = False):
         act = nn.relu if self.activation == "relu" else nn.tanh
         h = nn.Dense(self.hidden, kernel_init=orthogonal(np.sqrt(2)),
                      bias_init=constant(0.0))(x)
@@ -250,5 +258,33 @@ class BargainingActorCritic(nn.Module):
                           bias_init=constant(0.0))(h)
         critic = act(critic)
         critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(critic)
+        critic = jnp.squeeze(critic, axis=-1)
 
-        return pi_theta, pi_vote, jnp.squeeze(critic, axis=-1)
+        if self.aux_heads:
+            # The two branches a vote chooses between, estimated separately rather
+            # than differenced out of one critic: the critic averages over what the
+            # OTHER voters did, so it cannot say what THIS vote changed. Both are
+            # only meaningful on a vote-pass state (an offer is on the table), and
+            # both read the same trunk as the vote head, so they see the theta the
+            # vote is deciding on.
+            def branch(name):
+                z = nn.Dense(self.hidden, kernel_init=orthogonal(np.sqrt(2)),
+                             bias_init=constant(0.0), name=f"{name}_hidden")(h)
+                z = act(z)
+                z = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0),
+                             name=f"{name}_out")(z)
+                return jnp.squeeze(z, axis=-1)
+
+            lock_value = branch("lock")     # this offer binds, now
+            cont_value = branch("cont")     # it does not: null segment, reopen
+            if return_aux:
+                return pi_theta, pi_vote, critic, lock_value, cont_value
+        elif return_aux:
+            raise ValueError(
+                "return_aux=True needs BargainingActorCritic(aux_heads=True): the "
+                "branch value heads do not exist on this module. Build the network "
+                "with aux_heads inferred from the checkpoint "
+                "(bargain.params_have_aux_heads)."
+            )
+
+        return pi_theta, pi_vote, critic
