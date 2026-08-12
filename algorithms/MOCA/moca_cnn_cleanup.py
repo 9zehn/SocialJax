@@ -404,6 +404,12 @@ def make_train(config):
                 f"BARGAIN_PROBE_FRAC is the fraction of rounds whose offer is "
                 f"replaced by a scripted probe; above 0.5 the run is mostly probing "
                 f"rather than bargaining. Got {config['BARGAIN_PROBE_FRAC']!r}.")
+        config.setdefault("BARGAIN_PROBE_NULL_FRAC", 0.2)
+        if not 0.0 <= float(config["BARGAIN_PROBE_NULL_FRAC"]) <= 1.0:
+            raise ValueError(
+                f"BARGAIN_PROBE_NULL_FRAC is the fraction OF PROBES that offer the "
+                f"null contract, so it must be in [0, 1]. Got "
+                f"{config['BARGAIN_PROBE_NULL_FRAC']!r}.")
         # Recorded so a replay tool can refuse a checkpoint it cannot read, rather
         # than reading it as a mechanism that was never trained.
         config["BARGAIN_FEATURE_VERSION"] = bargain.FEATURE_VERSION
@@ -1346,6 +1352,7 @@ def make_train(config):
             # PRNG keys it always did, so existing runs and golden tests replay
             # bit-for-bit.
             probe_frac = float(config["BARGAIN_PROBE_FRAC"])
+            probe_null_frac = float(config.get("BARGAIN_PROBE_NULL_FRAC", 0.2))
 
             def _round(carry, r):
                 (env_state, last_obs, rng, agreed, locked, cum_return, cum_clean,
@@ -1403,10 +1410,19 @@ def make_train(config):
                 # choose the offer); the VOTE is trained normally, because voting on
                 # a probe is a genuine decision with genuine consequences.
                 if probe_frac > 0.0:
-                    is_probe = (jax.random.uniform(k_probe, (n_envs,)) < probe_frac)
+                    u = jax.random.uniform(k_probe, (n_envs,))
+                    is_probe = u < probe_frac
                     probe_theta = jax.random.uniform(
                         k_probe_theta, (n_envs,),
                         minval=contract.low, maxval=contract.high)
+                    # BARGAIN_PROBE_NULL_FRAC of the probes offer the NULL contract
+                    # itself (nested thresholds on one draw, so no extra key). A
+                    # null offer never locks -- see `newly` below -- so these probes
+                    # double as forced-null exposure: the segment plays uncontracted
+                    # whatever the vote, and gameplay keeps meeting theta=0.
+                    is_null_probe = u < probe_frac * probe_null_frac
+                    probe_theta = jnp.where(
+                        is_null_probe, jnp.float32(contract.null), probe_theta)
                     theta_offer = jnp.where(is_probe, probe_theta, theta_offer)
                 else:
                     is_probe = jnp.zeros((n_envs,), bool)
@@ -1438,7 +1454,15 @@ def make_train(config):
 
                 passed, n_accept = bargain.accepted(
                     votes.astype(bool), proposer, quorum_b, num_agents)
-                newly = passed & ~agreed
+                # An offer of exactly the null contract never LOCKS: accepted or
+                # not, the segment plays uncontracted and negotiation reopens next
+                # round -- a formal "pass this segment", categorically different
+                # from every theta > 0, which binds for all remaining segments.
+                # Null offers arise from null probes, and (with CONTRACT_LOW=0)
+                # from proposers themselves: the clipped unsquash puts an atom of
+                # the Gaussian's mass at exactly the lower bound.
+                offer_null = contract.is_null(theta_offer)
+                newly = passed & ~agreed & ~offer_null
                 theta_eff = jnp.where(
                     agreed, locked,
                     jnp.where(newly, theta_offer, jnp.float32(contract.null)))
@@ -1455,7 +1479,7 @@ def make_train(config):
                     "active": ~agreed, "newly": newly,
                     "is_proposer": mine, "theta_offer": theta_offer,
                     "n_accept": n_accept, "theta_eff": theta_eff,
-                    "is_probe": is_probe,
+                    "is_probe": is_probe, "offer_null": offer_null,
                 }
                 carry = (env_state, last_obs, rng,
                          agreed | newly,
@@ -1582,9 +1606,14 @@ def make_train(config):
                 # so its proposal was never acted on and must not be trained on --
                 # crediting it with the probe's consequences would teach the
                 # proposal head from offers it did not make. The votes on a probe
-                # were real decisions and train as usual.
+                # were real decisions and train as usual -- EXCEPT on a null offer,
+                # where accepting and rejecting lead to the same place (one
+                # uncontracted segment, negotiation reopens), so the vote is
+                # outcome-free and training it would credit pure noise.
                 not_probe = 1.0 - rounds["is_probe"].astype(jnp.float32)
-                w_prop, w_vote = act * mine * not_probe, act * (1.0 - mine)
+                consequential = 1.0 - rounds["offer_null"].astype(jnp.float32)
+                w_prop = act * mine * not_probe
+                w_vote = act * (1.0 - mine) * consequential
                 eps = config["BARGAIN_CLIP_EPS"]
 
                 def clipped(logp, old_logp, w):

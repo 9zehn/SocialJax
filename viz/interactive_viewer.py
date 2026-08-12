@@ -278,8 +278,12 @@ def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
             last_votes = np.array([0.0 if i == proposer else float(v)
                                    for i, v in enumerate(votes)], np.float32)
             last_n_accept = float(n_accept)
-            if passed:
+            if passed and theta_offer > contract.null + 1e-6:
                 agreed, locked = True, theta_offer
+            elif passed:
+                # As in training: a null offer never locks -- accepting it buys one
+                # uncontracted segment and negotiation reopens next round.
+                pass
             else:
                 n_reject += 1
             theta = locked if agreed else float(contract.null)

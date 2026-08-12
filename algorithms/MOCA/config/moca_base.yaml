@@ -192,6 +192,12 @@
 # whole range -- lowballs the cleaners must refuse AND exorbitant offers the
 # harvesters must refuse. (Code default is 0.0 = off, same reason as above.)
 "BARGAIN_PROBE_FRAC": 0.1
+# Of the probes, this fraction offers the NULL contract itself. A null offer never
+# locks -- accepted or not, the segment plays uncontracted and negotiation reopens
+# -- so null probes are forced-null exposure through the probe channel: gameplay
+# keeps meeting theta=0 even once every episode agrees early, which is what keeps
+# the disagreement point (and with it the meaning of rejection) behaviourally real.
+"BARGAIN_PROBE_NULL_FRAC": 0.2
 
 # Skip phase-1 training and run phase 2 against saved gameplay policies (a glob
 # matching one file per agent). This is what makes a protocol comparison

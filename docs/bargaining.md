@@ -32,10 +32,21 @@ An episode of T steps splits into K = T / `BARGAIN_SEGMENT` segments.
 round r = 0 .. K−1, while no contract is in force:
     proposer p(r) offers θ_r                                 ← forward pass 1
     every other agent SEES θ_r and casts a Bernoulli vote     ← forward pass 2
-    if #accept ≥ quorum:  θ_r binds for ALL REMAINING segments — done
+    if θ_r = 0:           θ = 0 for segment r ONLY, continue — a formal "pass"
+    elif #accept ≥ quorum: θ_r binds for ALL REMAINING segments — done
     else:                 θ = 0 for segment r, continue to round r+1
 never agreed → the null contract for the whole episode
 ```
+
+The θ_r = 0 branch makes the null offer **one segment of disagreement, never a
+lock**: whatever the vote, the segment plays uncontracted and negotiation reopens.
+Without it, an accepted θ=0 would bind "no transfers" for the rest of the episode —
+strictly worse than plain disagreement, which at least keeps renegotiation open.
+Votes on a null offer are outcome-free and are masked out of the vote loss. Null
+offers arise from null probes (`BARGAIN_PROBE_NULL_FRAC`), and — at
+`CONTRACT_LOW=0` — from proposers themselves, since the clipped unsquash puts an
+atom of proposal mass at exactly the lower bound, so "propose 0" is a move the
+policy can genuinely play.
 
 Rejection costs **one segment**, not the episode. At `BARGAIN_SEGMENT=100` of a
 1000-step episode that is roughly a tenth of the episode's welfare — the single lever
@@ -135,6 +146,13 @@ lowballers walked through). Probes keep testing the whole range: lowballs the
 cleaners must refuse, and — once the ceiling gives them a reason — exorbitant offers
 the harvesters must refuse.
 
+`BARGAIN_PROBE_NULL_FRAC=0.2` makes that fraction *of the probes* the null contract
+itself. Under the θ=0 protocol rule above these never lock, so they are **forced-null
+exposure through the probe channel**: even once every episode agrees in round 0,
+gameplay keeps meeting θ=0 segments, which is what keeps the disagreement point —
+and with it the meaning of rejection — behaviourally real rather than a stale value
+estimate. (Their votes are outcome-free and excluded from the vote loss.)
+
 ### Features (`BARGAIN_FEATURES`)
 
 Handcrafted, `12 + 2N` dimensions, selected by a mask so the network shape is
@@ -197,8 +215,8 @@ python algorithms/train.py --algo MOCA --env cleanup reward=individual \
   TRAINING_MODE=joint PHASE2_MODE=bargain \
   BARGAIN_SEGMENT=100 BARGAIN_PROPOSER=rotate BARGAIN_ROTATE_START=random \
   BARGAIN_QUORUM=all BARGAIN_FEATURES=private \
-  BARGAIN_VOTE_EPS_END=0.02 BARGAIN_PROBE_FRAC=0.1 \
-  CONTRACT_LOW=0.2 CONTRACT_HIGH=3.0 \
+  BARGAIN_VOTE_EPS_END=0.02 BARGAIN_PROBE_FRAC=0.1 BARGAIN_PROBE_NULL_FRAC=0.2 \
+  CONTRACT_LOW=0.0 CONTRACT_HIGH=3.0 \
   SEED=55 +ENV_KWARGS.num_agents=7
 ```
 

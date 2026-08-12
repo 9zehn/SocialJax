@@ -131,7 +131,9 @@ def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed):
             p_acc.append(pv.probs[..., 1])
         votes, p_acc = jnp.stack(votes), jnp.stack(p_acc)
         passed, n_acc = bg.accepted(votes.astype(bool), prop, quorum, n)
-        newly = passed & ~agreed
+        # As in training: an offer of exactly the null contract never locks --
+        # accepted or not, the segment plays uncontracted and negotiation reopens.
+        newly = passed & ~agreed & ~contract.is_null(offer)
         theta_eff = jnp.where(agreed, locked,
                               jnp.where(newly, offer, jnp.float32(contract.null)))
 
