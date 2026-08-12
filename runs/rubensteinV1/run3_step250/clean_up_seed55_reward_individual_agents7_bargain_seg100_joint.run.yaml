@@ -1,0 +1,31 @@
+_provenance:
+  source: backfilled-by-hand
+  saved_at: '2026-08-12'
+  confidence: >
+    CONTRACT_LOW/CONTRACT_HIGH were stated by Leon on 2026-08-12 ("i used contract
+    range [0.2,2.0] for bargain"). Everything else is DECODED from the checkpoint
+    filename via algorithms/utils/io_utils.checkpoint_filename, which is lossless
+    for the fields below. Fields the filename does not determine (LR, ENT_COEF,
+    TOTAL_TIMESTEPS, BARGAIN_ROUNDS, ...) are omitted rather than guessed.
+  git_commit: unknown
+  checkpoints: rolling `_latest` snapshot at update 250; the run had not finished
+
+ENV_NAME: clean_up
+SEED: 55
+REWARD: individual
+ENV_KWARGS:
+  num_agents: 7
+  shared_rewards: false
+  apple_reward: 1.0
+
+CONTRACT_LOW: 0.2
+CONTRACT_HIGH: 2.0
+NULL_CONTRACT_FRAC: 0.1
+
+TRAINING_MODE: joint
+PHASE2_MODE: bargain
+BARGAIN_SEGMENT: 100
+BARGAIN_PROPOSER: rotate
+BARGAIN_ROTATE_START: random
+BARGAIN_QUORUM: all
+BARGAIN_FEATURES: private

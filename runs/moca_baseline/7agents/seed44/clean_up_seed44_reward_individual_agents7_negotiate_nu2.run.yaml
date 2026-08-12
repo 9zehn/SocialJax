@@ -1,0 +1,28 @@
+_provenance:
+  source: backfilled-by-hand
+  saved_at: '2026-08-12'
+  confidence: >
+    CONTRACT_LOW/CONTRACT_HIGH were stated by Leon on 2026-08-12 ("[0.0,2.0] for
+    moca"). Everything else is DECODED from the checkpoint filename via
+    algorithms/utils/io_utils.checkpoint_filename. NULL_CONTRACT_FRAC is 0.1
+    because the filename carries no `_null` token and the checkpoints load
+    against the 3-feature contract observation, so the run postdates 220a9c3
+    where both the is_null flag and the null budget were introduced together.
+    Fields the filename does not determine are omitted rather than guessed.
+  git_commit: unknown
+
+ENV_NAME: clean_up
+SEED: 44
+REWARD: individual
+ENV_KWARGS:
+  num_agents: 7
+  shared_rewards: false
+  apple_reward: 1.0
+
+CONTRACT_LOW: 0.0
+CONTRACT_HIGH: 2.0
+NULL_CONTRACT_FRAC: 0.1
+
+TRAINING_MODE: two_phase
+PHASE2_MODE: negotiate
+NEGOTIATE_NU: 2

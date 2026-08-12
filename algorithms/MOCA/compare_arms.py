@@ -32,7 +32,7 @@ import numpy as np
 
 import socialjax
 from socialjax.wrappers.baselines import LogWrapper
-from algorithms.utils import load_params
+from algorithms.utils import contract_range, load_params
 from algorithms.MOCA import bargain as bg
 from algorithms.MOCA import negotiate as neg
 from algorithms.MOCA.contracts import AGREE, PROPOSE, CleanupContract
@@ -131,28 +131,57 @@ def main():
     p.add_argument("--episodes", type=int, default=20)
     p.add_argument("--num-steps", type=int, default=1000)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--contract-low", type=float, default=0.2)
+    p.add_argument("--contract-low", type=float, default=0.2,
+                   help="last-resort floor for runs with neither a sidecar nor --range")
     p.add_argument("--contract-high", type=float, default=1.0)
+    p.add_argument("--range", action="append", default=[], metavar="LABEL=LOW:HIGH",
+                   help="per-run contract range, overriding the run's .run.yaml "
+                        "sidecar. Arms are often trained on different ranges, and the "
+                        "bounds are NOT in the checkpoint name, so for a run with no "
+                        "sidecar a single global range silently rescales theta -- "
+                        "through both the observation and the unsquash of the "
+                        "proposal. theta itself stays comparable across arms: it is "
+                        "reward per cleaned cell either way.")
     args = p.parse_args()
+
+    ranges = {}
+    for spec in args.range:
+        label, _, bounds = spec.partition("=")
+        lo, _, hi = bounds.partition(":")
+        ranges[label] = (float(lo), float(hi))
 
     from viz.interactive_viewer import (_gameplay_checkpoints, detect_moca,
                                         infer_bargain_config)
 
-    arms, first_gp = {}, None
+    arms, first_gp, guessed = {}, None, []
     for spec in args.run:
         label, _, glob_ = spec.partition("=")
         moca = detect_moca(glob_)
         gp = [load_params(q) for q in _gameplay_checkpoints(glob_)]
         n = len(gp)
+        if n < 2:
+            # Otherwise this surfaces several frames later as "contracts need >= 2
+            # agents, got 0", which reads as a config problem rather than a typo in
+            # the glob. Rolling snapshots are `..._latest_[0-9].pkl`, not `_[0-9].pkl`.
+            raise SystemExit(f"[{label}] matched {n} gameplay checkpoints for "
+                             f"{glob_!r} -- check the glob (rolling snapshots are "
+                             f"named `..._latest_[0-9].pkl`)")
         env = LogWrapper(socialjax.make(
             "clean_up", num_agents=n, shared_rewards=False, cnn=True, jit=True,
             apple_reward=1.0, num_inner_steps=args.num_steps), replace_info=False)
-        contract = CleanupContract(n, args.contract_low, args.contract_high)
+        override = ranges.get(label, (None, None))
+        lo, hi, source = contract_range(glob_, *override,
+                                        fallback=(args.contract_low, args.contract_high))
+        if source == "fallback":
+            guessed.append(label)
+        contract = CleanupContract(n, lo, hi)
         if first_gp is None:
             first_gp = (gp, env, contract, n)
 
         mode = moca["mode"] if moca else "none"
-        print(f"[{label}] mode={mode}  agents={n}", flush=True)
+        print(f"[{label}] mode={mode}  agents={n}  "
+              f"contract {{{contract.null:g}}} u [{lo:g}, {hi:g}]  ({source})",
+              flush=True)
         if mode == "bargain":
             cfg = infer_bargain_config(moca["stem"])
             cfg.setdefault("hidden", 64)
@@ -188,6 +217,7 @@ def main():
             print(f"          nu={nu}  proposer=agent 0 (fixed)")
         else:
             raise SystemExit(f"[{label}] unsupported mode {mode!r}")
+        s["range"] = (lo, hi, source)
         arms[label] = s
 
     if args.null:
@@ -198,12 +228,24 @@ def main():
         arms["null"]["theta"] = np.zeros(args.episodes)
         print("[null] theta=0 throughout (uses the first run's gameplay policies)")
 
+    if guessed:
+        print(f"\n  [warning] no recorded contract range for {', '.join(guessed)} -- "
+              f"fell back to [{args.contract_low:g}, {args.contract_high:g}], which is "
+              f"a GUESS.\n  Any of those arms not actually trained on that range has "
+              f"its theta rescaled, and its\n  numbers below are wrong. Pass "
+              f"--range LABEL=LOW:HIGH, or backfill the run's sidecar.")
+
     # ------------------------------------------------------------------ report
     def blk(t):
         print(f"\n{t}\n" + "-" * 78)
 
     blk(f"outcomes over {args.episodes} episodes x {args.num_steps} steps "
         f"(mean +- sd)")
+    # Reprinted next to the results so a pasted table stays interpretable: the
+    # same theta means different things under different bounds.
+    print("  ranges: " + "  ".join(
+        f"{l}=[{s['range'][0]:g},{s['range'][1]:g}]"
+        for l, s in arms.items() if "range" in s))
     hdr = (f"  {'arm':<12}{'welfare':>16}{'equality':>14}{'clean/step':>14}"
            f"{'river':>9}{'theta':>9}")
     print(hdr)

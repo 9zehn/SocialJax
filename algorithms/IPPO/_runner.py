@@ -18,7 +18,8 @@ from omegaconf import OmegaConf
 import wandb
 
 import socialjax
-from algorithms.utils import save_params, load_params, checkpoint_filename, evaluate_ippo as evaluate
+from algorithms.utils import (save_params, load_params, checkpoint_filename,
+                              save_run_config, evaluate_ippo as evaluate)
 
 
 def single_run(config, make_train, *, wandb_name):
@@ -30,6 +31,12 @@ def single_run(config, make_train, *, wandb_name):
     # can't silently collide onto the same checkpoint path -- also used for the
     # WandB run name so those don't collide/get confused in the dashboard either.
     filename = checkpoint_filename(config)
+
+    # Resolved config beside the checkpoints, written before training so a run
+    # killed partway still leaves usable provenance. Env kwargs that change what
+    # a baseline MEANS (shared_rewards, initial_dirt_fraction, apple_reward) are
+    # not all in the filename, and a replay at the wrong ones is silently wrong.
+    save_run_config(config, f"./checkpoints/individual/{filename}", algorithm="IPPO")
 
     wandb.init(
         entity=config["ENTITY"],

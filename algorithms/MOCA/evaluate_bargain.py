@@ -38,7 +38,7 @@ import numpy as np
 
 import socialjax
 from socialjax.wrappers.baselines import LogWrapper
-from algorithms.utils import load_params
+from algorithms.utils import contract_range, load_params
 from algorithms.MOCA import bargain as bg
 from algorithms.MOCA import negotiate as neg
 from algorithms.MOCA.contracts import CleanupContract
@@ -256,10 +256,13 @@ def main():
     p.add_argument("--episodes", type=int, default=20)
     p.add_argument("--num-steps", type=int, default=1000)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--contract-low", type=float, default=0.2)
-    p.add_argument("--contract-high", type=float, default=1.0,
-                   help="MUST match the run: the bounds are not in the filename, and "
-                        "a mismatch silently rescales theta")
+    p.add_argument("--contract-low", type=float, default=None)
+    p.add_argument("--contract-high", type=float, default=None,
+                   help="theta bounds. Read from the run's .run.yaml sidecar when it "
+                        "has one; these flags override it. The bounds are not in the "
+                        "filename, so for runs predating the sidecar there is no "
+                        "record at all and a mismatch silently rescales theta -- "
+                        "supply them explicitly for those.")
     p.add_argument("--bargain-segment", type=int, default=None,
                    help="override the _seg<N> read from the checkpoint name")
     p.add_argument("--env-kwarg", action="append", default=[], metavar="KEY=VALUE")
@@ -295,9 +298,16 @@ def main():
         k, _, raw = kv.partition("=")
         env_kwargs[k] = _parse_env_kwarg_value(raw)
     env = LogWrapper(socialjax.make("clean_up", **env_kwargs), replace_info=False)
-    contract = CleanupContract(n, args.contract_low, args.contract_high)
+    lo, hi, source = contract_range(args.checkpoint, args.contract_low,
+                                    args.contract_high)
+    contract = CleanupContract(n, lo, hi)
 
     print(f"run: {moca['stem']}")
+    print(f"contract: theta in [{lo:g}, {hi:g}] (from {source})")
+    if source == "fallback":
+        print("  [warning] no .run.yaml sidecar and no --contract-low/--contract-high: "
+              "this is a GUESS. If the run was not trained on this range, every theta "
+              "below is rescaled and the numbers are wrong.")
     rec, K = rollout(env, gp, bp, contract, cfg, args.episodes, args.num_steps, args.seed)
     report(rec, K, cfg, contract, n, args.num_steps)
 

@@ -6,13 +6,17 @@ across different MARL algorithms. All functions use pickle serialization and JAX
 tree mapping for efficient parameter conversion.
 """
 
+import datetime
 import os
 import pickle
-from typing import Any, Dict
+import re
+import subprocess
+from typing import Any, Dict, Optional
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import yaml
 from flax.training.train_state import TrainState
 
 
@@ -123,6 +127,143 @@ def checkpoint_filename(config: Dict[str, Any], latest: bool = False) -> str:
 
     name = f'{config["ENV_NAME"]}_seed{config["SEED"]}{suffix}'
     return f"{name}_latest" if latest else name
+
+
+# ---------------------------------------------------------------------------
+# Run-config sidecars.
+#
+# checkpoint_filename encodes only what it must to keep two runs from colliding.
+# Plenty of settings that change what a checkpoint MEANS are absent from it --
+# CONTRACT_LOW/HIGH above all, since replaying a policy under a different range
+# rescales theta through both the contract observation the policy reads and the
+# unsquash of the proposal it emits, silently producing numbers for a mechanism
+# that was never trained. Hydra does write the resolved config, but to
+# outputs/<date>/<time>/.hydra/, which is gitignored and, for a Colab run, on a
+# VM that no longer exists by the time the .pkl files are downloaded.
+#
+# So the config is also written NEXT TO the checkpoints, travelling with them
+# into runs/ whenever the directory is copied. Written at run start rather than
+# at the end, because the checkpoints that actually get analysed here are
+# usually rolling `_latest` snapshots of a run that was still going.
+# ---------------------------------------------------------------------------
+
+RUN_CONFIG_EXT = ".run.yaml"
+
+# Role/rolling markers appended AFTER the run stem. Stripped right-to-left so
+# every checkpoint of a run -- gameplay, contracting, resume, rolling -- resolves
+# to the one sidecar written for that run.
+_CKPT_ROLE_TOKENS = ("contract", "proposal", "voting", "resume", "latest")
+
+
+def run_stem(checkpoint_path: str) -> str:
+    """The run stem shared by every checkpoint of one run.
+
+    Accepts anything that names a run's files -- `..._joint_0.pkl`,
+    `..._joint_[0-9].pkl`, `..._joint_latest_contract_3.pkl`, and the
+    `..._latest_0 (1).pkl` form a browser leaves behind on a repeat download --
+    and strips the per-agent index and any role/rolling markers.
+    """
+    stem = re.sub(r" \(\d+\)(?=\.pkl$)", "", str(checkpoint_path))
+    stem = re.sub(r"_(?:\d+|\[0-9\]|\*|\?)\.pkl$", "", stem)
+    stem = re.sub(r"\.pkl$", "", stem)
+    changed = True
+    while changed:  # e.g. "_latest_contract" needs two passes
+        changed = False
+        for token in _CKPT_ROLE_TOKENS:
+            if stem.endswith(f"_{token}"):
+                stem = stem[: -len(token) - 1]
+                changed = True
+    return stem
+
+
+def run_config_path(checkpoint_path: str) -> str:
+    """Sidecar path for a checkpoint path, glob, or bare stem."""
+    return run_stem(checkpoint_path) + RUN_CONFIG_EXT
+
+
+def _git_provenance() -> Dict[str, Any]:
+    """Commit/branch/dirty state of the working tree, best-effort."""
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    def git(*args):
+        try:
+            done = subprocess.run(("git", *args), cwd=repo, capture_output=True,
+                                  text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return done.stdout.strip() if done.returncode == 0 else None
+
+    commit = git("rev-parse", "HEAD")
+    if commit is None:  # no git, or not a checkout (a bare Colab copy, say)
+        return {}
+    status = git("status", "--porcelain")
+    return {
+        "git_commit": commit,
+        "git_branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+        # A dirty tree means the commit alone does not identify the code that
+        # ran, so the flag is the difference between provenance and a guess.
+        "git_dirty": bool(status),
+    }
+
+
+def save_run_config(config: Dict[str, Any], stem_path: str, **provenance: Any) -> str:
+    """Write a run's resolved config beside its checkpoints. Returns the path.
+
+    Args:
+        config: the resolved config dict (post-make_train, so derived values
+            like NEGOTIATE_NU and NUM_UPDATES_* are the ones actually used).
+        stem_path: checkpoint path stem, without the `_<agent>.pkl` suffix --
+            i.e. exactly the f"{dir}/{checkpoint_filename(config)}" the saves use.
+        **provenance: extra fields recorded alongside git/timestamp.
+    """
+    path = stem_path + RUN_CONFIG_EXT
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    meta = {
+        "saved_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "source": "recorded-at-run-start",
+        **_git_provenance(),
+        **provenance,
+    }
+    with open(path, "w") as f:
+        yaml.safe_dump({"_provenance": meta, **config}, f,
+                       default_flow_style=False, sort_keys=True)
+    return path
+
+
+def load_run_config(checkpoint_path: str) -> Optional[Dict[str, Any]]:
+    """Read the sidecar for a checkpoint, or None if the run predates them.
+
+    Returning None rather than raising is deliberate: every checkpoint in runs/
+    older than this mechanism has no sidecar, and callers should fall back to
+    their flags (loudly) rather than refusing to run at all.
+    """
+    path = run_config_path(checkpoint_path)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def contract_range(checkpoint_path: str, low=None, high=None, fallback=(0.2, 1.0)):
+    """Resolve a contracting run's theta space to (low, high, source).
+
+    Precedence: explicit override > sidecar > fallback. `source` is "flag",
+    "sidecar" or "fallback" so callers can WARN when they are guessing --
+    guessing silently is the exact failure this whole mechanism exists to stop.
+    """
+    cfg = load_run_config(checkpoint_path) or {}
+    recorded = (cfg.get("CONTRACT_LOW"), cfg.get("CONTRACT_HIGH"))
+    if recorded[0] is None or recorded[1] is None:
+        source = "fallback"
+        resolved = [float(fallback[0]), float(fallback[1])]
+    else:
+        source = "sidecar"
+        resolved = [float(recorded[0]), float(recorded[1])]
+    for i, override in enumerate((low, high)):
+        if override is not None:
+            resolved[i] = float(override)
+            source = "flag"
+    return resolved[0], resolved[1], source
 
 
 def save_params(train_state: TrainState, save_path: str) -> None:

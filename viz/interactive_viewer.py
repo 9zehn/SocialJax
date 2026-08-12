@@ -1214,12 +1214,14 @@ def main():
     parser.add_argument("--contract-theta", type=float, default=None,
                         help="MOCA only: replay under this contract value instead of the one the "
                              "learned proposal policy favours (0 = null contract, no transfers)")
-    parser.add_argument("--contract-low", type=float, default=0.2,
+    parser.add_argument("--contract-low", type=float, default=None,
                         help="MOCA only: lower bound of the NON-NULL contract range the run was "
                              "trained on (not encoded in the filename; must match CONTRACT_LOW). "
-                             "The null contract theta=0 is always available and is unaffected by "
-                             "these bounds. Default tracks moca_base.yaml; pass 0.0 for runs "
-                             "trained before the range excluded weak contracts")
+                             "Read from the run's .run.yaml sidecar when it has one; this "
+                             "overrides it. The null contract theta=0 is always available and is "
+                             "unaffected by these bounds. Without a sidecar this falls back to "
+                             "moca_base.yaml's 0.2; pass 0.0 for runs trained before the range "
+                             "excluded weak contracts")
     parser.add_argument("--bargain-segment", type=int, default=None,
                         help="PHASE2_MODE=bargain: steps per bargaining round. Read "
                              "from the checkpoint name (_seg<N>) by default; pass this "
@@ -1229,11 +1231,13 @@ def main():
                              "frozen critics at reset (training default: 50)")
     parser.add_argument("--solver-rule", default="majority", choices=("majority", "max"),
                         help="PHASE2_MODE=solver: decision rule (training default: majority)")
-    parser.add_argument("--contract-high", type=float, default=1.0,
+    parser.add_argument("--contract-high", type=float, default=None,
                         help="MOCA only: upper bound of the contract space (must match the run's "
                              "CONTRACT_HIGH; the bounds are not encoded in the filename, and a "
-                             "mismatch silently rescales theta). Default tracks moca_base.yaml; "
-                             "pass 0.2 for runs on the paper's original range")
+                             "mismatch silently rescales theta). Read from the run's .run.yaml "
+                             "sidecar when it has one; this overrides it. Without a sidecar this "
+                             "falls back to moca_base.yaml's 1.0; pass 0.2 for runs on the "
+                             "paper's original range")
     parser.add_argument("--record", default=None, metavar="PATH",
                         help="save the rollout to PATH (.npz) so it can be reopened later "
                              "with --replay, without re-running the simulation")
@@ -1309,24 +1313,34 @@ def main():
     moca = detect_moca(args.checkpoint) if args.checkpoint else None
     if moca is not None:
         from algorithms.MOCA.contracts import CleanupContract, contract_for_params
+        from algorithms.utils import contract_range
+
+        # The bounds decide what every theta below MEANS -- replaying at the wrong
+        # ones rescales it through both the contract observation the policy reads
+        # and the unsquash of the proposal it emits, so the viewer shows a
+        # mechanism that was never trained. Prefer the run's own record.
+        c_low, c_high, c_source = contract_range(
+            args.checkpoint, args.contract_low, args.contract_high)
 
         # Matched to the checkpoint's own encoding so pre-fix policies (2 contract
         # features, no is_null flag) stay replayable; without a checkpoint there are
         # no weights to read, so fall back to the current space.
         one = params[0] if isinstance(params, list) else params
-        contract = (contract_for_params(one, env.num_agents,
-                                        args.contract_low, args.contract_high)
+        contract = (contract_for_params(one, env.num_agents, c_low, c_high)
                     if one is not None
-                    else CleanupContract(env.num_agents, args.contract_low,
-                                         args.contract_high))
+                    else CleanupContract(env.num_agents, c_low, c_high))
         mode = moca["mode"]
         print(f"MOCA run detected (PHASE2_MODE={mode})")
-        print(f"  contract space: theta in [{args.contract_low}, {args.contract_high}]"
+        print(f"  contract space: theta in [{c_low:g}, {c_high:g}] (from {c_source})"
               + (" (continuous)" if mode != "reinforce" else ""))
+        if c_source == "fallback":
+            print("    [warning] the run has no .run.yaml sidecar, so this range is a "
+                  "guess.\n    If it is wrong, every theta shown is rescaled -- pass "
+                  "--contract-low/--contract-high.")
 
         learned = None
         if mode == "reinforce":
-            info = load_contract_policies(moca, args.contract_low, args.contract_high)
+            info = load_contract_policies(moca, c_low, c_high)
             learned = info["modal_theta"]
             print(f"  {len(moca['proposal_paths'])} proposal + "
                   f"{len(moca['voting_paths'])} voting policies, "

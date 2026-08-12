@@ -6,7 +6,7 @@ import numpy as np
 from omegaconf import OmegaConf
 import wandb
 
-from algorithms.utils import save_params, checkpoint_filename
+from algorithms.utils import save_params, save_run_config, checkpoint_filename
 
 
 def single_run(config, make_train, *, wandb_name):
@@ -21,6 +21,15 @@ def single_run(config, make_train, *, wandb_name):
     # It also means wandb now records the RESOLVED config rather than the raw one.
     train = make_train(config)
     filename = checkpoint_filename(config)
+
+    # Written BEFORE training, not after: the checkpoints that actually get
+    # analysed are usually rolling `_latest` snapshots pulled off a run that was
+    # still going (or that died), and those need provenance just as much as a
+    # completed one. CONTRACT_LOW/HIGH in particular appear nowhere in the
+    # filename, and replaying at the wrong range silently rescales theta.
+    sidecar = save_run_config(config, f"./checkpoints/moca/{filename}",
+                              algorithm="MOCA")
+    print(f"** Run config -> {sidecar} **")
 
     # "--algo MOCA" only selects this directory; it does not mean the run uses MOCA's
     # two-phase algorithm. Under TRAINING_MODE=joint there is no phase split, no
