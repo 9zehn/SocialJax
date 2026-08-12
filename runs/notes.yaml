@@ -16,6 +16,20 @@
 
 # ---------------------------------------------------------------- bargaining
 
+runs/rubensteinV1/run4_fablefixV1:
+  status: valid
+  note: >
+    First run under the two-pass round (vote sees the offer; commit 6b9521c).
+    Seed 42, theta in [0.2, 2.0] -- NO .run.yaml sidecar came back with it, so
+    tools need the range passed by flag. First offer-conditioned voting ever
+    observed: p(accept) correlates +0.95 with theta, carried by cleaners A1/A4;
+    lowballs (0.2) pass 53% vs 88% for ceiling offers. probe_votes.py shows the
+    acceptance curves are shallow RAMPS (A1 0.71->0.83, A4 0.81->0.92 across the
+    range, never crossing 0.5), not thresholds -- so lowballing retained
+    positive EV, and training-time theta eroded once the vote_eps anneal hit 0.
+    Motivated BARGAIN_VOTE_EPS_END and BARGAIN_PROBE_FRAC. Beware the stem
+    collision with run1_step300 (also seed 42): keep the directories apart.
+
 runs/rubensteinV1/run3_step250:
   status: valid
   note: >
