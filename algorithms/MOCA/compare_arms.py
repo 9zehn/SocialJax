@@ -195,20 +195,30 @@ def main():
             ret = (rec["base"] + rec["transfer"]).sum(0)
             cl_agent = rec["cleaned"].sum(0) / args.num_steps
             agreed = rec["newly"].any(0)
-            r_idx = np.arange(K)[:, None]
+            in_force = rec["theta_eff"] > contract.null + 1e-9
+            # Under `episode` exactly one round carries, so summing the carried
+            # offers picks it out. Under renegotiation several do, and the summary
+            # theta is the one actually played under -- weighting each segment
+            # equally, which is what the welfare beside it is made of. `agree_round`
+            # likewise becomes the FIRST contracted segment.
+            if cfg.get("binding", "episode") == "episode":
+                theta = (rec["newly"] * rec["offer"]).sum(0)
+            else:
+                theta = ((rec["theta_eff"] * in_force).sum(0)
+                         / np.maximum(in_force.sum(0), 1))
             s = {"return": ret, "welfare": ret.sum(0),
                  "equality": gini_equality(ret),
                  "cleaned": rec["cleaned"].sum((0, 1)) / args.num_steps,
                  "cleaned_agent": cl_agent, "river": rec["river"].mean(0),
                  "transfer_volume": np.maximum(rec["transfer"], 0).sum((0, 1)),
                  "base": rec["base"].sum(0),
-                 "theta": (rec["newly"] * rec["offer"]).sum(0),
+                 "theta": theta,
                  "agreed": agreed,
-                 "agree_round": np.where(agreed, (rec["newly"] * r_idx).sum(0), K),
-                 "uncontracted_steps": (rec["theta_eff"] <= contract.null + 1e-9
-                                        ).sum(0) * cfg["segment"]}
+                 "binding": cfg.get("binding", "episode"),
+                 "agree_round": np.where(agreed, np.argmax(rec["newly"], axis=0), K),
+                 "uncontracted_steps": (~in_force).sum(0) * cfg["segment"]}
             print(f"          segment={cfg['segment']} quorum={cfg['quorum']} "
-                  f"proposer={cfg['proposer']}")
+                  f"proposer={cfg['proposer']} binding={cfg.get('binding', 'episode')}")
         elif mode == "negotiate":
             th, prop, acc, prod, nu = one_shot_theta(
                 env, moca["contract_paths"], contract, args.episodes, args.seed)
@@ -283,6 +293,10 @@ def main():
         print(f"  {label:<12}{s['agreed'].mean():>9.2f}"
               f"{t.mean():>11.3f} +-{t.std():>4.3f}"
               f"{s['uncontracted_steps'].mean():>22.0f}{extra}")
+    if any(s.get("binding", "episode") != "episode" for s in arms.values()):
+        print("  (a renegotiating arm has no single agreement: 'agreed' reads as "
+              "'ever contracted',\n   theta as the mean theta actually played under, "
+              "and the round as the FIRST contracted segment)")
 
     blk("per episode: welfare / equality / clean-per-step")
     labels = list(arms)

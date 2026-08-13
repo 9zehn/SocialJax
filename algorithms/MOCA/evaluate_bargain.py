@@ -144,11 +144,13 @@ def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed, cp=None):
             p_acc.append(pv.probs[..., 1])
         votes, p_acc = jnp.stack(votes), jnp.stack(p_acc)
         passed, n_acc = bg.accepted(votes.astype(bool), prop, quorum, n)
-        # As in training: an offer of exactly the null contract never locks --
-        # accepted or not, the segment plays uncontracted and negotiation reopens.
-        newly = passed & ~agreed & ~contract.is_null(offer)
-        theta_eff = jnp.where(agreed, locked,
-                              jnp.where(newly, offer, jnp.float32(contract.null)))
+        # As in training: an offer of exactly the null contract never takes force --
+        # accepted or not, the fallback applies and negotiation reopens. How long an
+        # offer that DOES carry governs is BARGAIN_BINDING, read from the run's
+        # sidecar; a run without one predates the setting and is `episode`.
+        newly, theta_eff, next_agreed, next_locked = bg.apply_binding(
+            cfg.get("binding", "episode"), passed, contract.is_null(offer), offer,
+            agreed, locked, contract.null)
 
         (st, ob, _, rng), (cl, rew, tr, riv_t) = jax.lax.scan(
             seg_step, (st, ob, theta_eff, rng), None, x)
@@ -177,7 +179,7 @@ def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed, cp=None):
                "p_accept": p_acc, "theta_eff": theta_eff, "cleaned": seg_cl,
                "base": seg_base, "transfer": seg_tr, "river": riv_t.mean(0),
                "overclaim": overclaim, "audited": audited, "report_tr": settle}
-        carry = (st, ob, rng, agreed | newly, jnp.where(newly, offer, locked),
+        carry = (st, ob, rng, next_agreed, next_locked,
                  cum_r + seg_base + seg_tr + settle, cum_c + seg_cl,
                  bg.normalise_theta(offer, contract.low, contract.high),
                  jnp.ones_like(had), nrej + (~agreed & ~passed).astype(jnp.int32),
@@ -260,6 +262,61 @@ def voting_vs_offer(rec, contract, n, blk, nbins=6):
         print(f"  A{i:<6}" + "".join(cells))
 
 
+def renegotiation_block(rec, K, contract, n, blk, agreed_any, agree_round, theta_ag,
+                        contracted):
+    """The `negotiation` block's analogue when there is no single agreement.
+
+    Under BARGAIN_BINDING=segment/sticky an episode does not agree once; it holds up
+    to K separate negotiations. So the questions change: how much of the episode ends
+    up governed, what theta it is governed AT, and -- the one that decides how the
+    result may be described -- whether that theta is a bargained consensus or just an
+    average over whoever held the pen.
+    """
+    carried = rec["newly"]                                       # (K, E) new deal
+    blk("renegotiation  (one bargain per segment)")
+    print(f"  segments contracted  {contracted.mean():.3f}  "
+          f"({int(contracted.sum())}/{contracted.size})")
+    print(f"  offers that carried  {carried.mean():.3f} per round")
+    print(f"  first contracted     R{agree_round.mean():.2f} +- "
+          f"{agree_round.std():.2f}   (K={K} means never)")
+    if contracted.any():
+        t = rec["theta_eff"][contracted]
+        print(f"  theta in force       {t.mean():.4f} +- {t.std():.4f}   "
+              f"[{t.min():.3f}, {t.max():.3f}]")
+    # Churn: how often the contract in force actually changes between segments. Near
+    # zero means renegotiation is nominal -- the first deal is re-ratified every
+    # segment and the protocol has collapsed back onto `episode` in all but name.
+    if K > 1:
+        churn = np.abs(np.diff(rec["theta_eff"], axis=0)) > 1e-9
+        print(f"  contract changes     {churn.mean():.3f} per segment boundary")
+        half = K // 2
+        early = rec["theta_eff"][:half][contracted[:half]]
+        late = rec["theta_eff"][half:][contracted[half:]]
+        if early.size and late.size:
+            # Escalation or concession over the episode: the proposer's leverage
+            # should fall as the remaining episode shrinks, which is the one piece
+            # of Rubinstein intuition that survives per-segment renegotiation.
+            print(f"  theta drift          {early.mean():.4f} (first half) -> "
+                  f"{late.mean():.4f} (second half)")
+
+    # THE check on how this result may be described. If each proposer carries its own
+    # very different theta, an even average is turn-taking -- every agent gets a turn
+    # as dictator -- not bargaining. Convergence across proposers is the evidence
+    # that the responders, not the rotation, are setting the number.
+    per_prop = []
+    for i in range(n):
+        m = carried & (rec["proposer"] == i)
+        per_prop.append(rec["offer"][m].mean() if m.any() else np.nan)
+    per_prop = np.array(per_prop)
+    if np.isfinite(per_prop).sum() >= 2:
+        lo, hi = np.nanmin(per_prop), np.nanmax(per_prop)
+        print(f"  theta carried by proposer  " + "  ".join(
+            f"A{i}:{v:.2f}" if np.isfinite(v) else f"A{i}:--"
+            for i, v in enumerate(per_prop)))
+        print(f"    spread {hi - lo:.3f} across proposers -- a wide spread means the "
+              f"agreed theta is\n    whoever's turn it was, not what was bargained")
+
+
 def gini_equality(v, axis=0):
     d = np.abs(np.expand_dims(v, axis) - np.expand_dims(v, axis + 1)).sum((axis, axis + 1))
     return 1.0 - d / (2.0 * v.shape[axis] * np.abs(v).sum(axis) + 1e-8)
@@ -275,16 +332,31 @@ def report(rec, K, cfg, contract, n, num_steps):
     contracted = rec["theta_eff"] > contract.null + 1e-9        # (K, E)
     cl_per_step = rec["cleaned"].sum(1) / x                     # (K, E) all agents
     agreed_any = rec["newly"].any(0)                            # (E,)
-    r_idx = np.arange(K)[:, None]
-    agree_round = np.where(agreed_any, (rec["newly"] * r_idx).sum(0), K)
-    theta_ag = (rec["newly"] * rec["offer"]).sum(0)
+    binding = cfg.get("binding", "episode")
+    # Under `episode` at most one round can carry, so "the round it agreed" and
+    # "the theta it agreed on" are single well-defined numbers. Under renegotiation
+    # there are up to K of each, so the first carried segment and the theta actually
+    # PLAYED UNDER are the analogues -- summing over carried rounds, as the episode
+    # formulas do, would add several agreements together into a number that is not
+    # any theta anyone ever offered.
+    agree_round = np.where(agreed_any, np.argmax(rec["newly"], axis=0), K)
+    if binding == "episode":
+        theta_ag = (rec["newly"] * rec["offer"]).sum(0)                    # (E,)
+    else:
+        theta_ag = ((rec["theta_eff"] * contracted).sum(0)
+                    / np.maximum(contracted.sum(0), 1))
 
     def blk(t):
         print(f"\n\033[1m{t}\033[0m" if sys.stdout.isatty() else f"\n{t}")
 
-    print(f"protocol: segment={x}  rounds={K}  proposer={cfg['proposer']}"
+    print(f"protocol: segment={x}  rounds={K}  binding={binding}  "
+          f"proposer={cfg['proposer']}"
           f"(start {cfg['rotate_start']})  quorum={cfg['quorum']}"
           f"={bg.quorum_size(cfg['quorum'], n)}/{n-1}  features={cfg['features']}")
+    if binding != "episode":
+        print("  renegotiated every segment: a carried offer governs ITS OWN segment"
+              + (", a failed round keeps the incumbent" if binding == "sticky"
+                 else ", a failed round plays uncontracted"))
     print(f"contract space: {{{contract.null:g}}} u "
           f"[{contract.low:g}, {contract.high:g}]")
     print(f"{ret.shape[1]} episodes x {num_steps} steps")
@@ -313,18 +385,22 @@ def report(rec, K, cfg, contract, n, num_steps):
         print(f"  {label:<16}{int(m.sum()):>10}{cl_per_step[m].mean():>12.3f}"
               f"{w.mean():>14.3f}{rec['river'][m].mean():>9.1f}")
 
-    blk("negotiation")
-    print(f"  agreement rate    {agreed_any.mean():.3f}  "
-          f"({int(agreed_any.sum())}/{len(agreed_any)} episodes)")
-    print(f"  agreement round   {agree_round.mean():.2f} +- {agree_round.std():.2f}"
-          f"   (K={K} means never agreed)")
-    hist = np.bincount(agree_round, minlength=K + 1)
-    print("  round histogram   " + "  ".join(
-        f"R{i}:{c}" for i, c in enumerate(hist) if c) )
-    if agreed_any.any():
-        t = theta_ag[agreed_any]
-        print(f"  theta agreed      {t.mean():.4f} +- {t.std():.4f}   "
-              f"[{t.min():.3f}, {t.max():.3f}]")
+    if binding == "episode":
+        blk("negotiation")
+        print(f"  agreement rate    {agreed_any.mean():.3f}  "
+              f"({int(agreed_any.sum())}/{len(agreed_any)} episodes)")
+        print(f"  agreement round   {agree_round.mean():.2f} +- {agree_round.std():.2f}"
+              f"   (K={K} means never agreed)")
+        hist = np.bincount(agree_round, minlength=K + 1)
+        print("  round histogram   " + "  ".join(
+            f"R{i}:{c}" for i, c in enumerate(hist) if c) )
+        if agreed_any.any():
+            t = theta_ag[agreed_any]
+            print(f"  theta agreed      {t.mean():.4f} +- {t.std():.4f}   "
+                  f"[{t.min():.3f}, {t.max():.3f}]")
+    else:
+        renegotiation_block(rec, K, contract, n, blk, agreed_any, agree_round,
+                            theta_ag, contracted)
     print(f"  steps uncontracted {(~contracted).sum(0).mean() * x:.0f} of {num_steps}")
 
     if cfg.get("report"):
@@ -394,17 +470,31 @@ def report(rec, K, cfg, contract, n, num_steps):
                       f"   (carried {int((rec['newly'] & sel).sum())})")
 
     blk("per episode")
-    print(f"  {'ep':>3}{'agree':>7}{'theta':>8}{'by':>5}{'welfare':>10}"
-          f"{'equality':>10}{'clean/step':>12}")
-    for e in range(ret.shape[1]):
-        if agreed_any[e]:
-            r = int(agree_round[e])
-            who = f"A{int(rec['proposer'][r, e])}"
-            ag, th = f"R{r}", f"{theta_ag[e]:.3f}"
-        else:
-            who, ag, th = "-", "none", "-"
-        print(f"  {e:>3}{ag:>7}{th:>8}{who:>5}{welfare[e]:>10.1f}"
-              f"{equality[e]:>10.3f}{cl_per_step[:, e].mean():>12.3f}")
+    if binding == "episode":
+        print(f"  {'ep':>3}{'agree':>7}{'theta':>8}{'by':>5}{'welfare':>10}"
+              f"{'equality':>10}{'clean/step':>12}")
+        for e in range(ret.shape[1]):
+            if agreed_any[e]:
+                r = int(agree_round[e])
+                who = f"A{int(rec['proposer'][r, e])}"
+                ag, th = f"R{r}", f"{theta_ag[e]:.3f}"
+            else:
+                who, ag, th = "-", "none", "-"
+            print(f"  {e:>3}{ag:>7}{th:>8}{who:>5}{welfare[e]:>10.1f}"
+                  f"{equality[e]:>10.3f}{cl_per_step[:, e].mean():>12.3f}")
+    else:
+        # "agreed at R3 by A5" has no meaning when every segment is its own bargain,
+        # so the columns become the episode's contracting HISTORY: how many of its
+        # segments were governed, at what mean theta, and how many distinct deals it
+        # took to get there.
+        print(f"  {'ep':>3}{'segs':>7}{'theta':>8}{'deals':>7}{'welfare':>10}"
+              f"{'equality':>10}{'clean/step':>12}")
+        for e in range(ret.shape[1]):
+            n_seg = int(contracted[:, e].sum())
+            th = f"{theta_ag[e]:.3f}" if n_seg else "-"
+            print(f"  {e:>3}{f'{n_seg}/{K}':>7}{th:>8}"
+                  f"{int(rec['newly'][:, e].sum()):>7}{welfare[e]:>10.1f}"
+                  f"{equality[e]:>10.3f}{cl_per_step[:, e].mean():>12.3f}")
 
 
 def main():

@@ -370,7 +370,18 @@ interpretable later.
 
 The protocol and the contract range both come from the sidecar now, so these need no
 flags (the paths below are illustrative — the `rubensteinV1` runs are version 1 and
-will be refused; see *Checkpoint compatibility*):
+will be refused; see *Checkpoint compatibility*).
+
+**Every tool is binding-aware and reads the mode from the run**, so an `episode` run
+and a `segment` run each replay as the game they were trained on with nothing to pass
+and nothing to remember. A run with no sidecar predates `BARGAIN_BINDING` and is
+replayed as `episode`, which is what it was. Under renegotiation the reports change
+shape rather than being reinterpreted — there is no "agreed at R3 for θ=2.4" to
+print, so `evaluate_bargain` swaps its *negotiation* block for a *renegotiation* one
+(segments contracted, θ in force, how often the contract changes at a segment
+boundary, and θ carried **by proposer identity** — the turn-taking check), and its
+per-episode table reports each episode's contracting history instead of its one
+agreement.
 
 ```bash
 # statistics, per-agent voting/proposal pattern, and accept rate binned by the theta

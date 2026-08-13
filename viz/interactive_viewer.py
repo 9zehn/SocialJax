@@ -154,6 +154,12 @@ def infer_bargain_config(stem, checkpoint=None):
         "hidden": 64,
         "accept_bias": 1.0,
         "feature_version": None,
+        # How long a carried offer binds. EVERY run without a sidecar predates this
+        # setting, so "episode" is the only correct fallback -- and it has to be a
+        # fallback rather than a guess from the stem, because replaying a
+        # renegotiated run as an absorbing one reports a first carried segment as an
+        # episode-long agreement and every downstream number follows it.
+        "binding": "episode",
     }
     side = load_run_config(checkpoint) if checkpoint else None
     for key, recorded in (("segment", "BARGAIN_SEGMENT"), ("quorum", "BARGAIN_QUORUM"),
@@ -162,6 +168,7 @@ def infer_bargain_config(stem, checkpoint=None):
                           ("rotate_start", "BARGAIN_ROTATE_START"),
                           ("hidden", "BARGAIN_HIDDEN"),
                           ("accept_bias", "BARGAIN_ACCEPT_BIAS"),
+                          ("binding", "BARGAIN_BINDING"),
                           ("feature_version", "BARGAIN_FEATURE_VERSION")):
         if side is not None and side.get(recorded) is not None:
             cfg[key] = side[recorded]
@@ -222,10 +229,13 @@ def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
     step = 0
     num_rounds = max(1, int(np.ceil(num_steps / seg)))
 
+    binding = cfg.get("binding", "episode")
     for r in range(num_rounds):
         if fixed_theta is not None:
             theta = float(fixed_theta)
         elif agreed:
+            # Only `episode` is absorbing. Under renegotiation `agreed` never
+            # becomes True, so every segment bargains again.
             theta = locked
         else:
             rng, k_prop, k_theta, k_vote = jax.random.split(rng, 4)
@@ -286,15 +296,25 @@ def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
             last_n_accept = float(n_accept)
             last_rejecters = np.array([0.0 if i == proposer else 1.0 - float(v)
                                        for i, v in enumerate(votes)], np.float32)
-            if passed and theta_offer > contract.null + 1e-6:
-                agreed, locked = True, theta_offer
-            elif passed:
-                # As in training: a null offer never locks -- accepting it buys one
-                # uncontracted segment and negotiation reopens next round.
-                pass
-            else:
+            # A null offer never takes force in any mode: accepting it buys one
+            # segment under the fallback and negotiation reopens next round.
+            took_force = passed and theta_offer > contract.null + 1e-6
+            if not passed:
                 n_reject += 1
-            theta = locked if agreed else float(contract.null)
+            if binding == "episode":
+                if took_force:
+                    agreed, locked = True, theta_offer
+                theta = locked if agreed else float(contract.null)
+            else:
+                # Renegotiated: this segment plays under the new offer if it
+                # carried, and otherwise under the fallback -- null under
+                # `segment`, the incumbent under `sticky`. `locked` carries the
+                # incumbent forward and `agreed` stays False, so the next round
+                # bargains again.
+                fallback = locked if binding == "sticky" else float(contract.null)
+                theta = theta_offer if took_force else fallback
+                locked = theta
+            rounds[-1]["in_force"] = float(theta)
 
         contract_vec = contract.to_obs(jnp.float32(theta))[None, ...]
         for _ in range(min(seg, num_steps - step)):
@@ -561,11 +581,22 @@ def _render_bargain_log(draw, x0, y0, x1, y1, rounds, colors, width, n):
         draw.text((x1, y + 2), "no offer yet", font=head_f, fill=_PANEL_MUTED,
                   anchor="ra")
         return
-    settled = next((r for r in rounds if r["accepted"]), None)
-    status = (f"agreed R{settled['round']} at θ={settled['theta']:.3f}"
-              if settled else f"{len(rounds)} rejected")
+    # Under renegotiation there is no single settlement to report, so the header
+    # becomes how much of the episode so far is governed, and at what.
+    if any("in_force" in r for r in rounds) and len(
+            {r.get("in_force") for r in rounds}) > 1:
+        live = [r["in_force"] for r in rounds if r.get("in_force", 0.0) > 1e-6]
+        status = (f"{len(live)}/{len(rounds)} segs at θ~"
+                  f"{sum(live) / len(live):.3f}" if live
+                  else f"{len(rounds)} segs uncontracted")
+        ok = bool(live)
+    else:
+        settled = next((r for r in rounds if r["accepted"]), None)
+        status = (f"agreed R{settled['round']} at θ={settled['theta']:.3f}"
+                  if settled else f"{len(rounds)} rejected")
+        ok = settled is not None
     draw.text((x1, y + 2), status, font=head_f,
-              fill=_PANEL_ON if settled else _PANEL_OFF, anchor="ra")
+              fill=_PANEL_ON if ok else _PANEL_OFF, anchor="ra")
 
     y += int(head_f.size * 2.0)
     avail = y1 - y
@@ -1487,6 +1518,16 @@ def main():
         if args.contract_theta is not None:
             print(f"  --contract-theta given: bargaining bypassed, replaying at "
                   f"theta={args.contract_theta:g} throughout")
+        elif bargain_cfg.get("binding", "episode") != "episode":
+            live = [r["in_force"] for r in bargain_rounds
+                    if r.get("in_force", 0.0) > contract.null + 1e-6]
+            mean_theta = sum(live) / len(live) if live else contract.null
+            print(f"  renegotiated every segment: {len(live)}/"
+                  f"{len(bargain_rounds)} segments contracted, mean theta in force "
+                  f"{mean_theta:.4f}")
+            # The panel's per-round log is the honest record here; a single headline
+            # theta is an average over segments that were each bargained separately.
+            contract_info = {"theta": mean_theta, "source": "(mean over segments)"}
         elif settled:
             print(f"  agreed in round {settled['round']} at theta="
                   f"{settled['theta']:.4f} (proposed by agent {settled['proposer']}, "
