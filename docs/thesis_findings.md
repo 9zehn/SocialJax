@@ -275,6 +275,69 @@ probes (10%, of which 20% null), null offers never lock, range [0, 3]. **[OURS]*
   they are not using. Majority quorum would WEAKEN harvester vetoes (cleaner
   offers pass 4/6 without them). Keep unanimity; fix the mismatch.
 
+### Uncentered-cf arms: rotate vs holdout — 2026-08-12
+
+**[OURS, wandb only — checkpoints LOST (Colab download killed before finishing;
+stream checkpoints to Drive next time). ~300 updates each, seed 42, [0,3].]**
+
+Three-way comparison: centered+rotate (previous run) vs uncentered+rotate (arm 1)
+vs uncentered+holdout (arm 2).
+
+- **Un-centering did what it was built to do**: vote levels finally moved.
+  Arm 1: accept_count ~5.1, agreement round ~3.7, in_force ~0.62 — real
+  rejection at last, but miscalibrated into a war of attrition that still ends
+  HIGH (θ̄≈2.75) after burning ~4 segments; welfare ~1450. Pivotal rate fell to
+  ~0.33 (more rejection ⇒ fewer rounds where a single vote is pivotal ⇒ less cf
+  credit — the credit mechanism is partly self-limiting under rotate).
+- **Holdout steered the agreement into the welfare-optimal band**: arm 2 agreed
+  at **θ̄≈1.55** (the [1,2] interior identified across runs) with agreement
+  round ~1.9, in_force ~0.81, welfare ~2150, less over-cleaning (waste_cleared
+  ~115 vs 130). Giving rejecters the pen converts rejection into counteroffers:
+  harvesters who refuse a 3.0 propose lower and it sticks. First run where the
+  negotiated θ lands in the welfare-optimal interior.
+- **The welfare gap vs the centered run (~2450) is disagreement deadweight, not
+  worse contracts**: ~2 burned segments ≈ −500 welfare at the near-worthless
+  disagreement point. The SPE is round-0 agreement AT the interior θ; arm 2's
+  theta_offered was still drifting down (~1.7) at cutoff — proposers learning
+  to open acceptably. Expect the gap to close with longer training and/or
+  BARGAIN_SEGMENT=50 (halves the per-rejection deadweight).
+- **Prediction registered for the missing 2×2 cell (centered + holdout)**:
+  holdout only fires on rejections, and centered credit is what suppressed
+  rejection levels — so centered+holdout should revert toward the
+  round-0-acceptance, θ̄≈2.4 outcome with a random-ish proposer. Worth running
+  to complete the {centered,uncentered}×{rotate,holdout} square, with this
+  prediction on record.
+
+### seg=50 + holdout: the rejection monopoly — 2026-08-13
+
+**[OURS, probe + 40-episode eval, run8_50segments]** Halving the segment turned
+recognition-by-holdout into a **pen monopoly**: A5 votes reject with p=0.000 on
+*everything*, so every round it responds to fails, holdout hands it the pen, and
+it dictates θ=3.000 — proposer in 40/40 agreements (R0:6 by lottery, R1:34), θ̄ =
+2.9996 ± 0.003. This is exactly the strategic risk the mechanism priced by the
+burned segment — and at seg=50 the price halved, making blackmail profitable.
+The others' near-1.0 acceptance is a rational best response: rejecting A5's 3.0
+only delays the inevitable and returns the pen to A5.
+
+- **The dictatorship is oddly benign on aggregates**: welfare 2377±54 (lowest
+  variance of any run), equality 0.925, ratio 1.046, river 139, only 42/1000
+  steps uncontracted — a *stable extractive institution* whose rent is largely
+  dissipated by cleaner entry anyway. Compare seg=100 holdout (θ̄≈1.55,
+  interior): the exploit is specifically the CHEAP-DELAY × holdout interaction,
+  not holdout itself.
+- **Belief curves elsewhere finally have the right shapes**: harvesters' gaps
+  decrease in θ, cleaners' increase with reservation crossings at θ≈2.45–2.52 —
+  the sharpest value heads yet (shorter segments = more value data). A5's own
+  heads are meaningless: as responder it never experiences a lock (its
+  rejections prevent them), so its lock head trains on nothing — the
+  entrenchment is self-sealing in data as well as strategy.
+- **Protocol-design lesson for the write-up**: recognition-by-holdout requires
+  delay to be expensive; the segment length is not a nuisance parameter but the
+  price of proposal power, and below some threshold the mechanism flips from
+  "rejecters counter" to "rejecters rule". A mixed recognition rule (pen to a
+  rejecter with prob q < 1, else random) is the natural tax on the monopoly —
+  held in reserve.
+
 ## D. The vote-blindness defect and the fix (2026-08-12)
 
 - **Root cause of both degenerate equilibria:** features are built *before* the
@@ -337,6 +400,53 @@ probes (10%, of which 20% null), null offers never lock, range [0, 3]. **[OURS]*
   lowballs. Failure signature worth naming in advance: p(accept) flat while the
   believed gap is correctly signed would mean the branch heads learned the right
   thing and the policy still did not act on it.
+
+## E2. Reporting mechanism, first run (runs/reporting_tests/v1) — 2026-08-13
+
+**[OURS, 40-episode eval; gae/rotate/seg100/[0,3] substrate; p=0.25, λ=2, cap 20
+— deliberately on the lying side of λ\*=3. No sidecar came back; params passed by
+flag.]**
+
+- **Fraud emerged from honest initialisation, in every agent.** Mean overclaim
+  15.1 of cap 20; harvesters claim ~10× their true cleaning (true ~1.3–1.8
+  cells/window, claimed +14–16); cleaners (true ~25) inflate by the same ~15.
+  Caught rate ≈ audit p (0.22–0.30 vs 0.25) as it must be. With per-unit lying
+  EV = θ(1−p(1+λ)) = +0.25θ, the optimum is the cap; policies sit at ~75% of it
+  (Gaussian spread + possibly still climbing). The Becker calculus is being
+  found by learning — the instrument works.
+- **The costs**: welfare 1747±509 vs the paired no-reporting control's 2555
+  (−32%), equality 0.626 vs 0.910. Three channels: (a) audit-lottery variance —
+  identical strategies, wildly different returns (A6 153 vs A3 332); (b) low-θ
+  locks became catastrophic (θ≈0.1–0.2 episodes at welfare 226–366 — with claim
+  income ∝ θ, near-null contracts kill both channels at once); (c) even θ=3
+  episodes lost ~400 vs control — suspected TRAINING ARTIFACT: settlements land
+  as ±60-scale lumps on window-boundary steps inside the gameplay reward stream
+  (vs ~1/step apples), injecting credit noise into harvest policies. (c) is an
+  implementation cost of the rung-1 reward routing, not a finding about fraud —
+  keep the two separate in the write-up.
+- Negotiation itself tolerated the enforcement layer: agreement 40/40, θ̄=2.37,
+  R0 acceptance 0.80 — the contract and reporting layers compose.
+- **Fraud scales with θ** (offline sweep of the claim heads): mean overclaim
+  rises monotonically ~9.6 → ~16 as θ goes 0.25 → 3, for every agent. The
+  *rational optimum is the cap at any θ>0*, so the slope is a learning-dynamics
+  fingerprint, not an equilibrium property: the REINFORCE push per unit of
+  overclaim is θ(1−p(1+λ)) = 0.25θ, so policies climbed fastest where lying
+  pays most — the same slopes-before-levels signature the vote head showed.
+  Prediction: longer training flattens the curve toward the cap everywhere.
+- **Cleaners overclaim slightly more than harvesters at equal θ** (+0.7–1.0).
+  Note "having cover" confers zero advantage under exogenous audits (detection
+  is mechanical, not plausibility-based) — this measurement is the baseline
+  against which rung-2 strategic auditing, where cover SHOULD matter, will be
+  read.
+- **Seven independent learners converged to near-identical fraud curves**
+  (spread <0.2 at every θ) — the bandit is symmetric across agents, so this is
+  an internal replication of the Becker response, seven times in one run.
+  Sanity: the sweep at the run's θ̄=2.37 gives ~15, matching the eval's 15.05.
+- **Next**: the honesty-side twin (λ=6) to complete the Becker pair; then a
+  (p, λ) grid. If welfare stays depressed at λ=6 (where lying ≈ 0 and
+  settlements ≈ 0), the noise explanation for (c) weakens and something real is
+  going on. Figure idea: pool all reporting runs and plot learned overclaim
+  against the per-unit incentive θ(1−p(1+λ)) — the "price of fraud" curve.
 
 ## F. Standing methodological cautions
 

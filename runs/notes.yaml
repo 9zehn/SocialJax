@@ -14,6 +14,23 @@
 # Add an entry the day a run is downloaded, while you still remember why you
 # launched it. That is the only discipline this scheme asks for.
 
+# ----------------------------------------------------------------- reporting
+
+runs/reporting_tests/v1:
+  status: valid
+  note: >
+    First claims-and-audits run (REPORT_ENABLE, p=0.25, fine x2, cap 20 -- the
+    LYING side of the honesty boundary lambda*=3) on the gae/rotate/seg100/[0,3]
+    substrate, seed 42. Fraud emerged from the honest init in all seven agents:
+    mean overclaim 15.1/20, harvesters claiming ~10x their true cleaning.
+    Welfare 1747 vs the no-reporting twin's 2555 and equality 0.626 vs 0.910 --
+    part audit-lottery variance, part suspected gameplay-credit noise from lump
+    settlements (see thesis_findings E2 before quoting the welfare number as a
+    fraud cost). No .run.yaml sidecar: evaluate with --contract-low 0
+    --contract-high 3 --report-audit-p 0.25 --report-fine-mult 2
+    --report-max-overclaim 20. Stem collides with run4 and the gae [0,3] run;
+    keep in its own directory.
+
 # ---------------------------------------------------------------- bargaining
 
 runs/rubensteinV1/run4_fablefixV1:
