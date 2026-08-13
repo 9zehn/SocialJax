@@ -123,6 +123,24 @@
 # of one rejection, which is the whole lever on bargaining power: at 100 steps of a
 # 1000-step episode a rejection burns roughly a tenth of the episode's welfare.
 "BARGAIN_SEGMENT": 100
+# How long an accepted contract binds for.
+#   "episode" -- the original Rubinstein game: the first offer to carry binds for
+#                every remaining segment and bargaining ENDS.
+#   "segment" -- renegotiated from scratch every segment; a carried offer governs
+#                its own segment only, and a failed round plays uncontracted.
+#   "sticky"  -- renegotiated too, but a failed round leaves the INCUMBENT contract
+#                in force rather than falling back to null.
+# Why the switch away from "episode": the counterfactual value heads measured the
+# problem directly. A single vote decided the whole rest of the episode (believed
+# lock-continue gaps of +60 to +250 against a per-agent episode return around 390)
+# while the threat backing that vote was one segment, so accepting really was
+# optimal at every theta and no reservation value could exist. Under "segment"
+# stake and threat are the same size, and proposing in round r captures round r
+# rather than the episode -- which also removes the round-0 dictatorship.
+# The cost is theoretical: with no shrinking pie and no delay cost this is no
+# longer alternating-offers bargaining but a repeated contracting game.
+# (Code default is "episode", so tests and existing arms are unaffected.)
+"BARGAIN_BINDING": "segment"
 # Who proposes in round r. "rotate" is the symmetric Rubinstein protocol; "random"
 # is Baron-Ferejohn recognition; "contribution" weights proposal power by cumulative
 # cleaning (Ostrom's proportional equivalence); "holdout" draws uniformly among LAST
@@ -130,7 +148,11 @@
 # analogue of Rubinstein's "the one who refuses speaks next". It collapses the
 # credit path from rejection to counteroffer into a single move: reject and you may
 # hold the pen. Rejecting to farm proposal power is priced by the burned segment.
-"BARGAIN_PROPOSER": "rotate"
+# Set to "random" for the renegotiation line: under BARGAIN_BINDING=segment there is
+# no first-mover premium left to equalise (proposing in round r captures round r),
+# so rotation's job is done by the protocol, and random recognition is the standard
+# multilateral baseline to state the result against.
+"BARGAIN_PROPOSER": "random"
 # BARGAIN_PROPOSER=rotate only: who holds the FIRST move.
 #   "random" -- drawn once per episode per env (default). Rotation alone is not
 #               enough to make the protocol symmetric: the SPE of this game is

@@ -456,6 +456,18 @@ def make_train(config):
                   f"{config['REPORT_FINE_MULT']} (honesty needs > "
                   f"{reporting.honesty_threshold(p_audit):.2f}), overclaim cap "
                   f"{config['REPORT_MAX_OVERCLAIM']}", flush=True)
+        # How long an accepted contract binds. See bargain.apply_binding.
+        config.setdefault("BARGAIN_BINDING", "episode")
+        if config["BARGAIN_BINDING"] not in bargain.BINDING_MODES:
+            raise ValueError(
+                f"BARGAIN_BINDING must be one of "
+                f"{', '.join(bargain.BINDING_MODES)}; got "
+                f"{config['BARGAIN_BINDING']!r}. 'episode' is the original game -- "
+                f"the first offer to carry binds for the rest of the episode. "
+                f"'segment' renegotiates every segment with a null fallback, and "
+                f"'sticky' renegotiates but leaves the incumbent contract in force "
+                f"when a round fails. The renegotiating modes are NOT Rubinstein: "
+                f"there is no shrinking pie and no delay cost.")
         # How the VOTE head is credited. The proposal head keeps the GAE advantage
         # either way -- a proposal has no pivotality and no branch structure.
         config.setdefault("BARGAIN_VOTE_ADVANTAGE", "gae")
@@ -688,6 +700,9 @@ def make_train(config):
         # BARGAIN_VOTE_ADVANTAGE=gae the module is exactly what it was before they
         # were written, down to the parameter tree.
         cf_vote = config.get("BARGAIN_VOTE_ADVANTAGE", "gae") == "counterfactual"
+        # Read once here rather than per-function: the rollout and the metrics both
+        # branch on it, and they must never disagree about which game was played.
+        binding = config.get("BARGAIN_BINDING", "episode")
         bargain_net = [
             BargainingActorCritic(
                 hidden=int(config.get("BARGAIN_HIDDEN", 64)),
@@ -1554,11 +1569,15 @@ def make_train(config):
                 # Null offers arise from null probes, and (with CONTRACT_LOW=0)
                 # from proposers themselves: the clipped unsquash puts an atom of
                 # the Gaussian's mass at exactly the lower bound.
+                # An offer of exactly the null contract never takes force: accepted
+                # or not, the segment plays uncontracted (or, under `sticky`, under
+                # whatever was already in force) -- a formal "pass this segment".
+                # How long an offer that DOES carry binds for is the whole of
+                # BARGAIN_BINDING; see bargain.apply_binding.
                 offer_null = contract.is_null(theta_offer)
-                newly = passed & ~agreed & ~offer_null
-                theta_eff = jnp.where(
-                    agreed, locked,
-                    jnp.where(newly, theta_offer, jnp.float32(contract.null)))
+                newly, theta_eff, next_agreed, next_locked = bargain.apply_binding(
+                    binding, passed, offer_null, theta_offer, agreed, locked,
+                    contract.null)
 
                 (env_state, last_obs, _, rng), (traj, cleaned, clear) = jax.lax.scan(
                     _seg_step, (env_state, last_obs, theta_eff, rng), None, x)
@@ -1614,8 +1633,8 @@ def make_train(config):
                         "claim_w": (theta_eff > contract.null).astype(jnp.float32),
                     })
                 carry = (env_state, last_obs, rng,
-                         agreed | newly,
-                         jnp.where(newly, theta_offer, locked),
+                         next_agreed,
+                         next_locked,
                          cum_return + seg_return,
                          cum_clean + jnp.transpose(cleaned.sum(axis=0)),
                          bargain.normalise_theta(theta_offer, contract.low,
@@ -1655,14 +1674,28 @@ def make_train(config):
             # Semi-MDP reward. A rejected round pays only its own null segment; the
             # round where the offer is accepted pays every remaining segment at once,
             # because bargaining ends there and those segments are its consequence.
+            #
+            # Under the renegotiating modes this degenerates to exactly the right
+            # thing with no branch: nothing is ever inactive, so `post` is zero and
+            # every round pays its own segment and no more. That lump sum is what
+            # dominated the vote's advantage in the first place, so removing it is
+            # half of what BARGAIN_BINDING=segment is for.
             active = rounds["active"]                                    # (K, E)
             post = jnp.sum(
                 jnp.where(active[:, None, :], 0.0, rounds["seg_return"]), axis=0)  # (N,E)
             rounds["reward"] = rounds["seg_return"] + (
                 rounds["newly"][:, None, :] * post[None, :, :])
             last_round = jnp.arange(K)[:, None] == (K - 1)
-            rounds["terminal"] = rounds["newly"] | last_round
-            final_theta = jnp.where(agreed, locked, jnp.float32(contract.null))
+            # A carried offer ENDS the bargaining episode only when it binds for the
+            # rest of it. Under renegotiation the episode runs on regardless, so
+            # bootstrapping must not stop at a segment that happened to agree.
+            rounds["terminal"] = ((rounds["newly"] | last_round) if binding == "episode"
+                                  else jnp.broadcast_to(last_round, active.shape))
+            # What the gameplay critic bootstraps its final value against: the locked
+            # contract under `episode`, the last segment's contract otherwise (which
+            # is what `locked` carries there).
+            final_theta = (jnp.where(agreed, locked, jnp.float32(contract.null))
+                           if binding == "episode" else locked)
             return traj_batch, rounds, env_state, last_obs, final_theta, rng
 
         def _update_step_joint_bargain(runner_state, unused):
@@ -1885,21 +1918,37 @@ def make_train(config):
 
             agreed_any = rounds["newly"].any(axis=0)                   # (E,)
             K = config["BARGAIN_ROUNDS"]
-            # Round of agreement, K if the episode never agreed -- so the mean is
-            # directly "how many rounds of bargaining were burned".
+            # FIRST round in which an offer carried, K if none ever did. Under
+            # `episode` that is the round of agreement, and its mean is directly
+            # "how many rounds of bargaining were burned"; under renegotiation it is
+            # how long the agents took to get a contract in force at all, and the
+            # series that carries the outcome from then on is in_force_rate.
             round_idx = jnp.arange(K)[:, None]
             agree_round = jnp.where(
-                agreed_any, jnp.sum(jnp.where(rounds["newly"], round_idx, 0), axis=0), K)
-            out["agreement_rate"] = agreed_any.mean()
+                agreed_any, jnp.argmax(rounds["newly"].astype(jnp.int32), axis=0), K)
+            # Under `episode` an episode agrees at most once, so the fraction of
+            # ROUNDS that carried and the fraction of EPISODES that agreed are the
+            # same question asked twice; under renegotiation they are not, and the
+            # per-round rate is the one that means anything.
+            out["agreement_rate"] = (agreed_any.mean() if binding == "episode"
+                                     else rounds["newly"].mean())
             out["agreement_round"] = agree_round.mean()
             out["disagreement_steps"] = agree_round.mean() * config["BARGAIN_SEGMENT"]
-            out["contract_in_force_rate"] = (
-                rounds["theta_eff"] > contract.null).mean()
-            # theta actually agreed, averaged over the envs that agreed at all.
-            agreed_theta = jnp.sum(jnp.where(rounds["newly"], rounds["theta_offer"], 0.0),
-                                   axis=0)
-            out["theta_agreed"] = (jnp.sum(agreed_theta) /
-                                   jnp.maximum(agreed_any.sum(), 1.0))
+            in_force = rounds["theta_eff"] > contract.null
+            out["contract_in_force_rate"] = in_force.mean()
+            if binding == "episode":
+                # theta actually agreed, averaged over the envs that agreed at all.
+                agreed_theta = jnp.sum(
+                    jnp.where(rounds["newly"], rounds["theta_offer"], 0.0), axis=0)
+                out["theta_agreed"] = (jnp.sum(agreed_theta) /
+                                       jnp.maximum(agreed_any.sum(), 1.0))
+            else:
+                # There is no single agreed theta -- there are up to K of them, one
+                # per segment -- so this becomes the theta actually PLAYED UNDER,
+                # averaged over the segments that had a contract at all.
+                out["theta_agreed"] = (
+                    (rounds["theta_eff"] * in_force).sum()
+                    / jnp.maximum(in_force.sum(), 1.0))
             # Masked by `active`: agents still emit an offer in rounds after
             # agreement, but it is never read, so averaging it in would report
             # untrained noise as the policy's asking price. Probe rounds are masked

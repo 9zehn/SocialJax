@@ -24,6 +24,12 @@ The game, over an episode of T steps split into K segments of `segment` steps:
         else:                  theta = 0 for segment r, continue to round r+1
     never agreed -> the null contract for the whole episode
 
+That is `BARGAIN_BINDING=episode`. Under `segment` and `sticky` there is no "while
+no contract is in force" -- every segment is renegotiated from scratch, so an offer
+that carries governs its own segment only. See `apply_binding` for why, and for
+what it costs: the shrinking pie and the delay cost that make this Rubinstein are
+exactly what those modes remove.
+
 The round is TWO passes over the same network, not one, and that is load-bearing: a
 vote produced in the same pass as the proposal cannot condition on the offer, which
 leaves "reject anything below my reservation value" outside the policy class
@@ -57,6 +63,8 @@ PROPOSER_MODES = ("rotate", "random", "contribution", "holdout")
 # result can be shown not to depend on handing agents the inequality signal --
 # see `feature_mask`.
 FEATURE_LEVELS = ("protocol", "private", "public")
+# How long an accepted contract binds for. See `apply_binding`.
+BINDING_MODES = ("episode", "segment", "sticky")
 
 # Bumped whenever the feature layout or the round protocol changes, and recorded in
 # every run's .run.yaml sidecar. Weights are shaped by the feature dimension, so a
@@ -141,6 +149,67 @@ def proposer_for_round(round_idx, num_agents: int, num_envs: int, mode: str,
         return jax.random.categorical(key, jnp.log(w + 1e-9), axis=-1).astype(jnp.int32)
     raise ValueError(f"unknown BARGAIN_PROPOSER {mode!r} "
                      f"(available: {', '.join(PROPOSER_MODES)})")
+
+
+def apply_binding(mode: str, passed, offer_null, theta_offer, agreed, standing,
+                  null_theta) -> Tuple:
+    """How long an accepted offer binds. The one place the three protocols differ.
+
+    `episode` is the original game: the first offer to carry binds for every
+    remaining segment and bargaining ENDS. That makes the stake attached to a single
+    vote the whole rest of the episode, while the threat backing that vote is one
+    segment -- and the measured lock-continue gaps (+60 to +250 against a per-agent
+    episode return around 390) say that ratio is why nobody can afford to refuse.
+    It also hands the entire episode to whoever happens to propose in round 0.
+
+    `segment` renegotiates from scratch every segment: an offer that carries governs
+    ITS OWN segment and nothing more, and a failed round plays uncontracted. Stake
+    and threat are then the same size -- one segment either way -- and proposing in
+    round r captures round r rather than the episode. This stops being Rubinstein
+    (there is no shrinking pie and no delay cost) and becomes a repeated contracting
+    game; the literature to check it against is repeated games and relational
+    contracts rather than alternating offers.
+
+    `sticky` renegotiates too, but a failed round leaves the INCUMBENT contract in
+    force instead of falling back to null. Rejection then costs a responder who
+    likes the current deal nothing at all, which is the strongest responder position
+    of the three -- at the price that round 0 still bargains against a null
+    disagreement point and whatever it settles becomes the default thereafter.
+
+    Under every mode an offer of exactly the null contract never takes force: it is
+    a formal pass, so the fallback applies and the vote on it is outcome-free.
+
+    Args:
+        passed: (E,) bool, did the vote reach quorum.
+        offer_null: (E,) bool, was the offer exactly the null contract.
+        theta_offer: (E,) the offer on the table.
+        agreed: (E,) bool, has a contract already bound (episode mode only; stays
+            False forever under the renegotiating modes, which is what keeps every
+            round `active` with no special-casing downstream).
+        standing: (E,) the contract in force before this round -- the locked one
+            under `episode`, last segment's effective theta under `sticky`.
+        null_theta: the null contract's value.
+
+    Returns:
+        in_force: (E,) bool, did THIS round's offer take force.
+        theta_eff: (E,) the contract this segment actually plays under.
+        next_agreed, next_standing: the carry for the following round.
+    """
+    if mode not in BINDING_MODES:
+        raise ValueError(f"BARGAIN_BINDING must be one of "
+                         f"{', '.join(BINDING_MODES)}; got {mode!r}")
+    live = passed & ~offer_null
+    if mode == "episode":
+        in_force = live & ~agreed
+        theta_eff = jnp.where(
+            agreed, standing, jnp.where(in_force, theta_offer, null_theta))
+        return (in_force, theta_eff, agreed | in_force,
+                jnp.where(in_force, theta_offer, standing))
+    fallback = jnp.float32(null_theta) if mode == "segment" else standing
+    theta_eff = jnp.where(live, theta_offer, fallback)
+    # `agreed` is passed through untouched: nothing is ever absorbing here, so every
+    # round stays a decision point and `active` needs no mode-specific handling.
+    return live, theta_eff, agreed, theta_eff
 
 
 def is_proposer_mask(proposer_idx, num_agents: int) -> jnp.ndarray:

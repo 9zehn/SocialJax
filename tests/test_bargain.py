@@ -112,6 +112,78 @@ def test_proposer_never_votes_on_its_own_offer():
     assert bool(passed[0]) and int(n[0]) == 3
 
 
+# --------------------------------------------------------- how long it binds
+
+def _bind(mode, passed, offer_null=False, theta=1.5, agreed=False, standing=0.0):
+    """apply_binding on one env, as python scalars in and out."""
+    out = bargain.apply_binding(
+        mode, jnp.array([passed]), jnp.array([offer_null]),
+        jnp.array([theta], jnp.float32), jnp.array([agreed]),
+        jnp.array([standing], jnp.float32), 0.0)
+    in_force, theta_eff, next_agreed, next_standing = out
+    return (bool(in_force[0]), float(theta_eff[0]),
+            bool(next_agreed[0]), float(next_standing[0]))
+
+
+def test_episode_binding_is_absorbing():
+    """The original game: the first offer to carry binds for the rest of the
+    episode, and every later round is a non-decision."""
+    assert _bind("episode", passed=True) == (True, 1.5, True, 1.5)
+    # Once agreed, a later round changes nothing -- the locked theta keeps playing
+    # whatever is offered or voted after it.
+    assert _bind("episode", passed=True, theta=2.5, agreed=True, standing=1.5) == \
+        (False, 1.5, True, 1.5)
+    # A failed round plays uncontracted and leaves the state untouched.
+    assert _bind("episode", passed=False) == (False, 0.0, False, 0.0)
+
+
+def test_segment_binding_never_absorbs():
+    """Renegotiation: a carried offer governs its own segment and nothing more, so
+    nothing is ever absorbing and every round stays a decision point.
+
+    `agreed` staying False forever is load-bearing rather than incidental -- the
+    rollout derives `active` from it, so this is what keeps every round in the loss.
+    """
+    assert _bind("segment", passed=True) == (True, 1.5, False, 1.5)
+    # A failed round falls back to null, and does NOT inherit last segment's deal.
+    assert _bind("segment", passed=False, standing=1.5) == (False, 0.0, False, 0.0)
+    # Having carried before buys the proposer nothing this round.
+    assert _bind("segment", passed=False, agreed=True, standing=2.0)[:2] == (False, 0.0)
+
+
+def test_sticky_binding_keeps_the_incumbent_on_a_failed_round():
+    """The variant where refusing costs a satisfied responder nothing: the contract
+    it already likes stays in force, so only a Pareto-improving offer can move it."""
+    assert _bind("sticky", passed=True, theta=2.5, standing=1.5) == \
+        (True, 2.5, False, 2.5)
+    # Refused -> the incumbent plays on, which is the whole difference from segment.
+    assert _bind("sticky", passed=False, standing=1.5) == (False, 1.5, False, 1.5)
+    # With no incumbent yet (round 0) the fallback is null, as it must be.
+    assert _bind("sticky", passed=False, standing=0.0) == (False, 0.0, False, 0.0)
+
+
+def test_a_null_offer_never_takes_force_under_any_binding():
+    """It is a formal pass in every mode: accepted or not, the fallback applies, so
+    the vote on it is outcome-free and is masked out of the loss."""
+    for mode, standing, want in (("episode", 0.0, 0.0), ("segment", 1.5, 0.0),
+                                 ("sticky", 1.5, 1.5)):
+        in_force, theta_eff, _, _ = _bind(mode, passed=True, offer_null=True,
+                                          theta=0.0, standing=standing)
+        assert not in_force, mode
+        assert theta_eff == want, mode
+
+
+def test_unknown_binding_is_refused():
+    try:
+        bargain.apply_binding("forever", jnp.array([True]), jnp.array([False]),
+                              jnp.array([1.0]), jnp.array([False]),
+                              jnp.array([0.0]), 0.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unknown BARGAIN_BINDING should raise")
+
+
 # ------------------------------------------------------------------- features
 
 def _feats(n, envs=2, level="protocol", **over):

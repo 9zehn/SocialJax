@@ -52,6 +52,45 @@ Rejection costs **one segment**, not the episode. At `BARGAIN_SEGMENT=100` of a
 1000-step episode that is roughly a tenth of the episode's welfare — the single lever
 on bargaining power.
 
+### How long a contract binds (`BARGAIN_BINDING`)
+
+The sketch above is `episode`, the original game. The counterfactual value heads then
+measured why it does not bite: a single vote decides the **whole rest of the
+episode** — believed lock-continue gaps of +60 to +250 against a per-agent episode
+return of ~390 — while the threat backing that vote is one segment. Accepting really
+is optimal at every θ under that ratio, so no reservation value can exist, and
+whoever proposes in round 0 captures the episode.
+
+| mode | a carried offer governs | a failed round plays under |
+|---|---|---|
+| `episode` | every remaining segment; bargaining ends | null, and bargaining reopens |
+| `segment` | its own segment only | null |
+| `sticky` | its own segment only | **the incumbent contract** |
+
+Under `segment` the stake and the threat are the same size — one segment either way —
+and proposing in round *r* captures round *r*. Under `sticky`, refusing costs a
+responder that already likes the deal nothing at all, which is the strongest
+responder position of the three; the price is that round 0 still bargains against a
+null disagreement point and whatever it settles becomes the default.
+
+**This is a real change of game, not a tuning knob.** With no shrinking pie and no
+delay cost, the renegotiating modes are not alternating-offers bargaining; they are a
+repeated contracting game, and the literature to state a result against is repeated
+games and relational contracts rather than Rubinstein. Two consequences worth
+holding onto:
+
+- Prop 4.5-style extraction reasserts itself *within* each segment — the proposer can
+  still hold responders to a one-segment disagreement point. What changes is that the
+  prize per negotiation is one segment rather than the episode.
+- Because each agent proposes on some segments and not others, an equal split can
+  arise from **turn-taking averaging** rather than from bargaining power. Report θ by
+  proposer identity before claiming otherwise.
+
+The clean test this buys: if agents still accept everything when only one segment is
+at stake, then a contracted segment is worth far more than a null one to everyone and
+the binding constraint is the **environment** — the dilemma is too weak — not the
+protocol. Either way the answer is informative.
+
 ### Two passes per round, not one
 
 A round is two forward passes over the same network, sharing parameters and

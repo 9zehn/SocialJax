@@ -77,6 +77,13 @@ SMOKE_ARMS = {
     # scripted offers are all exercised in the same two updates.
     "bargain_cf": {**ARMS["bargain"], "BARGAIN_VOTE_ADVANTAGE": "counterfactual",
                    "BARGAIN_PROBE_FRAC": 0.5},
+    # Per-segment renegotiation with counterfactual credit -- the two together are
+    # the current experiment line. Every round is a live decision here, which is a
+    # different code path through the reward construction, the terminal mask and
+    # the branch-head masks than anything above exercises.
+    "bargain_renegotiate": {**ARMS["bargain"], "BARGAIN_BINDING": "segment",
+                            "BARGAIN_VOTE_ADVANTAGE": "counterfactual",
+                            "BARGAIN_PROBE_FRAC": 0.5},
 }
 ALL_ARMS = {**ARMS, **SMOKE_ARMS}
 
@@ -187,6 +194,20 @@ def test_counterfactual_vote_credit_runs_end_to_end():
     # Under unanimity almost every consequential vote is pivotal, so a zero rate
     # would mean the mask is wrong and the vote head is being trained on nothing.
     assert sig["metrics_joint/joint/cf/pivotal_rate"] > 0.0
+
+
+def test_per_segment_renegotiation_runs_end_to_end():
+    """Smoke, not a pin. Every round is a decision under BARGAIN_BINDING=segment, so
+    the reward loses its lump sum, the terminal mask stops firing on agreement and
+    the branch heads see a different split of rounds -- three things that only meet
+    in a real update, and whose failure mode is NaN rather than a wrong number."""
+    sig = _signature_isolated("bargain_renegotiate")
+    bad = {k: v for k, v in sig.items() if not np.isfinite(v)}
+    assert not bad, f"non-finite series under per-segment renegotiation: {bad}"
+    # agreement_rate is per-ROUND here, not per-episode, and a contract in force in
+    # every segment or none would mean the binding switch never took effect.
+    rate = sig["metrics_joint/joint/agree/rate"]
+    assert 0.0 < rate < 1.0, f"per-segment agreement rate is degenerate: {rate}"
 
 
 def _update(names=()):
