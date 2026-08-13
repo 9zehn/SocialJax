@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from algorithms.MOCA import bargain
+from algorithms.MOCA import bargain, contracts
 from algorithms.MOCA.networks import BargainingActorCritic
 
 
@@ -110,6 +110,135 @@ def test_proposer_never_votes_on_its_own_offer():
     votes = jnp.array([[False], [True], [True], [True]])
     passed, n = bargain.accepted(votes, proposer, quorum, num_agents)
     assert bool(passed[0]) and int(n[0]) == 3
+
+
+# ------------------------------------------------------------- the harvest tax
+
+def _tax(tau, harvest, window, n=None):
+    """tax_transfer on one env. `window` is a list of per-step cleaning rows."""
+    window = np.asarray(window, np.float32)
+    n = n or window.shape[-1]
+    c = contracts.HarvestTaxContract(n, low=0.0, high=1.0)
+    return np.array(c.tax_transfer(jnp.float32(tau), jnp.asarray(harvest, jnp.float32),
+                                   jnp.asarray(window)))
+
+
+def test_the_tax_is_zero_sum_every_step():
+    """The whole point of a CONTRACT rather than a penalty: it redistributes and
+    cannot create or destroy welfare. If this fails the mechanism is quietly paying
+    agents out of nowhere, and every welfare number in the run is meaningless."""
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        n = int(rng.integers(2, 8))
+        t = _tax(rng.uniform(0, 1), rng.integers(0, 3, n).astype(np.float32),
+                 rng.integers(0, 4, (5, n)).astype(np.float32))
+        assert abs(t.sum()) < 1e-4, t
+    # Including the corner where the same agent is the only harvester AND the only
+    # cleaner: it pays the pot and receives all of it, netting exactly zero.
+    solo = _tax(0.5, [4.0, 0.0, 0.0], [[2.0, 0.0, 0.0]])
+    assert np.allclose(solo, 0.0, atol=1e-6), solo
+
+
+def test_the_tax_is_deducted_from_the_harvest_immediately():
+    """An agent harvesting k apples nets (1-tau)*k before any payout reaches it, so
+    the price of appropriation is felt on the step it appropriates -- not at the end
+    of a window, where it would be a lump the policy cannot attribute."""
+    tau, k = 0.25, 4.0
+    # A2 harvests k and cleans nothing; A0 does all the cleaning and takes the pot.
+    t = _tax(tau, [0.0, 0.0, k], [[3.0, 0.0, 0.0]])
+    assert np.isclose(t[2], -tau * k), t          # nets (1 - tau) * k
+    assert np.isclose(t[0], tau * k), t           # the whole pot, being the only cleaner
+    assert np.isclose(t[1], 0.0), t               # idle: no harvest, no bill
+    # Two cleaners split the pot in proportion to window cleaning, 3:1.
+    t = _tax(tau, [0.0, 0.0, k], [[3.0, 1.0, 0.0]])
+    assert np.isclose(t[0], 0.75 * tau * k) and np.isclose(t[1], 0.25 * tau * k), t
+
+
+def test_no_levy_when_nobody_has_cleaned_recently():
+    """Taxing with no one to pay would burn welfare and break the zero-sum property,
+    so the tax simply does not fire -- harvesters keep everything."""
+    t = _tax(0.9, [5.0, 5.0, 5.0], np.zeros((4, 3)))
+    assert np.allclose(t, 0.0), t
+    # And it resumes the moment somebody cleans, with no residue from the dry spell.
+    t = _tax(0.9, [5.0, 5.0, 5.0], [[0, 0, 0], [0, 0, 0], [0, 0, 1.0]])
+    assert np.isclose(t[2], -0.9 * 5.0 + 0.9 * 15.0), t
+
+
+def test_the_null_contract_levies_nothing():
+    """tau = 0 has to leave the disagreement point genuinely uncontracted: it is what
+    every acceptance rule measures against."""
+    t = _tax(0.0, [3.0, 1.0, 0.0], [[1.0, 2.0, 0.0]])
+    assert np.allclose(t, 0.0), t
+
+
+def test_the_window_rolls_and_keeps_only_the_trailing_steps():
+    """The payout weighting is a trailing window, so work drops out of it on schedule
+    -- cleaning is bursty, and a one-step weighting would pay a working cleaner
+    nothing on most of its steps."""
+    n, w = 3, 3
+    win = contracts.new_tax_window(w, n)
+    assert np.asarray(win).shape == (w, n)
+    for step in (1.0, 2.0, 3.0):
+        win = contracts.push_tax_window(win, jnp.full((n,), step))
+    assert np.allclose(np.asarray(win), [[1.0] * n, [2.0] * n, [3.0] * n])
+    # A fourth push evicts the oldest and only the oldest.
+    win = contracts.push_tax_window(win, jnp.full((n,), 4.0))
+    assert np.allclose(np.asarray(win), [[2.0] * n, [3.0] * n, [4.0] * n])
+    # Work that has rolled out no longer earns: A0 cleaned only in the evicted step.
+    win = contracts.new_tax_window(2, n)
+    win = contracts.push_tax_window(win, jnp.array([5.0, 0.0, 0.0]))
+    win = contracts.push_tax_window(win, jnp.array([0.0, 1.0, 0.0]))
+    win = contracts.push_tax_window(win, jnp.array([0.0, 1.0, 0.0]))
+    c = contracts.HarvestTaxContract(n, low=0.0, high=1.0)
+    t = np.array(c.tax_transfer(jnp.float32(0.5), jnp.array([0.0, 0.0, 4.0]), win))
+    assert np.isclose(t[0], 0.0) and np.isclose(t[1], 2.0), t
+
+
+def test_the_tax_works_at_the_shapes_training_uses():
+    """Batched over envs, which is how the rollout calls it: harvest (E, N) against a
+    window (E, W, N). The window axis being second-to-last is load-bearing -- summing
+    the wrong axis silently averages over ENVS instead of over time, and the first
+    version of this did exactly that."""
+    E, W, N = 4, 3, 3
+    c = contracts.HarvestTaxContract(N, low=0.0, high=1.0)
+    win = contracts.new_tax_window(W, N, batch=(E,))
+    assert np.asarray(win).shape == (E, W, N)
+    # Each env gets a different cleaner, so a sum over the wrong axis would blend
+    # them and pay the wrong agent in every env but one.
+    cleaned = np.zeros((E, N), np.float32)
+    for e in range(E):
+        cleaned[e, e % N] = 1.0
+    win = contracts.push_tax_window(win, jnp.asarray(cleaned))
+    harvest = jnp.full((E, N), 2.0)
+    tau = jnp.full((E,), 0.5)
+    t = np.array(c.tax_transfer(tau, harvest, win))
+    assert t.shape == (E, N)
+    assert np.allclose(t.sum(axis=-1), 0.0, atol=1e-5), t
+    for e in range(E):
+        # The one cleaner in this env receives the whole pot (tau * 3 * 2 = 3) minus
+        # its own bill (tau * 2 = 1); everyone else just pays their bill.
+        assert np.isclose(t[e, e % N], 3.0 - 1.0), (e, t[e])
+    # A per-env tau must apply per env, not leak across the batch.
+    t = np.array(c.tax_transfer(jnp.array([0.0, 1.0, 0.5, 0.25]), harvest, win))
+    assert np.allclose(t[0], 0.0), t[0]
+
+
+def test_the_tax_refuses_the_clean_wage_signature():
+    """A silent fallback would pay a cleaning wage in a run that levied a tax: the
+    numbers would look entirely ordinary and be wrong, which is the same trap as
+    replaying at the wrong contract range."""
+    c = contracts.HarvestTaxContract(3, low=0.0, high=1.0)
+    try:
+        c.compute_transfer(jnp.float32(0.5), jnp.ones(3))
+    except NotImplementedError:
+        pass
+    else:
+        raise AssertionError("the tax contract must not answer compute_transfer")
+    # The factory still hands back the clean-wage contract by default.
+    assert type(contracts.make_contract("cleanup", 3, 0.0, 1.0)) is \
+        contracts.CleanupContract
+    assert type(contracts.make_contract("cleanup", 3, 0.0, 1.0, kind="harvest_tax")) \
+        is contracts.HarvestTaxContract
 
 
 # --------------------------------------------------------- how long it binds

@@ -46,6 +46,29 @@
 #
 # Set CONTRACT_LOW=0.0, CONTRACT_HIGH=0.2 to recover the paper's exact contract space.
 "CONTRACT_LOW": 0.2
+# What the bargained scalar MEANS. The space, the observation encoding and the null
+# contract are identical either way; only the transfer differs.
+#   "clean_wage"  -- theta is a payment per waste cell cleaned, funded evenly by the
+#                    other agents. The paper's contract space, and every run to date.
+#   "harvest_tax" -- theta is a TAX RATE on harvest income: each agent pays
+#                    theta * (its apples this step) and the pot is shared out the
+#                    same step in proportion to cleaning over the last TAX_WINDOW
+#                    steps. Levied only if somebody has cleaned recently, so it is
+#                    always zero-sum and never burns welfare.
+# Why the second exists: under clean_wage a pure harvester's bill is set by everyone
+# ELSE's cleaning, so the price it faces has nothing to do with how much it takes out
+# of the commons. A tax prices appropriation instead of subsidising provision, which
+# is the other half of Ostrom's pair, and it caps total redistribution at what was
+# actually harvested. Run it with CONTRACT_LOW=0.0 CONTRACT_HIGH=1.0 -- theta is a
+# rate, so the range is the unit interval and NOT comparable to a wage range.
+# Joint bargaining only (the phase-1 and one-shot paths have no harvest base).
+"CONTRACT_KIND": "clean_wage"
+# CONTRACT_KIND=harvest_tax: steps of trailing cleaning the payout is weighted by.
+# Cleaning is bursty -- walk to the river, clear several cells, walk back -- so a
+# payout weighted by THIS step alone would pay a working cleaner nothing on most of
+# its steps. It is a payout weighting rather than part of the contract, so it resets
+# per episode and carries across segment boundaries.
+"TAX_WINDOW": 20
 "CONTRACT_HIGH": 1.0
 # Phase 2 proposes from a discretised grid. Index 0 is the null contract whenever
 # CONTRACT_LOW > 0, and the remaining bins span [CONTRACT_LOW, CONTRACT_HIGH].

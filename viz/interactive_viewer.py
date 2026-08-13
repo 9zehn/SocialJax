@@ -165,6 +165,12 @@ def infer_bargain_config(stem, checkpoint=None):
         # renegotiated run as an absorbing one reports a first carried segment as an
         # episode-long agreement and every downstream number follows it.
         "binding": "episode",
+        # What the bargained scalar MEANS: a wage per cell cleaned, or a tax rate on
+        # harvest income. Same fallback logic, and a worse failure if it is wrong --
+        # the two pay different agents from different bases, so a mismatch is a
+        # complete fiction reported in ordinary-looking units.
+        "contract_kind": "clean_wage",
+        "tax_window": 20,
     }
     side = load_run_config(checkpoint) if checkpoint else None
     for key, recorded in (("segment", "BARGAIN_SEGMENT"), ("quorum", "BARGAIN_QUORUM"),
@@ -175,6 +181,8 @@ def infer_bargain_config(stem, checkpoint=None):
                           ("accept_bias", "BARGAIN_ACCEPT_BIAS"),
                           ("binding", "BARGAIN_BINDING"),
                           ("protocol", "BARGAIN_PROTOCOL"),
+                          ("contract_kind", "CONTRACT_KIND"),
+                          ("tax_window", "TAX_WINDOW"),
                           ("feature_version", "BARGAIN_FEATURE_VERSION")):
         if side is not None and side.get(recorded) is not None:
             cfg[key] = side[recorded]
@@ -189,6 +197,9 @@ def infer_bargain_config(stem, checkpoint=None):
     cfg["binding_source"] = ("sidecar" if side is not None
                              and side.get("BARGAIN_BINDING") is not None
                              else "fallback")
+    cfg["tax_window"] = int(cfg["tax_window"])
+    cfg["kind_source"] = ("sidecar" if side is not None
+                          and side.get("CONTRACT_KIND") is not None else "fallback")
     return cfg
 
 
@@ -208,6 +219,7 @@ def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
     contract); the round records are then empty, since nothing was negotiated.
     """
     from algorithms.MOCA import bargain as bg
+    from algorithms.MOCA import contracts as bg_contracts
     from algorithms.MOCA import negotiate as neg
     from algorithms.MOCA.networks import BargainingActorCritic, ContractActorCritic
 
@@ -244,6 +256,11 @@ def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
     num_rounds = max(1, int(np.ceil(num_steps / seg)))
 
     binding = cfg.get("binding", "episode")
+    tax_kind = cfg.get("contract_kind", "clean_wage") == "harvest_tax"
+    # Trailing cleaning for the harvest tax's payout weighting: one episode's worth,
+    # carried across segment boundaries, never read under clean_wage.
+    tax_win = bg_contracts.new_tax_window(
+        cfg.get("tax_window", 20) if tax_kind else 0, n)
     for r in range(num_rounds):
         if fixed_theta is not None:
             theta = float(fixed_theta)
@@ -375,7 +392,18 @@ def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
             step += 1
 
             cl = np.atleast_1d(np.array(info["cleaned_by_agent"], np.float32))
-            tr = np.array(contract.compute_transfer(jnp.float32(theta), jnp.asarray(cl)))
+            # The transfer the run was trained under. A harvest tax reads the
+            # harvest and a trailing cleaning window instead of this step's cleaning
+            # alone; the window is per episode and survives segment boundaries.
+            if tax_kind:
+                tax_win = bg_contracts.push_tax_window(tax_win, jnp.asarray(cl))
+                harvest = np.atleast_1d(
+                    np.array(info["original_rewards"], np.float32))
+                tr = np.array(contract.tax_transfer(
+                    jnp.float32(theta), jnp.asarray(harvest), tax_win))
+            else:
+                tr = np.array(contract.compute_transfer(jnp.float32(theta),
+                                                        jnp.asarray(cl)))
             cleaned_hist.append(cl)
             transfers.append(tr)
             cum_clean = cum_clean + cl
@@ -1551,6 +1579,17 @@ def main():
                     hidden=bargain_cfg["hidden"], label=moca["stem"])
             except ValueError as e:
                 raise SystemExit(f"[incompatible checkpoint] {e}")
+            if bargain_cfg["contract_kind"] == "harvest_tax":
+                # Same scalar space and the same observation encoding -- only the
+                # transfer differs, so the contract object is swapped rather than
+                # rebuilt. Replaying this run through the clean-wage transfer would
+                # pay a cleaning wage in a run that levied a tax.
+                from algorithms.MOCA.contracts import HarvestTaxContract
+                contract = HarvestTaxContract(env.num_agents, c_low, c_high)
+                print(f"  contract kind: HARVEST TAX "
+                      f"({bargain_cfg['kind_source']}) -- theta is a rate on "
+                      f"harvest income, shared out by cleaning over "
+                      f"{bargain_cfg['tax_window']} steps")
             if bargain_cfg.get("protocol") == "median":
                 print(f"  {len(bargain_params)} bargaining policies; "
                       f"protocol=median (simultaneous asks, the median binds), "

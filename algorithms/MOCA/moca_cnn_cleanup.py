@@ -43,7 +43,7 @@ from socialjax.wrappers.baselines import LogWrapper
 import wandb
 
 from algorithms.utils import checkpoint_filename, load_params, save_params, save_train_state
-from algorithms.MOCA import bargain, negotiate, reporting, solver
+from algorithms.MOCA import bargain, contracts, negotiate, reporting, solver
 from algorithms.MOCA.contracts import AGREE, PROPOSE, make_contract
 from algorithms.MOCA.networks import (
     BargainingActorCritic, ContractActorCritic, NegotiationActorCritic,
@@ -190,6 +190,19 @@ JOINT_BARGAIN_METRICS = {
     "contract_in_force_rate": "contract/in_force_rate",
     "theta_agreed": "contract/theta_agreed",
     "theta_offered": "contract/theta_offered",
+    # The scalar actually in force, averaged over the segments that had a contract.
+    # Under CONTRACT_KIND=harvest_tax this is the mean tax RATE in force; under
+    # clean_wage it is the mean wage. Distinct from theta_agreed, which under
+    # episode binding is the one agreed value rather than what got played.
+    "theta_in_force": "contract/theta_in_force",
+    # Harvest tax only (identically zero under clean_wage).
+    #   tax/revenue  reward levied per step, in reward units.
+    #   tax/wage     revenue / cells cleaned -- the per-cell wage the tax actually
+    #                produces, which is the number directly comparable to a
+    #                clean_wage theta. Unlike theta it is not chosen: it floats with
+    #                how much harvesting is taxed and how many agents share the pot.
+    "tax_revenue": "tax/revenue",
+    "tax_wage": "tax/wage",
     "accept_count": "contract/accept_count",
     # Max - min of the asks within a round. Under BARGAIN_PROTOCOL=median this is
     # the mechanism's own diagnostic -- are ideal points separating by role, or has
@@ -614,11 +627,36 @@ def make_train(config):
             f"{config['NULL_CONTRACT_FRAC']} -- phase 1 must see contracted play."
         )
 
+    # What the bargained scalar means. Validated here rather than at the call site so
+    # a typo is a message about CONTRACT_KIND rather than a missing-attribute error
+    # a thousand lines later.
+    contract_kind = config.setdefault("CONTRACT_KIND", "clean_wage")
+    if contract_kind not in contracts.CONTRACT_KINDS:
+        raise ValueError(
+            f"CONTRACT_KIND must be one of {', '.join(contracts.CONTRACT_KINDS)}; "
+            f"got {contract_kind!r}. 'clean_wage' pays theta per waste cell cleaned, "
+            f"funded evenly by the others; 'harvest_tax' levies theta as a rate on "
+            f"harvest income and shares the pot out by recent cleaning.")
+    if contract_kind == "harvest_tax":
+        # Every other code path calls compute_transfer(theta, cleaned), which the
+        # tax contract cannot answer -- it needs the harvest and the trailing
+        # window. Refuse up front rather than at the first phase-1 rollout.
+        if config.get("TRAINING_MODE") != "joint" or phase2_mode != "bargain":
+            raise ValueError(
+                "CONTRACT_KIND=harvest_tax is implemented for the joint bargaining "
+                "path only (TRAINING_MODE=joint, PHASE2_MODE=bargain). The phase-1 "
+                "and one-shot paths compute transfers from cleaning alone and have "
+                "no harvest base or trailing window to tax against.")
+        window = int(config.setdefault("TAX_WINDOW", 20))
+        if window < 1:
+            raise ValueError(f"TAX_WINDOW must be >= 1 steps, got {window}")
+        config["TAX_WINDOW"] = window
     contract = make_contract(
         config.get("CONTRACT_SPACE", "cleanup"),
         num_agents,
         low=config["CONTRACT_LOW"],
         high=config["CONTRACT_HIGH"],
+        kind=contract_kind,
     )
     contract_grid = contract.grid(config["NUM_CONTRACT_BINS"])
     # Plain Python copy of the grid, purely for building metric NAMES. Formatting a
@@ -741,6 +779,10 @@ def make_train(config):
         # already forced binding="segment" and vote advantage="gae" for it, so
         # everything downstream of the rollout needs no median-specific branches.
         median_protocol = config.get("BARGAIN_PROTOCOL", "alternating") == "median"
+        # Whether the bargained scalar is a tax rate rather than a cleaning wage.
+        # Python-level, so with clean_wage every branch below compiles to exactly
+        # the graph it did before the tax existed and no key is drawn differently.
+        tax_kind = config.get("CONTRACT_KIND", "clean_wage") == "harvest_tax"
         bargain_net = [
             BargainingActorCritic(
                 hidden=int(config.get("BARGAIN_HIDDEN", 64)),
@@ -1445,7 +1487,7 @@ def make_train(config):
 
             def _seg_step(carry, unused):
                 """One gameplay step under the segment's contract. Mirrors `rollout`."""
-                env_state, last_obs, theta, rng = carry
+                env_state, last_obs, theta, rng, tax_window = carry
                 contract_obs = contract.to_obs(theta)
                 rng, _rng = jax.random.split(rng)
                 obs_batch = jnp.transpose(last_obs, (1, 0, 2, 3, 4))
@@ -1465,7 +1507,26 @@ def make_train(config):
                 obsv, env_state, reward, done, info = jax.vmap(
                     env.step, in_axes=(0, 0, 0))(rng_step, env_state, env_act_list)
 
-                transfers = contract.compute_transfer(theta, info["cleaned_by_agent"])
+                # The contract's redistribution for this step, whatever kind it is.
+                # It lands in `reward` before anything downstream sees it, so GAE,
+                # the segment returns the bargaining rounds are scored on, and every
+                # welfare metric all read the same number.
+                if tax_kind:
+                    # Roll the trailing window forward FIRST: the payout weighting is
+                    # inclusive of this step, so an agent that cleans and harvests on
+                    # the same step is credited for both.
+                    tax_window = contracts.push_tax_window(
+                        tax_window, info["cleaned_by_agent"])
+                    transfers = contract.tax_transfer(
+                        theta, info["original_rewards"], tax_window)
+                    # What was actually levied, for the metrics: the receipts side of
+                    # a zero-sum transfer. Zero on steps where nobody has cleaned
+                    # recently and no tax is charged at all.
+                    tax_pot = jnp.maximum(transfers, 0.0).sum(axis=-1)      # (E,)
+                else:
+                    transfers = contract.compute_transfer(
+                        theta, info["cleaned_by_agent"])
+                    tax_pot = jnp.zeros((n_envs,), jnp.float32)
                 reward = reward + transfers
                 info = dict(info)
                 info["contract_transfer"] = transfers
@@ -1483,7 +1544,8 @@ def make_train(config):
                         log_prob[i], obs_batch[i], contract_obs, info_i))
                 cleaned = info["cleaned_by_agent"]                  # (E, N)
                 clear = info["waste_cleared"][:, 0]                 # (E,)
-                return (env_state, obsv, theta, rng), (transition, cleaned, clear)
+                return ((env_state, obsv, theta, rng, tax_window),
+                        (transition, cleaned, clear, tax_pot))
 
             # Python-level, not traced: with probes off the round draws exactly the
             # PRNG keys it always did, so existing runs and golden tests replay
@@ -1494,7 +1556,7 @@ def make_train(config):
             def _round(carry, r):
                 (env_state, last_obs, rng, agreed, locked, cum_return, cum_clean,
                  last_theta_n, had_offer, n_reject, river,
-                 last_votes, last_n_acc, last_rejecters) = carry
+                 last_votes, last_n_acc, last_rejecters, tax_window) = carry
                 # Key budget is decided at trace time from static config, and the
                 # first keys are always assigned in the same order, so switching a
                 # feature OFF reproduces the exact stream it had before the feature
@@ -1617,8 +1679,10 @@ def make_train(config):
                     binding, passed, offer_null, theta_offer, agreed, locked,
                     contract.null)
 
-                (env_state, last_obs, _, rng), (traj, cleaned, clear) = jax.lax.scan(
-                    _seg_step, (env_state, last_obs, theta_eff, rng), None, x)
+                ((env_state, last_obs, _, rng, tax_window),
+                 (traj, cleaned, clear, tax_pot)) = jax.lax.scan(
+                    _seg_step, (env_state, last_obs, theta_eff, rng, tax_window),
+                    None, x)
 
                 # Claims and audits (reporting.py). After the window has been
                 # played, each agent files an overclaim on its cleaning; audited
@@ -1655,6 +1719,10 @@ def make_train(config):
                     "feats": feats, "raw": raw, "logp_theta": jnp.stack(lp_t),
                     "vote": votes, "logp_vote": jnp.stack(lp_v), "value": values,
                     "seg_return": seg_return,
+                    # Harvest-tax revenue actually levied over the segment, for the
+                    # metrics. Identically zero under clean_wage.
+                    "tax_pot": tax_pot.sum(axis=0),
+
                     "active": ~agreed, "newly": newly,
                     "is_proposer": mine, "theta_offer": theta_offer,
                     # Every agent's sampled ask, read or not. Only the proposer's
@@ -1693,7 +1761,8 @@ def make_train(config):
                          # Who refused, for BARGAIN_PROPOSER=holdout: counted
                          # rejections only. Consumed next round; zeros mean random
                          # recognition there.
-                         (~votes.astype(bool) & ~mine).astype(jnp.float32))
+                         (~votes.astype(bool) & ~mine).astype(jnp.float32),
+                         tax_window)
                 return carry, (record, traj)
 
             def _round_median(carry, r):
@@ -1708,7 +1777,7 @@ def make_train(config):
                 """
                 (env_state, last_obs, rng, agreed, locked, cum_return, cum_clean,
                  last_theta_n, had_offer, n_reject, river,
-                 last_votes, last_n_acc, last_rejecters) = carry
+                 last_votes, last_n_acc, last_rejecters, tax_window) = carry
                 n_keys = 2 + (2 if report_on else 0)
                 keys = jax.random.split(rng, n_keys)
                 rng, k_theta = keys[0], keys[1]
@@ -1741,8 +1810,10 @@ def make_train(config):
                 theta_eff = theta_offer
                 newly = ~offer_null
 
-                (env_state, last_obs, _, rng), (traj, cleaned, clear) = jax.lax.scan(
-                    _seg_step, (env_state, last_obs, theta_eff, rng), None, x)
+                ((env_state, last_obs, _, rng, tax_window),
+                 (traj, cleaned, clear, tax_pot)) = jax.lax.scan(
+                    _seg_step, (env_state, last_obs, theta_eff, rng, tax_window),
+                    None, x)
 
                 # Claims and audits, exactly as in `_round`: the enforcement layer
                 # is orthogonal to how theta was chosen.
@@ -1777,6 +1848,10 @@ def make_train(config):
                     "logp_vote": jnp.zeros((num_agents, n_envs), jnp.float32),
                     "value": jnp.stack(v_prop),
                     "seg_return": seg_return,
+                    # Harvest-tax revenue actually levied over the segment, for the
+                    # metrics. Identically zero under clean_wage.
+                    "tax_pot": tax_pot.sum(axis=0),
+
                     "active": ~agreed, "newly": newly,
                     "is_proposer": jnp.ones((num_agents, n_envs), bool),
                     "theta_offer": theta_offer, "theta_all": theta_all,
@@ -1805,7 +1880,8 @@ def make_train(config):
                          clear[-1].astype(jnp.float32),
                          jnp.zeros_like(last_votes),
                          jnp.zeros_like(last_n_acc),
-                         jnp.zeros_like(last_rejecters))
+                         jnp.zeros_like(last_rejecters),
+                         tax_window)
                 return carry, (record, traj)
 
             zeros_e = jnp.zeros((n_envs,), jnp.float32)
@@ -1816,7 +1892,15 @@ def make_train(config):
                     zeros_e, jnp.zeros((n_envs,), bool),
                     jnp.zeros((n_envs,), jnp.int32), zeros_e,
                     jnp.zeros((num_agents, n_envs), jnp.float32), zeros_e,
-                    jnp.zeros((num_agents, n_envs), jnp.float32))
+                    jnp.zeros((num_agents, n_envs), jnp.float32),
+                    # Trailing cleaning, for the harvest tax's payout weighting.
+                    # Fresh per EPISODE and carried across segment boundaries: it is
+                    # a weighting, not part of the contract, so a cleaner that worked
+                    # through the last segment is still owed by the next one. Length
+                    # 0 under clean_wage, where it is never read.
+                    contracts.new_tax_window(
+                        config["TAX_WINDOW"] if tax_kind else 0,
+                        num_agents, batch=(n_envs,)))
             carry, (rounds, traj) = jax.lax.scan(
                 _round_median if median_protocol else _round, init, jnp.arange(K))
             env_state, last_obs, rng, agreed, locked = carry[0], carry[1], carry[2], carry[3], carry[4]
@@ -2105,6 +2189,16 @@ def make_train(config):
                 out["theta_agreed"] = (
                     (rounds["theta_eff"] * in_force).sum()
                     / jnp.maximum(in_force.sum(), 1.0))
+            out["theta_in_force"] = ((rounds["theta_eff"] * in_force).sum()
+                                     / jnp.maximum(in_force.sum(), 1.0))
+            # Harvest tax. Revenue is levied per step, so it is reported per step;
+            # the realised wage divides it by the cells that earned it, which is the
+            # figure to hold against a clean_wage theta. Both are structurally zero
+            # under clean_wage, where no pot exists.
+            steps = float(config["BARGAIN_ROUNDS"] * config["BARGAIN_SEGMENT"])
+            out["tax_revenue"] = rounds["tax_pot"].sum() / (steps * config["NUM_ENVS"])
+            cells_per_step = stacked["cleaned_by_agent"].mean() * num_agents
+            out["tax_wage"] = out["tax_revenue"] / jnp.maximum(cells_per_step, 1e-6)
             # Masked by `active`: agents still emit an offer in rounds after
             # agreement, but it is never read, so averaging it in would report
             # untrained noise as the policy's asking price. Probe rounds are masked

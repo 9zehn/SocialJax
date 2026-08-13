@@ -47,6 +47,7 @@ from algorithms.utils import contract_range, load_params, load_run_config
 from algorithms.MOCA import bargain as bg
 from algorithms.MOCA import negotiate as neg
 from algorithms.MOCA import reporting
+from algorithms.MOCA import contracts as contracts_mod
 from algorithms.MOCA.contracts import CleanupContract
 from algorithms.MOCA.networks import BargainingActorCritic, ContractActorCritic
 
@@ -72,6 +73,7 @@ def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed, cp=None):
                                  aux_heads=bg.params_have_aux_heads(bp[0]))
     mask = bg.feature_mask(cfg["features"], n)
     quorum = bg.quorum_size(cfg["quorum"], n)
+    tax_kind = cfg.get("contract_kind", "clean_wage") == "harvest_tax"
     x, K = cfg["segment"], num_steps // cfg["segment"]
     inner = int(getattr(env, "num_inner_steps", num_steps))
     ret_s = float(inner) * float(getattr(env, "apple_reward", 1.0))
@@ -85,7 +87,7 @@ def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed, cp=None):
               if cfg["rotate_start"] == "random" else None)
 
     def seg_step(carry, _):
-        st, ob, theta, rng = carry
+        st, ob, theta, rng, tax_win = carry
         cobs = contract.to_obs(theta)
         rng, ka, ks = jax.random.split(rng, 3)
         b = jnp.transpose(ob, (1, 0, 2, 3, 4))
@@ -93,14 +95,22 @@ def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed, cp=None):
         acts = [net.apply(gp[i], b[i], cobs)[0].sample(seed=keys[i]) for i in range(n)]
         ob2, st2, rew, done, info = jax.vmap(env.step)(
             jax.random.split(ks, num_envs), st, acts)
-        tr = contract.compute_transfer(theta, info["cleaned_by_agent"])
-        return (st2, ob2, theta, rng), (jnp.transpose(info["cleaned_by_agent"]),
-                                        jnp.transpose(rew), jnp.transpose(tr),
-                                        info["waste_cleared"][:, 0])
+        # Same transfer the run was trained under. Which one that is comes from the
+        # run's own CONTRACT_KIND -- replaying a tax run as a cleaning wage pays the
+        # wrong agents from the wrong base and reports it as ordinary welfare.
+        if tax_kind:
+            tax_win = contracts_mod.push_tax_window(tax_win, info["cleaned_by_agent"])
+            tr = contract.tax_transfer(theta, info["original_rewards"], tax_win)
+        else:
+            tr = contract.compute_transfer(theta, info["cleaned_by_agent"])
+        return ((st2, ob2, theta, rng, tax_win),
+                (jnp.transpose(info["cleaned_by_agent"]),
+                 jnp.transpose(rew), jnp.transpose(tr),
+                 info["waste_cleared"][:, 0]))
 
     def round_(carry, r):
         (st, ob, rng, agreed, locked, cum_r, cum_c, last_tn, had, nrej, riv,
-         last_votes, last_nacc, last_rej) = carry
+         last_votes, last_nacc, last_rej, tax_win) = carry
         if cfg.get("protocol") == "median":
             # One simultaneous pass, as in training: every agent asks, the median
             # binds this segment. There is no proposer (recorded as -1) and no
@@ -189,8 +199,8 @@ def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed, cp=None):
                 offer, agreed, locked, contract.null)
             nrej_next = nrej + (~agreed & ~passed).astype(jnp.int32)
 
-        (st, ob, _, rng), (cl, rew, tr, riv_t) = jax.lax.scan(
-            seg_step, (st, ob, theta_eff, rng), None, x)
+        (st, ob, _, rng, tax_win), (cl, rew, tr, riv_t) = jax.lax.scan(
+            seg_step, (st, ob, theta_eff, rng, tax_win), None, x)
         seg_cl, seg_base, seg_tr = cl.sum(0), rew.sum(0), tr.sum(0)      # (N, E)
 
         # Claims and audits, as in training: file after the window, audit against
@@ -224,7 +234,8 @@ def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed, cp=None):
                  riv_t[-1].astype(jnp.float32),
                  (votes.astype(bool) & ~mine).astype(jnp.float32),
                  n_acc.astype(jnp.float32),
-                 (~votes.astype(bool) & ~mine).astype(jnp.float32))
+                 (~votes.astype(bool) & ~mine).astype(jnp.float32),
+                 tax_win)
         return carry, rec
 
     z_e = jnp.zeros((num_envs,), jnp.float32)
@@ -233,7 +244,11 @@ def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed, cp=None):
             jnp.zeros((n, num_envs), jnp.float32), jnp.zeros((n, num_envs), jnp.float32),
             z_e, jnp.zeros((num_envs,), bool), jnp.zeros((num_envs,), jnp.int32), z_e,
             jnp.zeros((n, num_envs), jnp.float32), z_e,
-            jnp.zeros((n, num_envs), jnp.float32))
+            jnp.zeros((n, num_envs), jnp.float32),
+            # Trailing cleaning for the harvest tax's payout weighting: per episode,
+            # carried across segments, length 0 (never read) under clean_wage.
+            contracts_mod.new_tax_window(cfg["tax_window"] if tax_kind else 0,
+                                         n, batch=(num_envs,)))
     _, rec = jax.lax.scan(round_, init, jnp.arange(K))
     return jax.tree.map(np.asarray, rec), K
 
@@ -416,6 +431,13 @@ def report(rec, K, cfg, contract, n, num_steps):
         print(f"\n\033[1m{t}\033[0m" if sys.stdout.isatty() else f"\n{t}")
 
     src = cfg.get("binding_source", "fallback")
+    kind = cfg.get("contract_kind", "clean_wage")
+    if kind == "harvest_tax":
+        # Stated before anything else: every theta in this report is a tax RATE,
+        # not a per-cell wage, and the two are not comparable numbers.
+        print(f"contract kind: HARVEST TAX ({cfg.get('kind_source', 'fallback')}) -- "
+              f"theta is a rate on harvest income, paid out by cleaning over a "
+              f"{cfg.get('tax_window', 20)}-step trailing window")
     if cfg.get("protocol") == "median":
         print(f"protocol: MEDIAN (simultaneous asks, the middle ask binds per "
               f"segment)  segment={x}  rounds={K}  features={cfg['features']}")
@@ -633,6 +655,17 @@ def main():
                         "supply them explicitly for those.")
     p.add_argument("--bargain-segment", type=int, default=None,
                    help="override the _seg<N> read from the checkpoint name")
+    p.add_argument("--contract-kind", choices=contracts_mod.CONTRACT_KINDS,
+                   default=None,
+                   help="what the bargained scalar meant: 'clean_wage' (theta per "
+                        "cell cleaned) or 'harvest_tax' (theta as a rate on harvest "
+                        "income). Read from the .run.yaml sidecar when there is one; "
+                        "this flag is for runs without it. The two pay different "
+                        "agents from different bases, so a mismatch is fiction in "
+                        "ordinary-looking units.")
+    p.add_argument("--tax-window", type=int, default=None,
+                   help="CONTRACT_KIND=harvest_tax: steps of trailing cleaning the "
+                        "payout is weighted by (training default 20).")
     p.add_argument("--binding", choices=bg.BINDING_MODES, default=None,
                    help="how long a carried offer bound: 'episode' (the original "
                         "absorbing game), 'segment' or 'sticky' (renegotiated every "
@@ -676,6 +709,21 @@ def main():
         cfg["segment"] = args.bargain_segment
     if args.binding:
         cfg["binding"], cfg["binding_source"] = args.binding, "flag"
+    if args.contract_kind:
+        # Overriding a RECORDED kind is never a correction, it is a mistake: the
+        # sidecar is what the run was actually trained under, and replaying a tax
+        # run as a cleaning wage pays the wrong agents from the wrong base and
+        # reports it in units that look perfectly ordinary.
+        if (cfg.get("kind_source") == "sidecar"
+                and args.contract_kind != cfg["contract_kind"]):
+            raise SystemExit(
+                f"--contract-kind {args.contract_kind} contradicts the run's own "
+                f"sidecar, which records CONTRACT_KIND={cfg['contract_kind']}. "
+                f"Refusing: the two mechanisms redistribute differently and the "
+                f"numbers would look ordinary and be fiction. Drop the flag.")
+        cfg["contract_kind"], cfg["kind_source"] = args.contract_kind, "flag"
+    if args.tax_window:
+        cfg["tax_window"] = args.tax_window
     if cfg.get("protocol") == "median":
         # The median binds per segment by construction, so the binding fallback
         # (or a stray --binding flag) must not route a median run through the
@@ -693,7 +741,8 @@ def main():
     env = LogWrapper(socialjax.make("clean_up", **env_kwargs), replace_info=False)
     lo, hi, source = contract_range(args.checkpoint, args.contract_low,
                                     args.contract_high)
-    contract = CleanupContract(n, lo, hi)
+    contract = contracts_mod.make_contract("cleanup", n, lo, hi,
+                                           kind=cfg["contract_kind"])
 
     print(f"run: {moca['stem']}")
     print(f"contract: theta in [{lo:g}, {hi:g}] (from {source})")

@@ -263,6 +263,118 @@ class CleanupContract:
         return receive - pay
 
 
+class HarvestTaxContract(CleanupContract):
+    """The bargained scalar is a TAX RATE on harvesting, not a wage for cleaning.
+
+    Same scalar space, same observation encoding, same null contract -- what changes
+    is where the money comes from and how it is shared out. Each step:
+
+        every agent pays  tau * (its harvest income this step)
+        the pot           tau * sum_i harvest_i  is paid out the SAME step,
+        in shares         w_j / sum_k w_k,  w = cells cleaned over the trailing window
+
+    Two differences from the clean-wage contract are the point of the design rather
+    than incidental to it.
+
+    The BASE is what an agent takes out of the commons, not what it fails to put in.
+    Under `CleanupContract` a pure harvester's bill is set by everyone else's
+    cleaning: it pays theta*(C - c_i)/(N-1) whether it harvested nothing or stripped
+    the orchard. Here the bill is proportional to its own take, so an agent that
+    sits idle owes nothing and one that harvests hard owes a lot. That makes tau a
+    price on appropriation, which is the side of Ostrom's provision/appropriation
+    pair the wage contract leaves untouched.
+
+    The PAYOUT is a share of a pot rather than a per-cell wage, so total
+    redistribution is capped by what was actually harvested and cannot outrun the
+    surplus that funds it. The realised per-cell wage (pot / cells cleaned) then
+    floats with how many agents are cleaning, and is worth logging next to tau: it
+    is the quantity directly comparable to a clean-wage theta.
+
+    The TRAILING WINDOW is what keeps a cleaner's income from vanishing on the steps
+    it happens not to land a cleaning beam. Cleaning is bursty -- an agent walks to
+    the river, clears several cells, walks back -- so a payout weighted by cleaning
+    THIS step alone would pay a working cleaner nothing on most of its steps and
+    everything on a few. It is only a payout weighting, so it is reset at episode
+    start and carries across segment boundaries.
+
+    If nobody has cleaned in the window, NO TAX IS LEVIED at all: harvesters keep
+    their income and nothing is burned. Taxing with no one to pay would make the
+    contract destroy welfare rather than redistribute it, and the zero-sum property
+    is what makes this a contract rather than a penalty.
+
+    The mechanism is inert under the null contract (tau = 0 zeroes both sides), so
+    the disagreement point is unchanged and every acceptance rule still compares
+    against genuine uncontracted play.
+    """
+
+    def compute_transfer(self, theta, cleaned):
+        raise NotImplementedError(
+            "HarvestTaxContract needs the harvest income and the trailing cleaning "
+            "window: call tax_transfer(theta, harvest, window). compute_transfer's "
+            "signature belongs to the clean-wage contract, and silently falling "
+            "back to it would pay a cleaning wage in a run that levied a tax -- "
+            "wrong numbers that look entirely ordinary."
+        )
+
+    def tax_transfer(self, theta, harvest, window) -> jnp.ndarray:
+        """Zero-sum per-agent transfers for one step.
+
+        Args:
+            theta: (...,) the tax rate tau, broadcastable against `harvest`'s
+                leading dims.
+            harvest: (..., N) each agent's harvest income this step
+                (info["original_rewards"] -- reward from apples, before any
+                transfer). A rate on income rather than a flat fee per apple, which
+                is the same thing at the apple_reward=1.0 every config here sets,
+                and the sane reading of "pays tau per apple" at any other.
+            window: (..., W, N) cells cleaned per step over the trailing window,
+                inclusive of this step.
+
+        Returns:
+            (..., N) float32 transfers summing to exactly zero along the agent axis.
+        """
+        harvest = jnp.asarray(harvest, dtype=jnp.float32)
+        window = jnp.asarray(window, dtype=jnp.float32)
+        tau = jnp.asarray(theta, dtype=jnp.float32)[..., None]
+
+        w = jnp.sum(window, axis=-2)                          # (..., N) recent work
+        total_w = jnp.sum(w, axis=-1, keepdims=True)          # (..., 1)
+        levied = total_w > 0.0
+        paid = tau * harvest                                  # (..., N)
+        pot = jnp.sum(paid, axis=-1, keepdims=True)           # (..., 1)
+        # Guard the denominator INSIDE the where as well: a 0/0 produces NaN whose
+        # gradient poisons the branch that discards it.
+        share = w / jnp.where(levied, total_w, 1.0)
+        # Nobody cleaned recently -> no levy at all, rather than a pot with no one
+        # to receive it. Both sides go to zero together, so the step stays zero-sum.
+        return jnp.where(levied, pot * share - paid, 0.0)
+
+
+def new_tax_window(window_steps: int, num_agents: int, batch=()) -> jnp.ndarray:
+    """A zeroed trailing-cleaning buffer, (*batch, W, N).
+
+    The window axis is second-to-last so the buffer broadcasts against the (..., N)
+    per-agent quantities everywhere else -- `batch` is the env axis in training and
+    empty when reasoning about one env.
+
+    Built fresh at each episode start. It is a payout weighting rather than part of
+    the contract, so it deliberately does NOT reset when a segment ends or when the
+    contract is renegotiated -- a cleaner that worked through the last segment is
+    still owed for that work by the next one.
+    """
+    return jnp.zeros(tuple(batch) + (int(window_steps), int(num_agents)),
+                     dtype=jnp.float32)
+
+
+def push_tax_window(window: jnp.ndarray, cleaned: jnp.ndarray) -> jnp.ndarray:
+    """Drop the oldest step, append this one's cleaning. Returns the new buffer.
+
+    Rolls along the window axis (-2), so it takes a batched buffer or a bare one.
+    """
+    return jnp.roll(window, -1, axis=-2).at[..., -1, :].set(
+        jnp.asarray(cleaned, dtype=jnp.float32))
+
+
 class LegacyCleanupContract(CleanupContract):
     """The contract observation as it was BEFORE the is_null flag: [theta_norm, stage].
 
@@ -346,8 +458,18 @@ def contract_for_params(params, num_agents: int, low: float, high: float):
     )
 
 
-def make_contract(name: str, num_agents: int, low: float, high: float):
+# What the bargained scalar MEANS. The space, the observation encoding and the null
+# contract are identical across kinds; only the transfer differs.
+CONTRACT_KINDS = ("clean_wage", "harvest_tax")
+
+
+def make_contract(name: str, num_agents: int, low: float, high: float,
+                  kind: str = "clean_wage"):
     """Contract-space factory, so the space is selectable from config."""
     if name != "cleanup":
         raise ValueError(f"unknown contract space {name!r} (available: 'cleanup')")
-    return CleanupContract(num_agents, low=low, high=high)
+    if kind not in CONTRACT_KINDS:
+        raise ValueError(f"unknown CONTRACT_KIND {kind!r} "
+                         f"(available: {', '.join(CONTRACT_KINDS)})")
+    cls = CleanupContract if kind == "clean_wage" else HarvestTaxContract
+    return cls(num_agents, low=low, high=high)

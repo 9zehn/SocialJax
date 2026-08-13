@@ -52,6 +52,50 @@ Rejection costs **one segment**, not the episode. At `BARGAIN_SEGMENT=100` of a
 1000-step episode that is roughly a tenth of the episode's welfare — the single lever
 on bargaining power.
 
+### What the scalar means (`CONTRACT_KIND`)
+
+The protocol above bargains over a scalar; `CONTRACT_KIND` says what that scalar
+buys. Everything else — proposals, votes, holdout recognition, probes, the
+counterfactual advantage, the binding modes — is unchanged, because the negotiation
+never depended on what was being negotiated.
+
+| | `clean_wage` (default) | `harvest_tax` |
+|---|---|---|
+| θ is | a payment per waste cell cleaned | a **tax rate** on harvest income |
+| who pays | the other agents, evenly | whoever harvested, in proportion to their take |
+| who receives | whoever cleaned, per cell | whoever cleaned in the last `TAX_WINDOW` steps, as a share of the pot |
+| range | a wage, unbounded above | a rate, so `[0, 1]` |
+
+The point of the second is the **base**. Under `clean_wage` a pure harvester's bill
+is θ(C − c_i)/(N−1) — set entirely by *everyone else's* cleaning — so the price it
+faces has nothing to do with how much it takes out of the commons; it pays the same
+whether it stripped the orchard or sat still. A tax prices appropriation rather than
+subsidising provision, which is the other half of Ostrom's provision/appropriation
+pair, and it caps total redistribution at what was actually harvested, so payouts
+cannot outrun the surplus funding them.
+
+Three details that are mechanism rather than implementation:
+
+- **The trailing window.** Cleaning is bursty — walk to the river, clear several
+  cells, walk back — so weighting the payout by *this step's* cleaning would pay a
+  working cleaner nothing on most of its steps. `TAX_WINDOW=20` smooths that. It is
+  a payout weighting, not part of the contract, so it resets per episode and carries
+  across segment boundaries: a cleaner that worked through the last segment is still
+  owed by the next one.
+- **No cleaners, no tax.** If nobody has cleaned in the window the levy does not
+  fire at all and harvesters keep their income. Taxing with nobody to pay would burn
+  welfare, and zero-sum-every-step is what makes this a contract rather than a fine.
+- **The realised wage floats.** `tax/wage` (revenue ÷ cells cleaned) is the number
+  directly comparable to a `clean_wage` θ, and unlike θ nobody chooses it: it moves
+  with how much harvesting is taxed and how many agents are splitting the pot. A τ
+  that looks modest can pay a large per-cell wage when only one agent is cleaning.
+
+θ under the two kinds is **not the same quantity** and the ranges are not comparable,
+so the kind is recorded in the sidecar and every replay tool reads it. Passing
+`--contract-kind` against what the sidecar records is refused outright rather than
+warned about: the mechanisms pay different agents from different bases, so a mismatch
+is not a rescaling but a fiction in ordinary-looking units.
+
 ### How long a contract binds (`BARGAIN_BINDING`)
 
 The sketch above is `episode`, the original game. The counterfactual value heads then
