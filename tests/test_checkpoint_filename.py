@@ -142,6 +142,25 @@ def test_non_moca_configs_are_unaffected_by_the_phase2_marker():
     assert checkpoint_filename(cfg) == "clean_up_seed42_reward_individual_agents4"
 
 
+def test_median_protocol_replaces_the_proposer_and_quorum_tags():
+    """A median run at the same seed is a different mechanism entirely, so it must
+    not collide with an alternating run -- and its stem must not carry proposer or
+    quorum tags, which name knobs the protocol does not have."""
+    base = _config()
+    base.update({"PHASE2_MODE": "bargain", "TRAINING_MODE": "joint",
+                 "BARGAIN_SEGMENT": 100, "BARGAIN_PROPOSER": "random",
+                 "BARGAIN_QUORUM": "majority"})
+    alternating = checkpoint_filename(base)
+    median = checkpoint_filename({**base, "BARGAIN_PROTOCOL": "median"})
+    assert "_median" in median, median
+    assert median != alternating
+    assert "_random" not in median and "_qmajority" not in median, median
+    # The explicit default is byte-identical to leaving the key absent, so every
+    # existing alternating run keeps its filename.
+    assert checkpoint_filename(
+        {**base, "BARGAIN_PROTOCOL": "alternating"}) == alternating
+
+
 def test_negotiate_nu_is_in_the_checkpoint_name():
     """nu changes who gates the contract and so what the negotiation policy learns;
     a nu=2 and a nu=all run at one seed must not share a path."""

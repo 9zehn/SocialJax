@@ -191,6 +191,11 @@ JOINT_BARGAIN_METRICS = {
     "theta_agreed": "contract/theta_agreed",
     "theta_offered": "contract/theta_offered",
     "accept_count": "contract/accept_count",
+    # Max - min of the asks within a round. Under BARGAIN_PROTOCOL=median this is
+    # the mechanism's own diagnostic -- are ideal points separating by role, or has
+    # everyone collapsed onto one number? -- and under alternating offers it is the
+    # dispersion of asking prices, only one of which is ever read.
+    "theta_ask_spread": "contract/ask_spread",
     "transfer_volume": "contract/transfer_volume",
     # Did behaviour actually change? Transfers are zero-sum, so welfare can only
     # move if cleaning does.
@@ -480,6 +485,35 @@ def make_train(config):
                 f"used); 'counterfactual' credits each vote with pivotality x "
                 f"(lock value - continue value) and adds two value heads to the "
                 f"bargaining network.")
+        # Which contracting game each round plays. "alternating" is everything
+        # above: one proposer, a vote, a quorum. "median" is one simultaneous
+        # move -- every agent names a theta, the median of the N asks binds for
+        # the segment -- so the whole accept/reject apparatus (quorum, probes,
+        # vote floor, vote credit, binding modes other than per-segment) has
+        # nothing to act on. Those settings are REWRITTEN to what actually runs
+        # rather than left as recorded lies in the sidecar: a median run is
+        # per-segment by construction, and a vote that does not exist cannot
+        # carry counterfactual credit or branch value heads.
+        config.setdefault("BARGAIN_PROTOCOL", "alternating")
+        if config["BARGAIN_PROTOCOL"] not in bargain.PROTOCOL_MODES:
+            raise ValueError(
+                f"BARGAIN_PROTOCOL must be one of "
+                f"{', '.join(bargain.PROTOCOL_MODES)}; got "
+                f"{config['BARGAIN_PROTOCOL']!r}. 'alternating' is the "
+                f"proposer-and-vote game; 'median' binds the median of "
+                f"everyone's simultaneous asks, with no vote.")
+        if config["BARGAIN_PROTOCOL"] == "median":
+            forced = {"BARGAIN_BINDING": "segment",
+                      "BARGAIN_VOTE_ADVANTAGE": "gae",
+                      "BARGAIN_PROBE_FRAC": 0.0}
+            overridden = {k: config[k] for k, v in forced.items()
+                          if config.get(k) not in (None, v)}
+            config.update(forced)
+            if overridden:
+                print(f"[MOCA] BARGAIN_PROTOCOL=median has no vote and no "
+                      f"multi-round agreement, so these settings are inert and "
+                      f"recorded as their forced values: {overridden} -> "
+                      f"{ {k: forced[k] for k in overridden} }", flush=True)
         # Recorded so a replay tool can refuse a checkpoint it cannot read, rather
         # than reading it as a mechanism that was never trained.
         config["BARGAIN_FEATURE_VERSION"] = bargain.FEATURE_VERSION
@@ -703,6 +737,10 @@ def make_train(config):
         # Read once here rather than per-function: the rollout and the metrics both
         # branch on it, and they must never disagree about which game was played.
         binding = config.get("BARGAIN_BINDING", "episode")
+        # Median protocol: simultaneous asks, the median binds, no vote. make_train
+        # already forced binding="segment" and vote advantage="gae" for it, so
+        # everything downstream of the rollout needs no median-specific branches.
+        median_protocol = config.get("BARGAIN_PROTOCOL", "alternating") == "median"
         bargain_net = [
             BargainingActorCritic(
                 hidden=int(config.get("BARGAIN_HIDDEN", 64)),
@@ -1619,6 +1657,11 @@ def make_train(config):
                     "seg_return": seg_return,
                     "active": ~agreed, "newly": newly,
                     "is_proposer": mine, "theta_offer": theta_offer,
+                    # Every agent's sampled ask, read or not. Only the proposer's
+                    # is acted on here, but the dispersion of asks is the series
+                    # that says whether ideal points are separating by role -- and
+                    # under the median protocol it is the mechanism itself.
+                    "theta_all": theta_all,
                     "n_accept": n_accept, "theta_eff": theta_eff,
                     "is_probe": is_probe, "offer_null": offer_null,
                 }
@@ -1653,6 +1696,118 @@ def make_train(config):
                          (~votes.astype(bool) & ~mine).astype(jnp.float32))
                 return carry, (record, traj)
 
+            def _round_median(carry, r):
+                """One MEDIAN round: every agent asks, the median binds the segment.
+
+                Same carry and record layout as `_round`, so the semi-MDP reward,
+                the GAE, the loss masks and the metrics are all shared. The
+                vote-shaped fields are structural zeros, and `is_proposer` is all
+                True -- every agent's ask is a trained decision -- which is what
+                routes the whole round through the proposal head's mask and zeroes
+                the vote credit mask without any downstream special-casing.
+                """
+                (env_state, last_obs, rng, agreed, locked, cum_return, cum_clean,
+                 last_theta_n, had_offer, n_reject, river,
+                 last_votes, last_n_acc, last_rejecters) = carry
+                n_keys = 2 + (2 if report_on else 0)
+                keys = jax.random.split(rng, n_keys)
+                rng, k_theta = keys[0], keys[1]
+                if report_on:
+                    k_claim, k_audit = keys[2], keys[3]
+
+                feats_prop = bargain.median_round_features(
+                    r, K, num_agents, last_theta_n, had_offer,
+                    cum_return / ret_scale, cum_clean / clean_scale,
+                    river / river_scale, feat_mask)                   # (N, E, F)
+
+                raws, lp_t, v_prop = [], [], []
+                kt = jax.random.split(k_theta, num_agents)
+                for i in range(num_agents):
+                    pi_theta, _, v = bargain_net[i].apply(
+                        bargain_params[i], feats_prop[i])
+                    raw_i = pi_theta.sample(seed=kt[i])               # (E, 1)
+                    raws.append(raw_i[:, 0])
+                    lp_t.append(pi_theta.log_prob(raw_i))
+                    v_prop.append(v)
+                raw = jnp.stack(raws)                                 # (N, E)
+
+                theta_all = negotiate.unsquash(raw, contract.low, contract.high)
+                theta_offer = bargain.median_offer(theta_all)         # (E,)
+                # A null median is only reachable when CONTRACT_LOW is 0 (the
+                # clipped unsquash then puts an atom at exactly 0, and half the
+                # asks must sit on it). It plays the segment uncontracted, same
+                # as a null offer everywhere else.
+                offer_null = contract.is_null(theta_offer)
+                theta_eff = theta_offer
+                newly = ~offer_null
+
+                (env_state, last_obs, _, rng), (traj, cleaned, clear) = jax.lax.scan(
+                    _seg_step, (env_state, last_obs, theta_eff, rng), None, x)
+
+                # Claims and audits, exactly as in `_round`: the enforcement layer
+                # is orthogonal to how theta was chosen.
+                if report_on:
+                    window_clean = jnp.transpose(cleaned.sum(axis=0))         # (N,E)
+                    feats_claim = reporting.claim_features(
+                        window_clean, theta_eff, x, contract.low, contract.high)
+                    kc = jax.random.split(k_claim, num_agents)
+                    raws_c = []
+                    for i in range(num_agents):
+                        pi_c = claim_net[i].apply(claim_params[i], feats_claim[i])
+                        raws_c.append(pi_c.sample(seed=kc[i])[:, 0])
+                    raw_claim = jnp.stack(raws_c)                             # (N,E)
+                    overclaim = negotiate.unsquash(
+                        raw_claim, 0.0, float(config["REPORT_MAX_OVERCLAIM"]))
+                    audit = jax.random.uniform(
+                        k_audit, (num_agents, n_envs)) < float(config["REPORT_AUDIT_P"])
+                    settle, claim_own = reporting.settle_claims(
+                        theta_eff, overclaim, audit,
+                        float(config["REPORT_FINE_MULT"]), num_agents)
+                    traj = [
+                        traj[i]._replace(reward=traj[i].reward.at[-1].add(settle[i]))
+                        for i in range(num_agents)
+                    ]
+
+                seg_return = jnp.stack(
+                    [traj[i].reward.sum(axis=0) for i in range(num_agents)])   # (N,E)
+                record = {
+                    "feats": feats_prop, "raw": raw,
+                    "logp_theta": jnp.stack(lp_t),
+                    "vote": jnp.zeros((num_agents, n_envs), jnp.int32),
+                    "logp_vote": jnp.zeros((num_agents, n_envs), jnp.float32),
+                    "value": jnp.stack(v_prop),
+                    "seg_return": seg_return,
+                    "active": ~agreed, "newly": newly,
+                    "is_proposer": jnp.ones((num_agents, n_envs), bool),
+                    "theta_offer": theta_offer, "theta_all": theta_all,
+                    "n_accept": jnp.zeros((n_envs,), jnp.int32),
+                    "theta_eff": theta_eff,
+                    "is_probe": jnp.zeros((n_envs,), bool),
+                    "offer_null": offer_null,
+                }
+                if report_on:
+                    record.update({
+                        "claim_feats": feats_claim, "claim_raw": raw_claim,
+                        "claim_reward": claim_own, "overclaim": overclaim,
+                        "audited": audit,
+                        "claim_w": (theta_eff > contract.null).astype(jnp.float32),
+                    })
+                carry = (env_state, last_obs, rng,
+                         agreed,                     # never absorbs: every round asks
+                         theta_eff,                  # what the gameplay critic
+                                                     # bootstraps against at the end
+                         cum_return + seg_return,
+                         cum_clean + jnp.transpose(cleaned.sum(axis=0)),
+                         bargain.normalise_theta(theta_offer, contract.low,
+                                                 contract.high),
+                         jnp.ones_like(had_offer),
+                         n_reject,                   # rejections do not exist here
+                         clear[-1].astype(jnp.float32),
+                         jnp.zeros_like(last_votes),
+                         jnp.zeros_like(last_n_acc),
+                         jnp.zeros_like(last_rejecters))
+                return carry, (record, traj)
+
             zeros_e = jnp.zeros((n_envs,), jnp.float32)
             init = (env_state, last_obs, rng,
                     jnp.zeros((n_envs,), bool), jnp.full((n_envs,), contract.null),
@@ -1662,7 +1817,8 @@ def make_train(config):
                     jnp.zeros((n_envs,), jnp.int32), zeros_e,
                     jnp.zeros((num_agents, n_envs), jnp.float32), zeros_e,
                     jnp.zeros((num_agents, n_envs), jnp.float32))
-            carry, (rounds, traj) = jax.lax.scan(_round, init, jnp.arange(K))
+            carry, (rounds, traj) = jax.lax.scan(
+                _round_median if median_protocol else _round, init, jnp.arange(K))
             env_state, last_obs, rng, agreed, locked = carry[0], carry[1], carry[2], carry[3], carry[4]
 
             # (K, x, ...) -> (NUM_STEPS, ...), so the existing GAE/loss are unchanged.
@@ -1961,6 +2117,16 @@ def make_train(config):
                                     / jnp.maximum(w_own_offer.sum(), 1.0))
             out["accept_count"] = (
                 rounds["n_accept"] * rounds["active"]).sum() / n_active
+            # Dispersion of the asks within a round (max - min across agents,
+            # averaged over active rounds). Under the median protocol this is the
+            # series that says whether ideal points are separating by role --
+            # cleaners asking high, harvesters low -- or whether everyone has
+            # collapsed onto one number; under alternating offers it is the same
+            # question about the asks only one of which is ever read.
+            ask_spread = (rounds["theta_all"].max(axis=1)
+                          - rounds["theta_all"].min(axis=1))           # (K, E)
+            out["theta_ask_spread"] = (
+                ask_spread * rounds["active"]).sum() / n_active
             # Gameplay policy entropy, averaged over agents. Nothing else in this set
             # detects a collapsing policy: welfare and cleaning stay plausible right
             # up until the policies go deterministic, and then everything drops to

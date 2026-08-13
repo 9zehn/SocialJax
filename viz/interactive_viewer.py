@@ -147,6 +147,11 @@ def infer_bargain_config(stem, checkpoint=None):
         "quorum": (quorum.group(1) if quorum else "all"),
         "proposer": proposer,
         "features": features,
+        # Simultaneous-move protocols are tagged in the stem (checkpoint_filename
+        # writes the protocol INSTEAD of the proposer/quorum tags), so a median
+        # run is recoverable from its filename alone. Replaying one as
+        # alternating would ask the vote head questions it was never trained on.
+        "protocol": "median" if "_median" in stem else "alternating",
         "rotate_start": "fixed" if "_fixedstart" in stem else "random",
         # Not in any filename, so a run trained off these defaults is unreplayable
         # without its sidecar -- the shape check in bargain.check_params_compatible
@@ -169,12 +174,21 @@ def infer_bargain_config(stem, checkpoint=None):
                           ("hidden", "BARGAIN_HIDDEN"),
                           ("accept_bias", "BARGAIN_ACCEPT_BIAS"),
                           ("binding", "BARGAIN_BINDING"),
+                          ("protocol", "BARGAIN_PROTOCOL"),
                           ("feature_version", "BARGAIN_FEATURE_VERSION")):
         if side is not None and side.get(recorded) is not None:
             cfg[key] = side[recorded]
     cfg["segment"] = int(cfg["segment"])
     cfg["hidden"] = int(cfg["hidden"])
     cfg["accept_bias"] = float(cfg["accept_bias"])
+    # Whether the binding mode is known or assumed. Unlike every other setting here,
+    # getting this one wrong does not fail or look odd -- a renegotiated run replays
+    # as an episode-long agreement struck in its first contracted segment, and every
+    # number that follows is internally consistent and wrong. So the tools say which
+    # it was, the way contract_range does.
+    cfg["binding_source"] = ("sidecar" if side is not None
+                             and side.get("BARGAIN_BINDING") is not None
+                             else "fallback")
     return cfg
 
 
@@ -237,6 +251,38 @@ def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
             # Only `episode` is absorbing. Under renegotiation `agreed` never
             # becomes True, so every segment bargains again.
             theta = locked
+        elif cfg.get("protocol") == "median":
+            # One simultaneous pass: every agent asks, the median binds for this
+            # segment. No proposer, no vote -- the round record marks that with
+            # proposer=-1 and carries the asks instead.
+            rng, k_theta = jax.random.split(rng)
+            feats = bg.median_round_features(
+                r, num_rounds, n, jnp.array([last_tn], jnp.float32),
+                jnp.array([had_offer]),
+                jnp.asarray(cum_ret)[:, None] / ret_scale,
+                jnp.asarray(cum_clean)[:, None] / clean_scale,
+                jnp.array([river], jnp.float32) / river_scale, mask)
+            kt = jax.random.split(k_theta, n)
+            asks = []
+            for i in range(n):
+                pi_theta, _, _ = bnet.apply(bargain_params[i], feats[i])
+                raw = pi_theta.sample(seed=kt[i])[0, 0]
+                asks.append(float(neg.unsquash(raw, contract.low, contract.high)))
+            theta_offer = float(np.median(asks))
+            # A null median (only reachable when the range floor is 0) plays the
+            # segment uncontracted, like a null offer everywhere else.
+            took_force = theta_offer > contract.null + 1e-6
+            theta = theta_offer if took_force else float(contract.null)
+            locked = theta
+            rounds.append({
+                "round": r, "step": step, "proposer": -1, "theta": theta_offer,
+                "votes": [], "accepted": bool(took_force), "n_accept": 0,
+                "quorum": 0, "p_accept": [], "asks": asks,
+                "in_force": float(theta),
+            })
+            last_tn = float(bg.normalise_theta(theta_offer, contract.low,
+                                               contract.high))
+            had_offer = True
         else:
             rng, k_prop, k_theta, k_vote = jax.random.split(rng, 4)
             proposer = int(bg.proposer_for_round(
@@ -617,24 +663,38 @@ def _render_bargain_log(draw, x0, y0, x1, y1, rounds, colors, width, n):
         draw.rounded_rectangle([x0 - 4, ry + 1, x1 + 4, ry + row_h - 2],
                                radius=5, fill=_PANEL_ROW)
         p = rec["proposer"]
-        pcol = tuple(int(c) for c in colors[p]) if p < len(colors) else (200, 200, 200)
         draw.text((x0 + 2, cy), f"R{rec['round']}", font=head_f,
                   fill=_PANEL_MUTED, anchor="lm")
-        # Proposer swatch + id, so "who asked" is readable without counting dots.
         sx = x0 + int(width * 0.075)
-        draw.rounded_rectangle([sx, cy - dot / 2, sx + dot, cy + dot / 2],
-                               radius=3, fill=pcol, outline=(15, 16, 24))
-        draw.text((sx + dot + 4, cy), f"A{p}", font=head_f, fill=_PANEL_FG, anchor="lm")
+        if p < 0:
+            # Median round: nobody proposed and nobody voted, so the row shows
+            # the mechanism instead -- the label, the spread of asks it took the
+            # middle of, and the theta that middle turned out to be.
+            draw.text((sx, cy), "median", font=head_f, fill=_PANEL_FG, anchor="lm")
+            asks = rec.get("asks") or ()
+            if asks:
+                draw.text((x_dots + strip_w, cy),
+                          f"asks {min(asks):.2f}–{max(asks):.2f}",
+                          font=head_f, fill=_PANEL_MUTED, anchor="rm")
+        else:
+            pcol = (tuple(int(c) for c in colors[p]) if p < len(colors)
+                    else (200, 200, 200))
+            # Proposer swatch + id, so "who asked" is readable without counting dots.
+            draw.rounded_rectangle([sx, cy - dot / 2, sx + dot, cy + dot / 2],
+                                   radius=3, fill=pcol, outline=(15, 16, 24))
+            draw.text((sx + dot + 4, cy), f"A{p}", font=head_f, fill=_PANEL_FG,
+                      anchor="lm")
         draw.text((x_dots - int(width * 0.02), cy), f"θ={rec['theta']:.3f}",
                   font=cell_f, fill=_PANEL_FG, anchor="rm")
 
-        for i in range(n):
-            dx = x_dots + i * (dot + 3)
-            box = [dx, cy - dot / 2, dx + dot, cy + dot / 2]
-            if i == p:
-                draw.ellipse(box, outline=_PANEL_MUTED, width=1)   # proposer: no vote
-            else:
-                draw.ellipse(box, fill=_PANEL_ON if rec["votes"][i] else _PANEL_OFF)
+        if p >= 0:
+            for i in range(n):
+                dx = x_dots + i * (dot + 3)
+                box = [dx, cy - dot / 2, dx + dot, cy + dot / 2]
+                if i == p:
+                    draw.ellipse(box, outline=_PANEL_MUTED, width=1)  # proposer: no vote
+                else:
+                    draw.ellipse(box, fill=_PANEL_ON if rec["votes"][i] else _PANEL_OFF)
         draw.text((x1, cy), "✓" if ok else "✗", font=cell_f,
                   fill=_PANEL_ON if ok else _PANEL_OFF, anchor="rm")
 
@@ -1491,12 +1551,18 @@ def main():
                     hidden=bargain_cfg["hidden"], label=moca["stem"])
             except ValueError as e:
                 raise SystemExit(f"[incompatible checkpoint] {e}")
-            print(f"  {len(bargain_params)} bargaining policies; "
-                  f"segment={bargain_cfg['segment']}, "
-                  f"proposer={bargain_cfg['proposer']} "
-                  f"(start {bargain_cfg['rotate_start']}), "
-                  f"quorum={bargain_cfg['quorum']}, "
-                  f"features={bargain_cfg['features']}")
+            if bargain_cfg.get("protocol") == "median":
+                print(f"  {len(bargain_params)} bargaining policies; "
+                      f"protocol=median (simultaneous asks, the median binds), "
+                      f"segment={bargain_cfg['segment']}, "
+                      f"features={bargain_cfg['features']}")
+            else:
+                print(f"  {len(bargain_params)} bargaining policies; "
+                      f"segment={bargain_cfg['segment']}, "
+                      f"proposer={bargain_cfg['proposer']} "
+                      f"(start {bargain_cfg['rotate_start']}), "
+                      f"quorum={bargain_cfg['quorum']}, "
+                      f"features={bargain_cfg['features']}")
             print("  theta is renegotiated during the episode, so it is not fixed "
                   "up front -- see the bargaining log in the panel")
 

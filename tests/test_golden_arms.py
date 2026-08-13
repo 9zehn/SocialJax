@@ -84,6 +84,10 @@ SMOKE_ARMS = {
     "bargain_renegotiate": {**ARMS["bargain"], "BARGAIN_BINDING": "segment",
                             "BARGAIN_VOTE_ADVANTAGE": "counterfactual",
                             "BARGAIN_PROBE_FRAC": 0.5},
+    # The median protocol: simultaneous asks, the middle ask binds its segment, no
+    # vote at all. A different round body feeding the same reward, GAE, loss-mask
+    # and metrics plumbing as everything above.
+    "bargain_median": {**ARMS["bargain"], "BARGAIN_PROTOCOL": "median"},
 }
 ALL_ARMS = {**ARMS, **SMOKE_ARMS}
 
@@ -208,6 +212,23 @@ def test_per_segment_renegotiation_runs_end_to_end():
     # every segment or none would mean the binding switch never took effect.
     rate = sig["metrics_joint/joint/agree/rate"]
     assert 0.0 < rate < 1.0, f"per-segment agreement rate is degenerate: {rate}"
+
+
+def test_median_protocol_runs_end_to_end():
+    """Smoke, not a pin. The median round has no vote, so its record fields are
+    structural zeros feeding masks that must come out empty without dividing by
+    themselves -- NaN is the realistic failure. The three equalities are the
+    protocol's invariants: with CONTRACT_LOW > 0 the median is always a live
+    contract, and nothing is ever accepted because nothing is ever voted on."""
+    sig = _signature_isolated("bargain_median")
+    bad = {k: v for k, v in sig.items() if not np.isfinite(v)}
+    assert not bad, f"non-finite series under the median protocol: {bad}"
+    assert sig["metrics_joint/joint/contract/in_force_rate"] == 1.0
+    assert sig["metrics_joint/joint/contract/accept_count"] == 0.0
+    # Freshly initialised Gaussian asks differ across agents, so the within-round
+    # ask spread is positive from update 0; zero would mean the asks (or the
+    # median itself) are being read from the wrong axis.
+    assert sig["metrics_joint/joint/contract/ask_spread"] > 0.0
 
 
 def _update(names=()):

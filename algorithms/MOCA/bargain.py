@@ -59,6 +59,11 @@ import jax
 import jax.numpy as jnp
 
 PROPOSER_MODES = ("rotate", "random", "contribution", "holdout")
+# Which contracting game each round plays. "alternating" is everything this module
+# was built for: one proposer, a vote, a quorum. "median" replaces the round with a
+# single simultaneous move -- every agent names a theta and the median of the N asks
+# binds for the segment, no vote at all. See `median_offer` for why.
+PROTOCOL_MODES = ("alternating", "median")
 # Which slice of the bargaining state the policy may see. Tiered so the headline
 # result can be shown not to depend on handing agents the inequality signal --
 # see `feature_mask`.
@@ -374,6 +379,88 @@ def bargaining_features(round_idx, num_rounds: int, proposer_idx, num_agents: in
 
     feats = jnp.stack([per_agent(i) for i in range(num_agents)])               # (N,E,F)
     return feats * mask
+
+
+# ------------------------------------------------------------ median protocol
+#
+# Why a protocol with no vote exists at all: under per-segment renegotiation the
+# accept/reject game has a degenerate SPE that the counterfactual credit machinery
+# learns FAITHFULLY. A responder's vote changes exactly one thing -- whether this
+# segment plays at theta or at null -- so the true counterfactual is a per-segment
+# individual-rationality test, and in Clean Up the null segment is bad enough that
+# every theta in range passes it for everyone. Accept-everything is then correct,
+# proposers bid their ideal points unopposed, and the outcome is a random
+# dictatorship per segment. No estimator fixes that; it is a property of the game.
+#
+# The median mechanism swaps IR-gated acceptance for preference aggregation.
+# Everyone asks, the median binds. With single-peaked preferences over a scalar
+# theta -- which Clean Up's contract space gives every agent: too little buys no
+# cleaning, too much funds rent-seeking entry -- the median mechanism is
+# STRATEGYPROOF (Moulin 1980's generalised median voter schemes): no agent can move
+# the outcome toward its peak by misreporting, so each agent's whole learning
+# problem collapses to "find my ideal point", a stationary target that plain
+# REINFORCE can hit. No threats, no reservation values, no co-learning
+# chicken-and-egg between proposers and voters.
+
+def median_offer(theta_all) -> jnp.ndarray:
+    """(E,) the theta that binds: the median of every agent's simultaneous ask.
+
+    With an odd number of agents this is the middle order statistic, so the winning
+    ask is always one an agent actually made; with an even number jnp.median
+    averages the two middle asks, which is still inside the asked range but belongs
+    to nobody -- prefer odd N when it matters. A single extremist cannot drag the
+    outcome: the median moves only when the middle of the distribution does, which
+    is exactly the property the alternating-offers game lacked (whoever held the
+    pen set the number).
+
+    Args:
+        theta_all: (N, E) every agent's ask, already unsquashed onto [low, high].
+    """
+    return jnp.median(jnp.asarray(theta_all, jnp.float32), axis=0)
+
+
+def median_round_features(round_idx, num_rounds: int, num_agents: int,
+                          last_median_norm, had_offer,
+                          own_return, own_cleaning, river_stock,
+                          mask) -> jnp.ndarray:
+    """(N, E, F) decision state for a median round: everyone asks, nobody votes.
+
+    Reuses the alternating-offers layout (`bargaining_features`) rather than
+    defining its own, so the network shape, the checkpoint tooling and the feature
+    tiers are shared unchanged. The mapping onto that layout:
+
+      * every agent is its own proposer -- the `mine` flag is 1 for all, and the
+        proposer one-hot carries the agent's own identity;
+      * the standing-offer slot carries LAST round's median, which is the whole
+        public history this protocol has;
+      * the live-offer slots stay empty (one simultaneous pass -- nothing is ever
+        "on the table" when the decision is made), and the vote-history and
+        rejection slots stay zero, because votes and rejections do not exist.
+
+    The structurally-zero slots cost nothing: a constant input is folded into the
+    first layer's bias. What matters is that a median-trained checkpoint reads a
+    feature vector whose live slots mean what they meant in training, which this
+    guarantees by construction.
+
+    Args:
+        last_median_norm: (E,) last round's median on [-1, 1], 0 in round 0.
+        had_offer: (E,) bool, whether any round has resolved yet.
+        own_return, own_cleaning: (N, E) per-agent accumulations, pre-scaled.
+        river_stock: (E,) pre-scaled.
+        mask: (F,) from `feature_mask`.
+    """
+    num_envs = last_median_norm.shape[0]
+    zeros_i = jnp.zeros((num_envs,), jnp.int32)
+    zeros_f = jnp.zeros((num_envs,), jnp.float32)
+    zeros_votes = jnp.zeros((num_agents, num_envs), jnp.float32)
+    rows = []
+    for i in range(num_agents):
+        feats_i = bargaining_features(
+            round_idx, num_rounds, jnp.full((num_envs,), i, jnp.int32), num_agents,
+            last_median_norm, had_offer, zeros_i, zeros_f, zeros_f,
+            zeros_votes, zeros_f, own_return, own_cleaning, river_stock, mask)
+        rows.append(feats_i[i])
+    return jnp.stack(rows)
 
 
 # -------------------------------------------------------------- the vote itself

@@ -101,56 +101,93 @@ def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed, cp=None):
     def round_(carry, r):
         (st, ob, rng, agreed, locked, cum_r, cum_c, last_tn, had, nrej, riv,
          last_votes, last_nacc, last_rej) = carry
-        if report:
-            rng, kp, kt, kv, kc, ka = jax.random.split(rng, 6)
+        if cfg.get("protocol") == "median":
+            # One simultaneous pass, as in training: every agent asks, the median
+            # binds this segment. There is no proposer (recorded as -1) and no
+            # vote, so the vote-shaped record fields are structural zeros and the
+            # rejection counter never moves.
+            if report:
+                rng, kt, kc, ka = jax.random.split(rng, 4)
+            else:
+                rng, kt = jax.random.split(rng)
+            feats_prop = bg.median_round_features(
+                r, K, n, last_tn, had, cum_r / ret_s, cum_c / cl_s, riv / riv_s,
+                mask)
+            kts = jax.random.split(kt, n)
+            raw = []
+            for i in range(n):
+                pt, _, _ = bnet.apply(bp[i], feats_prop[i])
+                raw.append(pt.sample(seed=kts[i])[:, 0])
+            theta_all = neg.unsquash(jnp.stack(raw), contract.low, contract.high)
+            offer = bg.median_offer(theta_all)
+            prop = jnp.full((num_envs,), -1, jnp.int32)
+            mine = jnp.zeros((n, num_envs), bool)
+            votes = jnp.zeros((n, num_envs), jnp.int32)
+            p_acc = jnp.zeros((n, num_envs), jnp.float32)
+            n_acc = jnp.zeros((num_envs,), jnp.int32)
+            # A null median (reachable only when the range floor is 0) plays the
+            # segment uncontracted, like a null offer everywhere else.
+            newly = ~contract.is_null(offer)
+            passed = newly
+            theta_eff = offer
+            next_agreed, next_locked = agreed, theta_eff
+            nrej_next = nrej
         else:
-            rng, kp, kt, kv = jax.random.split(rng, 4)
-        prop = bg.proposer_for_round(r, n, num_envs, cfg["proposer"], key=kp,
-                                     contributions=cum_c, start_offset=offset,
-                                     holdouts=last_rej)
+            if report:
+                rng, kp, kt, kv, kc, ka = jax.random.split(rng, 6)
+            else:
+                rng, kp, kt, kv = jax.random.split(rng, 4)
+            prop = bg.proposer_for_round(r, n, num_envs, cfg["proposer"], key=kp,
+                                         contributions=cum_c, start_offset=offset,
+                                         holdouts=last_rej)
 
-        def feats_at(live_tn, live):
-            return bg.bargaining_features(r, K, prop, n, last_tn, had, nrej,
-                                          live_tn, live, last_votes, last_nacc,
-                                          cum_r / ret_s, cum_c / cl_s, riv / riv_s,
-                                          mask)
+            def feats_at(live_tn, live):
+                return bg.bargaining_features(r, K, prop, n, last_tn, had, nrej,
+                                              live_tn, live, last_votes, last_nacc,
+                                              cum_r / ret_s, cum_c / cl_s,
+                                              riv / riv_s, mask)
 
-        # Two passes, exactly as in training: propose first, then vote on what was
-        # proposed. Collapsing them back into one would replay a policy that had
-        # never been trained -- the votes would be reading an empty table.
-        zeros_e = jnp.zeros((num_envs,), jnp.float32)
-        feats_prop = feats_at(zeros_e, zeros_e)
-        kts, kvs = jax.random.split(kt, n), jax.random.split(kv, n)
-        raw = []
-        for i in range(n):
-            pt, _, _ = bnet.apply(bp[i], feats_prop[i])
-            raw.append(pt.sample(seed=kts[i])[:, 0])
-        raw = jnp.stack(raw)
-        theta_all = neg.unsquash(raw, contract.low, contract.high)
-        mine = bg.is_proposer_mask(prop, n)
-        offer = jnp.sum(jnp.where(mine, theta_all, 0.0), axis=0)
+            # Two passes, exactly as in training: propose first, then vote on what
+            # was proposed. Collapsing them back into one would replay a policy
+            # that had never been trained -- the votes would be reading an empty
+            # table.
+            zeros_e = jnp.zeros((num_envs,), jnp.float32)
+            feats_prop = feats_at(zeros_e, zeros_e)
+            kts, kvs = jax.random.split(kt, n), jax.random.split(kv, n)
+            raw = []
+            for i in range(n):
+                pt, _, _ = bnet.apply(bp[i], feats_prop[i])
+                raw.append(pt.sample(seed=kts[i])[:, 0])
+            raw = jnp.stack(raw)
+            theta_all = neg.unsquash(raw, contract.low, contract.high)
+            mine = bg.is_proposer_mask(prop, n)
+            offer = jnp.sum(jnp.where(mine, theta_all, 0.0), axis=0)
 
-        feats_vote = feats_at(bg.normalise_theta(offer, contract.low, contract.high),
-                              jnp.ones((num_envs,), jnp.float32))
-        votes, p_acc = [], []
-        for i in range(n):
-            _, pv, _ = bnet.apply(bp[i], feats_vote[i])
-            # eps=0: the exploration floor is a training device, so what is measured
-            # here is the policy itself. p_accept is kept as well -- it is the
-            # offer-conditioned quantity, and reading it off the distribution rather
-            # than the sampled votes gives a far less noisy picture per bin.
-            v, _ = bg.floored_vote(pv, 0.0, kvs[i])
-            votes.append(v)
-            p_acc.append(pv.probs[..., 1])
-        votes, p_acc = jnp.stack(votes), jnp.stack(p_acc)
-        passed, n_acc = bg.accepted(votes.astype(bool), prop, quorum, n)
-        # As in training: an offer of exactly the null contract never takes force --
-        # accepted or not, the fallback applies and negotiation reopens. How long an
-        # offer that DOES carry governs is BARGAIN_BINDING, read from the run's
-        # sidecar; a run without one predates the setting and is `episode`.
-        newly, theta_eff, next_agreed, next_locked = bg.apply_binding(
-            cfg.get("binding", "episode"), passed, contract.is_null(offer), offer,
-            agreed, locked, contract.null)
+            feats_vote = feats_at(
+                bg.normalise_theta(offer, contract.low, contract.high),
+                jnp.ones((num_envs,), jnp.float32))
+            votes, p_acc = [], []
+            for i in range(n):
+                _, pv, _ = bnet.apply(bp[i], feats_vote[i])
+                # eps=0: the exploration floor is a training device, so what is
+                # measured here is the policy itself. p_accept is kept as well --
+                # it is the offer-conditioned quantity, and reading it off the
+                # distribution rather than the sampled votes gives a far less
+                # noisy picture per bin.
+                v, _ = bg.floored_vote(pv, 0.0, kvs[i])
+                votes.append(v)
+                p_acc.append(pv.probs[..., 1])
+            votes, p_acc = jnp.stack(votes), jnp.stack(p_acc)
+            passed, n_acc = bg.accepted(votes.astype(bool), prop, quorum, n)
+            # As in training: an offer of exactly the null contract never takes
+            # force -- accepted or not, the fallback applies and negotiation
+            # reopens. How long an offer that DOES carry governs is
+            # BARGAIN_BINDING, read from the run's sidecar; a run without one
+            # predates the setting and is `episode`.
+            newly, theta_eff, next_agreed, next_locked = bg.apply_binding(
+                cfg.get("binding", "episode"), passed, contract.is_null(offer),
+                offer, agreed, locked, contract.null)
+            nrej_next = nrej + (~agreed & ~passed).astype(jnp.int32)
 
         (st, ob, _, rng), (cl, rew, tr, riv_t) = jax.lax.scan(
             seg_step, (st, ob, theta_eff, rng), None, x)
@@ -178,11 +215,12 @@ def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed, cp=None):
                "newly": newly, "active": ~agreed, "n_accept": n_acc,
                "p_accept": p_acc, "theta_eff": theta_eff, "cleaned": seg_cl,
                "base": seg_base, "transfer": seg_tr, "river": riv_t.mean(0),
+               "asks": theta_all,
                "overclaim": overclaim, "audited": audited, "report_tr": settle}
         carry = (st, ob, rng, next_agreed, next_locked,
                  cum_r + seg_base + seg_tr + settle, cum_c + seg_cl,
                  bg.normalise_theta(offer, contract.low, contract.high),
-                 jnp.ones_like(had), nrej + (~agreed & ~passed).astype(jnp.int32),
+                 jnp.ones_like(had), nrej_next,
                  riv_t[-1].astype(jnp.float32),
                  (votes.astype(bool) & ~mine).astype(jnp.float32),
                  n_acc.astype(jnp.float32),
@@ -260,6 +298,34 @@ def voting_vs_offer(rec, contract, n, blk, nbins=6):
             cells.append(f"{rec['p_accept'][:, i, :][m].mean():>9.3f}"
                          if m.any() else f"{'--':>9}")
         print(f"  A{i:<6}" + "".join(cells))
+
+
+def asks_block(rec, n, blk):
+    """The median protocol's analogue of the voting table: who asked what.
+
+    There is no vote to condition on an offer, so the question becomes whether the
+    ASKS separate by preference -- cleaners bidding high, harvesters low -- and who
+    actually sets the outcome. 'held median' is the fraction of active rounds in
+    which this agent's ask WAS the middle one (ties are measure-zero with
+    continuous asks, so the middle ask belongs to exactly one agent per round).
+    """
+    act = rec["active"]                                            # (K, E)
+    if not act.any():
+        return
+    asks = rec["asks"]                                             # (K, N, E)
+    med = rec["offer"]                                             # (K, E)
+    blk("asks  (median protocol: everyone bids, the middle ask binds)")
+    print(f"  {'agent':<7}{'mean ask':>10}{'sd':>8}{'min':>8}{'max':>8}"
+          f"{'held median':>13}")
+    for i in range(n):
+        a = asks[:, i, :][act]
+        held = (np.abs(asks[:, i, :] - med) < 1e-6) & act
+        print(f"  A{i:<6}{a.mean():>10.4f}{a.std():>8.4f}{a.min():>8.3f}"
+              f"{a.max():>8.3f}{held.sum() / act.sum():>13.3f}")
+    spread = asks.max(axis=1) - asks.min(axis=1)                   # (K, E)
+    print(f"\n  median theta   {med[act].mean():.4f} +- {med[act].std():.4f}")
+    print(f"  ask spread     {spread[act].mean():.4f} (max-min within a round; "
+          f"~0 means the asks have collapsed onto one number)")
 
 
 def renegotiation_block(rec, K, contract, n, blk, agreed_any, agree_round, theta_ag,
@@ -349,10 +415,22 @@ def report(rec, K, cfg, contract, n, num_steps):
     def blk(t):
         print(f"\n\033[1m{t}\033[0m" if sys.stdout.isatty() else f"\n{t}")
 
-    print(f"protocol: segment={x}  rounds={K}  binding={binding}  "
-          f"proposer={cfg['proposer']}"
-          f"(start {cfg['rotate_start']})  quorum={cfg['quorum']}"
-          f"={bg.quorum_size(cfg['quorum'], n)}/{n-1}  features={cfg['features']}")
+    src = cfg.get("binding_source", "fallback")
+    if cfg.get("protocol") == "median":
+        print(f"protocol: MEDIAN (simultaneous asks, the middle ask binds per "
+              f"segment)  segment={x}  rounds={K}  features={cfg['features']}")
+    else:
+        print(f"protocol: segment={x}  rounds={K}  binding={binding} ({src})  "
+              f"proposer={cfg['proposer']}"
+              f"(start {cfg['rotate_start']})  quorum={cfg['quorum']}"
+              f"={bg.quorum_size(cfg['quorum'], n)}/{n-1}  "
+              f"features={cfg['features']}")
+        if src == "fallback":
+            print("  [warning] no BARGAIN_BINDING in the run's .run.yaml sidecar, "
+                  "so 'episode' is an ASSUMPTION.\n  If this run renegotiated "
+                  "every segment, pass --binding segment: replayed as 'episode' "
+                  "its first contracted\n  segment is reported as an episode-long "
+                  "agreement and every number below follows from it.")
     if binding != "episode":
         print("  renegotiated every segment: a carried offer governs ITS OWN segment"
               + (", a failed round keeps the incumbent" if binding == "sticky"
@@ -428,46 +506,87 @@ def report(rec, K, cfg, contract, n, num_steps):
             caught = (lied & rec["audited"][:, i]).sum() / max(lied.sum(), 1)
             print(f"  A{i:<6}{oc_i:>11.3f}{cl_i:>15.2f}{caught:>13.3f}")
 
-    blk("offers by round  (do proposers concede as the episode shrinks?)")
-    print(f"  {'round':>6}{'offers':>8}{'mean theta':>12}{'accepted':>10}{'accept rate':>13}")
-    for r in range(K):
-        act = rec["active"][r]
-        if not act.any():
-            continue
-        print(f"  {r:>6}{int(act.sum()):>8}{rec['offer'][r][act].mean():>12.4f}"
-              f"{int(rec['newly'][r].sum()):>10}"
-              f"{rec['newly'][r][act].mean():>13.3f}")
+    if cfg.get("protocol") == "median":
+        blk("medians by round  (does the outcome drift over the episode?)")
+        print(f"  {'round':>6}{'rounds':>8}{'mean theta':>12}{'in force':>10}")
+        for r in range(K):
+            act = rec["active"][r]
+            if not act.any():
+                continue
+            print(f"  {r:>6}{int(act.sum()):>8}{rec['offer'][r][act].mean():>12.4f}"
+                  f"{rec['newly'][r][act].mean():>10.3f}")
+        asks_block(rec, n, blk)
+    else:
+        blk("offers by round  (do proposers concede as the episode shrinks?)")
+        print(f"  {'round':>6}{'offers':>8}{'mean theta':>12}{'accepted':>10}"
+              f"{'accept rate':>13}")
+        for r in range(K):
+            act = rec["active"][r]
+            if not act.any():
+                continue
+            print(f"  {r:>6}{int(act.sum()):>8}{rec['offer'][r][act].mean():>12.4f}"
+                  f"{int(rec['newly'][r].sum()):>10}"
+                  f"{rec['newly'][r][act].mean():>13.3f}")
 
-    voting_vs_offer(rec, contract, n, blk)
+        voting_vs_offer(rec, contract, n, blk)
 
     blk("per agent")
     cl_agent = rec["cleaned"].sum(0).mean(1) / num_steps         # (N,) cells/step
     is_cleaner = cl_agent > cl_agent.mean()
-    print(f"  {'agent':<7}{'clean/step':>11}{'return':>9}{'role':>10}"
-          f"{'proposed':>10}{'mean theta':>12}{'carried':>9}{'votes yes':>11}")
-    for i in range(n):
-        mine = rec["proposer"] == i                              # (K, E)
-        prop_act = mine & rec["active"]
-        voted = rec["active"] & ~mine
-        yes = (rec["votes"][:, i] == 1) & voted
-        print(f"  A{i:<6}{cl_agent[i]:>11.3f}{ret[i].mean():>9.1f}"
-              f"{'cleaner' if is_cleaner[i] else 'harvester':>10}"
-              f"{int(prop_act.sum()):>10}"
-              f"{(rec['offer'][prop_act].mean() if prop_act.any() else np.nan):>12.4f}"
-              f"{int((rec['newly'] & mine).sum()):>9}"
-              f"{(yes.sum() / max(voted.sum(), 1)):>11.3f}")
+    is_median = cfg.get("protocol") == "median"
+    if is_median:
+        # Nobody proposes and nobody votes; what an agent DOES is ask, so the
+        # columns become its asking behaviour and how often its ask was the one
+        # that bound.
+        print(f"  {'agent':<7}{'clean/step':>11}{'return':>9}{'role':>10}"
+              f"{'mean ask':>10}{'held median':>13}")
+        for i in range(n):
+            a = rec["asks"][:, i, :][rec["active"]]
+            held = (np.abs(rec["asks"][:, i, :] - rec["offer"]) < 1e-6) & rec["active"]
+            print(f"  A{i:<6}{cl_agent[i]:>11.3f}{ret[i].mean():>9.1f}"
+                  f"{'cleaner' if is_cleaner[i] else 'harvester':>10}"
+                  f"{a.mean():>10.4f}"
+                  f"{held.sum() / max(rec['active'].sum(), 1):>13.3f}")
+    else:
+        print(f"  {'agent':<7}{'clean/step':>11}{'return':>9}{'role':>10}"
+              f"{'proposed':>10}{'mean theta':>12}{'carried':>9}{'votes yes':>11}")
+        for i in range(n):
+            mine = rec["proposer"] == i                          # (K, E)
+            prop_act = mine & rec["active"]
+            voted = rec["active"] & ~mine
+            yes = (rec["votes"][:, i] == 1) & voted
+            print(f"  A{i:<6}{cl_agent[i]:>11.3f}{ret[i].mean():>9.1f}"
+                  f"{'cleaner' if is_cleaner[i] else 'harvester':>10}"
+                  f"{int(prop_act.sum()):>10}"
+                  f"{(rec['offer'][prop_act].mean() if prop_act.any() else np.nan):>12.4f}"
+                  f"{int((rec['newly'] & mine).sum()):>9}"
+                  f"{(yes.sum() / max(voted.sum(), 1)):>11.3f}")
     if is_cleaner.any() and (~is_cleaner).any():
         c, h = ret[is_cleaner].mean(), ret[~is_cleaner].mean()
         print(f"\n  cleaner:harvester return ratio  {c / h:.3f}   "
               f"(cleaners {c:.1f}, harvesters {h:.1f})")
-        # The direct test of whether rotating proposal rights does any work: if a
-        # cleaner's turn produces a systematically higher offer than a harvester's,
-        # then who holds the move is shifting the split.
-        for label, m in (("cleaners", is_cleaner), ("harvesters", ~is_cleaner)):
-            sel = np.isin(rec["proposer"], np.where(m)[0]) & rec["active"]
-            if sel.any():
-                print(f"  mean theta offered by {label:<11}{rec['offer'][sel].mean():.4f}"
-                      f"   (carried {int((rec['newly'] & sel).sum())})")
+        if is_median:
+            # THE check on this mechanism: single-peaked preferences should pull
+            # the roles' asks apart, with the median tracking whichever role holds
+            # the middle. Cleaners and harvesters asking the same number means the
+            # ideal points never separated and the run needs more training (or the
+            # asks have collapsed -- compare the sd in the asks table).
+            for label, m in (("cleaners", is_cleaner), ("harvesters", ~is_cleaner)):
+                role_asks = rec["asks"][:, m, :]                 # (K, |role|, E)
+                sel = role_asks[np.broadcast_to(
+                    rec["active"][:, None, :], role_asks.shape)]
+                if sel.size:
+                    print(f"  mean ask by {label:<11}{sel.mean():.4f}")
+        else:
+            # The direct test of whether rotating proposal rights does any work:
+            # if a cleaner's turn produces a systematically higher offer than a
+            # harvester's, then who holds the move is shifting the split.
+            for label, m in (("cleaners", is_cleaner), ("harvesters", ~is_cleaner)):
+                sel = np.isin(rec["proposer"], np.where(m)[0]) & rec["active"]
+                if sel.any():
+                    print(f"  mean theta offered by "
+                          f"{label:<11}{rec['offer'][sel].mean():.4f}"
+                          f"   (carried {int((rec['newly'] & sel).sum())})")
 
     blk("per episode")
     if binding == "episode":
@@ -514,6 +633,14 @@ def main():
                         "supply them explicitly for those.")
     p.add_argument("--bargain-segment", type=int, default=None,
                    help="override the _seg<N> read from the checkpoint name")
+    p.add_argument("--binding", choices=bg.BINDING_MODES, default=None,
+                   help="how long a carried offer bound: 'episode' (the original "
+                        "absorbing game), 'segment' or 'sticky' (renegotiated every "
+                        "segment). Read from the .run.yaml sidecar when there is "
+                        "one; this flag is for runs without it, where the default "
+                        "is 'episode' and a renegotiated run would otherwise be "
+                        "reported as an episode-long agreement struck in its first "
+                        "contracted segment.")
     p.add_argument("--report-audit-p", type=float, default=None)
     p.add_argument("--report-fine-mult", type=float, default=None)
     p.add_argument("--report-max-overclaim", type=float, default=None,
@@ -547,6 +674,13 @@ def main():
         raise SystemExit(f"[incompatible checkpoint] {e}")
     if args.bargain_segment:
         cfg["segment"] = args.bargain_segment
+    if args.binding:
+        cfg["binding"], cfg["binding_source"] = args.binding, "flag"
+    if cfg.get("protocol") == "median":
+        # The median binds per segment by construction, so the binding fallback
+        # (or a stray --binding flag) must not route a median run through the
+        # episode-agreement reporting: there is no such agreement to report.
+        cfg["binding"], cfg["binding_source"] = "segment", "protocol"
     if args.num_steps % cfg["segment"]:
         raise SystemExit(f"--num-steps {args.num_steps} must be a multiple of the "
                          f"segment length {cfg['segment']}")

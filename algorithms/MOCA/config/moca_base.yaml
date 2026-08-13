@@ -123,6 +123,31 @@
 # of one rejection, which is the whole lever on bargaining power: at 100 steps of a
 # 1000-step episode a rejection burns roughly a tenth of the episode's welfare.
 "BARGAIN_SEGMENT": 100
+# Which contracting game each round plays.
+#   "alternating" -- one proposer (BARGAIN_PROPOSER) makes an offer, the others
+#                    vote under BARGAIN_QUORUM. Everything up to 2026-08-13.
+#   "median"      -- every agent names a theta SIMULTANEOUSLY and the median of
+#                    the N asks binds for the segment. There is no vote.
+# Why the switch: the accept/reject game converged to its own SPE, not to
+# bargaining. Under per-segment renegotiation a vote changes one segment only, so
+# the true counterfactual behind it is a per-segment IR test -- and the null
+# segment is bad enough that EVERY theta in range passes it for everyone. The
+# counterfactual credit learned exactly that (accept everything), proposers bid
+# their ideal points unopposed, and the outcome was a random dictatorship per
+# segment with cleaners pinning the ceiling -- welfare-suboptimal, since a per-cell
+# price cannot stop rent-seeking entry (the 4th cleaner) at high theta.
+# The median mechanism swaps IR-gated acceptance for preference aggregation: with
+# single-peaked preferences over a scalar theta it is STRATEGYPROOF (median voter
+# theorem), so each agent's whole learning problem is "find my ideal point" -- a
+# stationary REINFORCE target, no threats to sustain, no proposer/voter
+# co-learning. With ~4 harvesters among 7 agents the median tracks the harvester
+# ideal, which the welfare(theta) curve puts near its optimum.
+# Under "median" the vote apparatus is inert: BARGAIN_BINDING, the vote knobs
+# (quorum, eps floor, accept bias, probes) and BARGAIN_VOTE_ADVANTAGE are forced
+# to segment/gae/off and recorded as such in the sidecar. (Code default is
+# "alternating" so existing configs and tests replay unchanged; this file carries
+# the current experiment line.)
+"BARGAIN_PROTOCOL": "median"
 # How long an accepted contract binds for.
 #   "episode" -- the original Rubinstein game: the first offer to carry binds for
 #                every remaining segment and bargaining ENDS.

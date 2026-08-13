@@ -100,16 +100,24 @@ def checkpoint_filename(config: Dict[str, Any], latest: bool = False) -> str:
     # only for bargain runs, so no existing filename changes.
     if phase2_mode == "bargain":
         suffix += f"_seg{config.get('BARGAIN_SEGMENT')}"
-        proposer = config.get("BARGAIN_PROPOSER")
-        if proposer and proposer != "rotate":
-            suffix += f"_{proposer}"
-        elif config.get("BARGAIN_ROTATE_START") == "fixed":
-            # Only meaningful under rotation, and it changes who captures the
-            # first-mover premium -- so the ablation needs its own path.
-            suffix += "_fixedstart"
-        quorum = config.get("BARGAIN_QUORUM")
-        if quorum and quorum != "all":
-            suffix += f"_q{quorum}"
+        protocol = config.get("BARGAIN_PROTOCOL")
+        if protocol and protocol != "alternating":
+            # A simultaneous protocol has no proposer and no quorum, so the
+            # protocol tag REPLACES those tags rather than joining them -- and a
+            # median run at the same seed must never collide with an alternating
+            # one, since the checkpoints are different mechanisms entirely.
+            suffix += f"_{protocol}"
+        else:
+            proposer = config.get("BARGAIN_PROPOSER")
+            if proposer and proposer != "rotate":
+                suffix += f"_{proposer}"
+            elif config.get("BARGAIN_ROTATE_START") == "fixed":
+                # Only meaningful under rotation, and it changes who captures the
+                # first-mover premium -- so the ablation needs its own path.
+                suffix += "_fixedstart"
+            quorum = config.get("BARGAIN_QUORUM")
+            if quorum and quorum != "all":
+                suffix += f"_q{quorum}"
         features = config.get("BARGAIN_FEATURES")
         if features and features != "private":
             suffix += f"_{features}"

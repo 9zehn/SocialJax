@@ -84,6 +84,12 @@ def main():
                    help="theta bounds; read from the .run.yaml sidecar when present")
     p.add_argument("--by-proposer", action="store_true",
                    help="also print each (proposer, responder) pair separately")
+    p.add_argument("--binding", choices=bg.BINDING_MODES, default=None,
+                   help="how long a carried offer bound; read from the .run.yaml "
+                        "sidecar when there is one. Only affects --episodes (the "
+                        "sweep itself is per-round either way), but a renegotiated "
+                        "run replayed as 'episode' reports its first contracted "
+                        "segment as an episode-long agreement.")
     p.add_argument("--episodes", type=int, default=0,
                    help="also roll out this many episodes and print "
                         "evaluate_bargain's full report underneath the sweep. The "
@@ -104,6 +110,15 @@ def main():
     bp = [load_params(q) for q in moca["contract_paths"]]
     n = len(bp)
     cfg = infer_bargain_config(moca["stem"], checkpoint=args.checkpoint)
+    if cfg.get("protocol") == "median":
+        raise SystemExit(
+            "this is a BARGAIN_PROTOCOL=median run: there is no vote to probe -- "
+            "the vote head exists in the network but was never trained, so its "
+            "curves would describe an initialisation, not a mechanism. The "
+            "analogue is the asks table in evaluate_bargain.py (per-agent mean "
+            "ask, held-median rate, ask spread).")
+    if args.binding:
+        cfg["binding"], cfg["binding_source"] = args.binding, "flag"
     try:
         bg.check_params_compatible(bp[0], n, cfg.get("feature_version"),
                                    hidden=cfg["hidden"], label=moca["stem"])

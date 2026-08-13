@@ -294,6 +294,62 @@ def test_proposer_sees_that_it_is_the_proposer():
     assert feats[0, 1, 1] == 1.0 and feats[2, 1, 1] == 0.0
 
 
+# ------------------------------------------------------------- median protocol
+
+def test_median_offer_is_the_middle_ask():
+    asks = jnp.array([[3.0, 0.2],
+                      [1.0, 0.5],
+                      [2.0, 2.9]])                              # (N=3, E=2)
+    assert np.allclose(bargain.median_offer(asks), [2.0, 0.5])
+    # A single extremist cannot drag the outcome: the top bidder tripling its ask
+    # moves nothing, which is exactly what the alternating-offers game lacked.
+    assert np.allclose(bargain.median_offer(asks.at[0, 0].set(30.0)), [2.0, 0.5])
+
+
+def _median_feats(n=3, envs=2, level="private", **over):
+    """median_round_features with every argument at a neutral default."""
+    kw = dict(round_idx=1, num_rounds=4, num_agents=n,
+              last_median_norm=jnp.zeros((envs,)),
+              had_offer=jnp.zeros((envs,), bool),
+              own_return=jnp.zeros((n, envs)), own_cleaning=jnp.zeros((n, envs)),
+              river_stock=jnp.zeros((envs,)))
+    kw.update(over)
+    kw.setdefault("mask", bargain.feature_mask(level, n))
+    return np.array(bargain.median_round_features(**kw))
+
+
+def test_median_features_share_the_alternating_layout():
+    """Every agent is its own proposer, and the vote-shaped slots are dead.
+
+    The median checkpoint tooling (network shape, feature version, tiers) is
+    shared with alternating offers on the strength of this layout mapping, so the
+    mapping itself is the thing to pin.
+    """
+    n, envs = 3, 2
+    feats = _median_feats(n, envs, last_median_norm=jnp.full((envs,), 0.25),
+                          had_offer=jnp.ones((envs,), bool))
+    assert feats.shape == (n, envs, bargain.feature_dim(n))
+    for i in range(n):
+        assert np.all(feats[i, :, 1] == 1.0), "every agent decides an ask"
+        onehot = feats[i, :, 8:8 + n]
+        assert np.all(onehot == np.eye(n)[i]), "the one-hot carries own identity"
+    assert np.all(feats[:, :, 3] == 0.25), "standing slot holds last round's median"
+    assert np.all(feats[:, :, 5:7] == 0.0), "nothing is ever on the table"
+    assert np.all(feats[:, :, 8 + n:8 + 2 * n] == 0.0), "no votes exist"
+    assert np.all(feats[:, :, 4] == 0.0), "no rejections exist"
+
+
+def test_median_features_respect_the_feature_tiers():
+    """The ablation levers must keep working when the protocol changes."""
+    n = 3
+    common = dict(own_return=jnp.full((n, 2), 0.7))
+    hidden = _median_feats(n, level="protocol", **common)
+    shown = _median_feats(n, level="private", **common)
+    own_slot = 8 + 2 * n
+    assert np.all(hidden[:, :, own_slot] == 0.0), "protocol tier must hide returns"
+    assert np.all(shown[:, :, own_slot] == 0.7), "private tier must show them"
+
+
 # ------------------------------------------------------------ credit over rounds
 
 def _run_gae(rewards, active, terminal, values=None, gamma=1.0, lam=1.0):
