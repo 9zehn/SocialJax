@@ -49,6 +49,7 @@ def single_run(config, make_train, *, wandb_name):
         config=config,
         mode=config["WANDB_MODE"],
         name=config.get("WANDB_RUN_NAME") or f"{wandb_name}_{filename}",
+        group=config.get("WANDB_GROUP"),
     )
 
     rng = jax.random.PRNGKey(config["SEED"])

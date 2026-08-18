@@ -399,3 +399,6 @@
 "PROJECT": "socialjax"
 "WANDB_MODE": "online"
 "WANDB_RUN_NAME": null
+# wandb group the run files under (e.g. one group per environment), so a
+# ceiling and the arms measured against it sit together. Null = ungrouped.
+"WANDB_GROUP": null
