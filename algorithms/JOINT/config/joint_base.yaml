@@ -41,3 +41,5 @@
 "PROJECT": "socialjax"
 "WANDB_MODE": "online"
 "WANDB_RUN_NAME": null
+# wandb group the run files under (e.g. one group per environment). Null = ungrouped.
+"WANDB_GROUP": null
