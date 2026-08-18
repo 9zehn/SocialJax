@@ -1,0 +1,18 @@
+# @package _global_
+# Alternating-offers bargaining, the ORIGINAL game: the first offer to carry binds
+# for every remaining segment and bargaining ends.
+#
+# The comparison partner to arm/renegotiate. Identical in every other respect --
+# same segment length, same proposer rule, same quorum, same vote credit -- so the
+# difference between the two runs is the binding and nothing else.
+#
+# What to look for: the counterfactual value heads (joint/cf/gap) are what diagnosed
+# this mode on Clean Up. A single vote decides the whole rest of the episode while
+# the threat behind it is one segment, so believed lock-minus-continue gaps run
+# large and positive, accepting is optimal at every theta, and whoever proposes in
+# round 0 captures the episode. If that reappears on another environment it is a
+# property of the protocol; if it does not, it was a property of Clean Up.
+TRAINING_MODE: joint
+PHASE2_MODE: bargain
+BARGAIN_PROTOCOL: alternating
+BARGAIN_BINDING: episode

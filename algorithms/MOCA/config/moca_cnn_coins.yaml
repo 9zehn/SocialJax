@@ -1,0 +1,59 @@
+# MOCA / formal contracting on the Coin Game.
+#
+# Contract space (contracts.CoinGameContract): theta per coin taken of another
+# agent's colour, paid to the agent whose colour it was.
+#
+# THE AUTHORS DEFINE NO COIN GAME CONTRACT. This space follows their design rules --
+# one scalar, a per-unit price on the attributable externality, zero-sum -- and
+# routes the payment to the harmed party as their self-driving contract does.
+# Report it as constructed, not as transcribed.
+defaults:
+  - moca_base
+  - _self_
+  - reward: individual   # contracts assume an intact individual-reward dilemma
+  # Which contracting arm runs. Last in the list, so `arm=<name>` on the command
+  # line overrides everything above it -- one flag instead of four, and the arm is
+  # then a single recorded name rather than a combination to reconstruct.
+  #   arm=moca          MOCA, Algorithm 1 (the default; changes nothing)
+  #   arm=vanilla       single-stage contracting, no phase split
+  #   arm=renegotiate   alternating offers, renegotiated every segment
+  #   arm=episode_lock  alternating offers, first carried offer binds the episode
+  #   arm=median        the median mechanism (Clean Up only)
+  - arm: moca
+
+"ENV_NAME": "coin_game"
+"CONTRACT_SPACE": "coin_game"
+
+# Set by the payoff matrix rather than tuned. A coin is worth +1 to whoever takes it
+# and -2 to its owner, so theta = 1 is where stealing stops paying and theta = 2 is
+# where the owner is made whole. Above 2 the contract would over-compensate and pay
+# agents to be robbed, so the ceiling is a property of the game.
+"CONTRACT_LOW": 0.0
+"CONTRACT_HIGH": 2.0
+
+"ENV_KWARGS":
+  # Two by construction: the environment is red-vs-green, with a 2x3 payoff matrix.
+  "num_agents": 2
+  "num_inner_steps": 1000
+  "cnn": True
+  "jit": True
+  # Play the payoff matrix as written (+1 / -2). The env defaults this to num_agents,
+  # which would double every payoff and halve the effective strength of theta.
+  "coin_reward": 1.0
+
+# nu, the number of non-proposers polled on agent 0's offer. With 2 agents the
+# reference's own branch polls every non-proposer, which is the single other agent --
+# so acceptance here is one agent's decision and the contract is a genuine bilateral
+# agreement rather than a sampled quorum. Left null so negotiate.default_nu applies
+# that rule; stated here because it is the one place the protocol degenerates.
+"NEGOTIATE_NU": null
+# The same count for PHASE2_MODE=reinforce, which has no such rule and takes the
+# number literally. moca_base's 2 is out of range with only one non-proposer, so it
+# has to be set here or every coin-game run fails validation -- including the arms
+# that never read it.
+"VOTER_SAMPLE_NU": 1
+# With 2 agents unanimity among non-proposers IS the single counterparty, so the
+# bargaining arms are literal two-player alternating offers -- the canonical
+# Rubinstein setting, and the one place in this project where the protocol matches
+# the theory exactly rather than approximating it.
+"BARGAIN_QUORUM": "all"

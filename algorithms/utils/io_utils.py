@@ -100,6 +100,17 @@ def checkpoint_filename(config: Dict[str, Any], latest: bool = False) -> str:
     # only for bargain runs, so no existing filename changes.
     if phase2_mode == "bargain":
         suffix += f"_seg{config.get('BARGAIN_SEGMENT')}"
+        # How long an accepted contract binds. This is the axis the renegotiation
+        # experiment turns on -- "the first offer to carry binds for the episode" vs
+        # "renegotiated every segment" are different games, run at the same seed and
+        # segment length and otherwise identical, so without it in the name the
+        # second silently overwrites the first. Marked for ALL bindings rather than
+        # only off-default ones, the same rule PHASE2_MODE follows and for the same
+        # reason: an unmarked name would be ambiguous between the default of the day
+        # it was written and the default of the day it is read.
+        binding = config.get("BARGAIN_BINDING")
+        if binding:
+            suffix += f"_{binding}"
         protocol = config.get("BARGAIN_PROTOCOL")
         if protocol and protocol != "alternating":
             # A simultaneous protocol has no proposer and no quorum, so the
@@ -121,8 +132,14 @@ def checkpoint_filename(config: Dict[str, Any], latest: bool = False) -> str:
         features = config.get("BARGAIN_FEATURES")
         if features and features != "private":
             suffix += f"_{features}"
-    if config.get("TRAINING_MODE") == "joint":
-        suffix += "_joint"
+    # How the contracting stage was TRAINED. This is the axis the whole
+    # MOCA-vs-vanilla-contracting comparison turns on -- same environment, same
+    # protocol, same seed, same range, differing only here -- so without it the two
+    # arms resolve to one path and the second silently overwrites the first.
+    # "two_phase" stays unmarked so every existing MOCA filename is unchanged.
+    training_mode = config.get("TRAINING_MODE")
+    if training_mode in ("joint", "combined"):
+        suffix += f"_{training_mode}"
 
     # Phase-1 null-contract mass. This shapes the GAMEPLAY policy, so unlike the
     # phase-2 knobs above it is not neutralised by PHASE1_ONLY / PHASE1_FROM: two

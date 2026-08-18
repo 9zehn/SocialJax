@@ -1,4 +1,4 @@
-"""Tabulate V_i(s_0, theta) for a frozen MOCA phase-1 policy.
+"""Tabulate V_i(s_0, theta) for a frozen MOCA phase-1 policy, on any contract env.
 
 Phase 2 -- in every mode -- is a choice over a single scalar made against a FROZEN
 gameplay policy. Everything it decides is therefore a deterministic function of one
@@ -10,10 +10,11 @@ This script measures that table directly instead of inferring it from a learned
 proposal, which separates three questions that are otherwise indistinguishable from
 a training run alone:
 
-  1. Does the policy respond to theta at all? Read cleaned/step against theta. Flat
-     means contracts cannot change behaviour, and the null contract is then the
-     correct answer rather than a failure -- a proposer who is not a cleaner should
-     offer 0 and free-ride, because paying buys it nothing.
+  1. Does the policy respond to theta at all? Read the contracted act per step
+     against theta -- cleaning on Clean Up, depleting harvests on Harvest, theft on
+     the Coin Game. Flat means contracts cannot change behaviour, and the null
+     contract is then the correct answer rather than a failure -- a proposer with
+     nothing to gain should offer 0, because paying buys it nothing.
   2. What SHOULD phase 2 converge to? argmax over theta of the proposer's own
      return, subject to the others accepting. Comparing that to what phase 2 did
      converge to distinguishes "the equilibrium is unattractive" from "phase 2 never
@@ -45,11 +46,13 @@ import numpy as np
 import socialjax
 from socialjax.wrappers.baselines import LogWrapper
 from algorithms.utils import load_params
-from algorithms.MOCA.contracts import CleanupContract, contract_for_params
+from algorithms.MOCA import envs as moca_envs
+from algorithms.MOCA.contracts import contract_for_params
 from algorithms.MOCA.networks import ContractActorCritic
 
 
-def rollout_at_theta(env, network, params, contract, theta, num_envs, num_steps, key):
+def rollout_at_theta(env, network, params, contract, spec, theta, num_envs,
+                     num_steps, key):
     """One batch of full episodes with `theta` in force. Returns per-agent metrics.
 
     Rewards are contract-augmented exactly as in training (R'_i = R_i + transfer_i),
@@ -77,15 +80,18 @@ def rollout_at_theta(env, network, params, contract, theta, num_envs, num_steps,
         obsv, env_state, reward, done, info = jax.vmap(env.step)(
             jax.random.split(k_step, num_envs), env_state, actions
         )
-        cleaned = info["cleaned_by_agent"]                         # (E, N)
-        transfers = contract.compute_transfer(theta, cleaned)
-        # River STOCK, not per-agent throughput: cells that are not dirt. This is
-        # what actually gates apple growth, so it says whether a contract merely
-        # bought cleaning actions or actually sustained the commons.
-        clear = info["waste_cleared"][:, 0]                        # (E,), agent-invariant
-        return (env_state, obsv, rng), (reward, transfers, cleaned, clear)
+        # The act the contract prices, per agent: cleaning on Clean Up, depleting
+        # harvests on Harvest, theft on the Coin Game.
+        act = info[spec.contracted_act]                            # (E, N)
+        transfers = contract.transfer_from_info(theta, info)
+        # The COMMONS, not per-agent throughput: river stock, apple stock, own-colour
+        # collection. This is what says whether a contract merely bought the
+        # contracted action or actually sustained the resource. Agent-invariant, so
+        # one column is the whole story.
+        clear = info[spec.commons_metric][:, 0]                    # (E,)
+        return (env_state, obsv, rng), (reward, transfers, act, clear)
 
-    (_, _, _), (reward, transfers, cleaned, clear) = jax.lax.scan(
+    (_, _, _), (reward, transfers, act, clear) = jax.lax.scan(
         step, (env_state, obsv, key), None, num_steps
     )                                                              # each (T, E, N)
     base = reward.sum(axis=0)                                      # (E, N)
@@ -94,15 +100,15 @@ def rollout_at_theta(env, network, params, contract, theta, num_envs, num_steps,
         "base_return": base.mean(axis=0),                          # (N,)
         "transfer": moved.mean(axis=0),
         "return": (base + moved).mean(axis=0),
-        "cleaned_per_step": cleaned.mean(axis=(0, 1)),
+        "act_per_step": act.mean(axis=(0, 1)),
         "transfer_volume": jnp.maximum(transfers, 0.0).sum(axis=(0, 2)).mean(),
-        "river_mean": clear.mean(),          # average cells clear over the episode
-        "river_final": clear[-1].mean(),     # ... and at the end: did it hold?
+        "commons_mean": clear.mean(),        # average commons state over the episode
+        "commons_final": clear[-1].mean(),   # ... and at the end: did it hold?
         "theta": theta.mean(),
     }
 
 
-def evaluate_grid(env, params, contract, thetas, num_envs, num_steps, seed):
+def evaluate_grid(env, params, contract, spec, thetas, num_envs, num_steps, seed):
     network = ContractActorCritic(env.action_space().n, activation="relu")
     rows = []
     key = jax.random.PRNGKey(seed)
@@ -110,7 +116,7 @@ def evaluate_grid(env, params, contract, thetas, num_envs, num_steps, seed):
         key, k = jax.random.split(key)
         # Same key per theta would be better paired, but the env reset already
         # dominates the variance and a shared key would correlate the estimates.
-        out = rollout_at_theta(env, network, params, contract, float(t),
+        out = rollout_at_theta(env, network, params, contract, spec, float(t),
                                num_envs, num_steps, k)
         rows.append(jax.tree.map(np.asarray, out))
         print(f"  theta={t:.4f} done", flush=True)
@@ -122,13 +128,14 @@ def _gini_equality(v):
     return 1.0 - diffs / (2.0 * len(v) * np.abs(v).sum() + 1e-8)
 
 
-def report(thetas, rows, num_agents):
+def report(thetas, rows, num_agents, spec):
     ret = np.stack([r["return"] for r in rows])                    # (K, N)
     base = np.stack([r["base_return"] for r in rows])
-    clean = np.stack([r["cleaned_per_step"] for r in rows])
+    clean = np.stack([r["act_per_step"] for r in rows])
     welfare = ret.sum(axis=1)
+    act = spec.contracted_act
 
-    print("\n=== cleaning per step, per agent (the theta-responsiveness test) ===")
+    print(f"\n=== {act} per step, per agent (the theta-responsiveness test) ===")
     hdr = "  theta  " + "".join(f"  ag{i:<6d}" for i in range(num_agents)) + "   total"
     print(hdr)
     for k, t in enumerate(thetas):
@@ -149,13 +156,13 @@ def report(thetas, rows, num_agents):
     d = ret[0]                                                     # V_i(0)
     print("\n=== diagnosis ===")
     span = clean.sum(axis=1)
-    print(f"  total cleaning at theta=0 : {span[0]:.3f} cells/step")
-    print(f"  total cleaning at theta=max: {span[-1]:.3f} cells/step")
+    print(f"  total {act} at theta=0  : {span[0]:.3f} /step")
+    print(f"  total {act} at theta=max: {span[-1]:.3f} /step")
     if span.max() - span.min() < 0.05 * max(span.max(), 1e-6):
-        print("  -> FLAT in theta: the policy does not gate cleaning on payment, so no")
-        print("     contract can change behaviour and theta=0 is the correct proposal.")
+        print(f"  -> FLAT in theta: the policy does not gate {act} on the contract, so")
+        print("     no contract can change behaviour and theta=0 is the correct proposal.")
     else:
-        print("  -> cleaning RESPONDS to theta: contracts can change behaviour.")
+        print(f"  -> {act} RESPONDS to theta: contracts can change behaviour.")
 
     print(f"\n  proposer (agent 0) return by theta:")
     for k, t in enumerate(thetas):
@@ -209,8 +216,12 @@ def main():
     print(f"Loading {len(paths)} gameplay policies")
     params = [load_params(p_) for p_ in paths]
 
+    spec = moca_envs.spec_for(args.env)
+    # The reward scale knob is named per environment and defaults to num_agents in
+    # all of them, which would make theta N times too weak against the range the
+    # policy was trained on.
     env_kwargs = {"num_agents": args.num_agents, "shared_rewards": False,
-                  "cnn": True, "jit": True, "apple_reward": 1.0,
+                  "cnn": True, "jit": True, spec.reward_scale_kwarg: 1.0,
                   "num_inner_steps": args.num_steps}
     for kv in args.env_kwarg:
         key, _, raw = kv.partition("=")
@@ -223,7 +234,8 @@ def main():
     # Matched to the checkpoint's own encoding, so pre-fix policies (2 contract
     # features, no is_null flag) stay measurable rather than failing to load.
     contract = contract_for_params(params[0], args.num_agents,
-                                   args.contract_low, args.contract_high)
+                                   args.contract_low, args.contract_high,
+                                   space=spec.contract_space)
     # contract.grid, not a bare linspace: when the range excludes weak contracts
     # (--contract-low > 0) the null contract is not the range floor, and protocols.py
     # requires it at row 0 as the disagreement point.
@@ -231,9 +243,9 @@ def main():
 
     print(f"Evaluating {len(thetas)} contracts x {args.num_envs} envs x "
           f"{args.num_steps} steps")
-    rows = evaluate_grid(env, params, contract, thetas, args.num_envs,
+    rows = evaluate_grid(env, params, contract, spec, thetas, args.num_envs,
                          args.num_steps, args.seed)
-    report(thetas, rows, args.num_agents)
+    report(thetas, rows, args.num_agents, spec)
 
     if args.save:
         np.savez(
@@ -241,7 +253,10 @@ def main():
             thetas=thetas,
             returns=np.stack([r["return"] for r in rows]),
             base_returns=np.stack([r["base_return"] for r in rows]),
-            cleaned=np.stack([r["cleaned_per_step"] for r in rows]),
+            # Kept under the name protocols.py already reads. It is the CONTRACTED
+            # ACT per step, which is cleaning only on Clean Up; `act` names which.
+            cleaned=np.stack([r["act_per_step"] for r in rows]),
+            act=spec.contracted_act,
         )
         print(f"\nTable written to {args.save}")
 

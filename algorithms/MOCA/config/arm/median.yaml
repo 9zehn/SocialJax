@@ -1,0 +1,14 @@
+# @package _global_
+# The median mechanism: every agent names a theta simultaneously each segment and the
+# MIDDLE ask binds. No proposer, no vote, no quorum.
+#
+# CLEAN UP ONLY, and refused elsewhere. Its argument is that with ~4 harvesters among
+# 7 agents the median ask tracks the harvester ideal, which the welfare(theta) curve
+# puts near its optimum -- a property of that environment's role split rather than of
+# contracting. On two agents it is not even well defined as a preference aggregator.
+#
+# Per-segment by construction, so BARGAIN_BINDING and the whole vote apparatus are
+# inert and make_train rewrites them to what actually runs.
+TRAINING_MODE: joint
+PHASE2_MODE: bargain
+BARGAIN_PROTOCOL: median

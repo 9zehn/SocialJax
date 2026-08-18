@@ -1,0 +1,17 @@
+# Centralised joint control on Clean Up.
+defaults:
+  - joint_base
+  - _self_
+
+"ENV_NAME": "clean_up"
+# Not a config group. The controller is paid the SUM of individual rewards, which
+# is the welfare objective; reward=common would pay each agent that sum already and
+# make the total N times too large. make_train refuses shared_rewards=True outright.
+"REWARD": "individual"
+
+"ENV_KWARGS":
+  "num_agents": 7
+  "num_inner_steps": 1000
+  "cnn": True
+  "jit": True
+  "apple_reward": 1.0

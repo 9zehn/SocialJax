@@ -1,0 +1,22 @@
+# @package _global_
+# Alternating-offers bargaining, RENEGOTIATED EVERY SEGMENT.
+#
+# The episode splits into BARGAIN_SEGMENT-step rounds. Each round one recognised
+# proposer offers a theta, the others vote under BARGAIN_QUORUM, and whatever
+# carries governs THAT SEGMENT ONLY -- a failed round plays uncontracted and
+# negotiation reopens next round.
+#
+# Why this and not `episode_lock`: under episode binding a single vote decides the
+# whole rest of the episode while the threat backing it is one segment, so accepting
+# is optimal at every theta and no reservation value can exist. Per-segment
+# renegotiation makes stake and threat the same size. The cost is theoretical -- with
+# no shrinking pie and no delay cost this is a repeated contracting game rather than
+# Rubinstein bargaining. Run both; the pair is the result.
+#
+# Protocol is pinned to `alternating` rather than inherited: moca_base carries the
+# Clean Up median-mechanism line, and median is a Clean Up experiment (its argument
+# rests on that environment's role split). See arm/median.yaml.
+TRAINING_MODE: joint
+PHASE2_MODE: bargain
+BARGAIN_PROTOCOL: alternating
+BARGAIN_BINDING: segment

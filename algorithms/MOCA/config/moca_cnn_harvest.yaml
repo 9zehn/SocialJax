@@ -1,0 +1,54 @@
+# MOCA / formal contracting on Harvest (Commons Harvest, open map).
+#
+# Contract space (contracts.HarvestContract), the authors' verbatim: an agent that
+# eats an apple in a low-density patch pays theta to the other agents, split evenly.
+# Their range is [0, 10], which is 50x Clean Up's because it prices a different
+# thing -- one apple-eating event, at most once per agent per step, rather than a
+# cell of cleaning that a working cleaner does several of per step.
+defaults:
+  - moca_base
+  - _self_
+  - reward: individual   # contracts assume an intact individual-reward dilemma
+  # Which contracting arm runs. Last in the list, so `arm=<name>` on the command
+  # line overrides everything above it -- one flag instead of four, and the arm is
+  # then a single recorded name rather than a combination to reconstruct.
+  #   arm=moca          MOCA, Algorithm 1 (the default; changes nothing)
+  #   arm=vanilla       single-stage contracting, no phase split
+  #   arm=renegotiate   alternating offers, renegotiated every segment
+  #   arm=episode_lock  alternating offers, first carried offer binds the episode
+  #   arm=median        the median mechanism (Clean Up only)
+  - arm: moca
+
+"ENV_NAME": "harvest_common_open"
+"CONTRACT_SPACE": "harvest"
+
+# The paper's range exactly. Unlike Clean Up -- where the range was raised because
+# the negotiated contract pinned to the 0.2 ceiling, a boundary solution meaning the
+# space itself was binding -- nothing here has been measured yet, so start where the
+# authors did and widen only if theta pins to a boundary.
+#
+# CONTRACT_LOW is the floor on a NON-NULL contract, not the null contract itself
+# (contracts.NULL_THETA = 0.0 is always available and always moves nothing), so the
+# space is {0} u [CONTRACT_LOW, CONTRACT_HIGH]. Left at 0.0 rather than raised to
+# exclude weak contracts: the Clean Up argument for a floor was that theta below
+# ~0.2 cannot change behaviour against a unit apple, and the equivalent number here
+# is not yet known. theta = 1 is the analytic floor to watch -- below it, eating the
+# last apple of a patch still nets the eater a profit.
+"CONTRACT_LOW": 0.0
+"CONTRACT_HIGH": 10.0
+
+"ENV_KWARGS":
+  "num_agents": 7
+  "num_inner_steps": 1000
+  "cnn": True
+  "jit": True
+  # One apple = one reward to whoever ate it. The env defaults this to num_agents
+  # (so individual- and shared-reward arms carry equal reward mass), which would
+  # make theta effectively 7x weaker than the range above says.
+  "apple_reward": 1.0
+  # The authors' low-density predicate, quirks included: fewer than 4 apples with
+  # j**2 + k**2 <= 5 of the agent -- a 21-cell neighbourhood, since the reference
+  # compares squared distance against the radius rather than its square. See
+  # harvest_open.py for why it is kept literal rather than "corrected".
+  "low_density_radius": 5
+  "low_density_threshold": 4

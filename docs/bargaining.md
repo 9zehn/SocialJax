@@ -4,6 +4,43 @@ Replaces the take-it-or-leave-it contracting stage of Christoffersen et al. with
 Rubinstein/Ståhl alternating-offers game. Background on the contract space itself is
 in [contracts.md](contracts.md).
 
+## Which environments, and how to run it
+
+All three. The protocol never depended on what was being negotiated, so it runs
+wherever a contract space does — Clean Up, Harvest, the Coin Game.
+
+```bash
+python algorithms/train.py --algo MOCA --env harvest arm=renegotiate    # per segment
+python algorithms/train.py --algo MOCA --env harvest arm=episode_lock   # binds the episode
+python algorithms/train.py --algo MOCA --env coins   arm=renegotiate
+```
+
+`arm=` is a Hydra config group (`algorithms/MOCA/config/arm/`), last in each per-env
+defaults list so it overrides everything above it. One flag rather than four, and
+what ran is one recorded name rather than a combination to reconstruct. `arm=moca`
+is the default and changes nothing.
+
+`BARGAIN_BINDING` is in the checkpoint stem, so an `episode` run and a `segment` run
+at the same seed and segment length cannot overwrite each other — which matters
+because that pair *is* the experiment.
+
+**Clean Up only**, refused elsewhere at config time rather than failing inside a
+traced rollout:
+
+| setting | why |
+|---|---|
+| `BARGAIN_PROTOCOL=median` | its argument is that ~4 harvesters among 7 agents put the median ask near the welfare optimum — a property of Clean Up's role split, not of contracting. On two agents it is not even well defined. |
+| `REPORT_ENABLE` | a claim is an overclaim *of cleaning*, filed against a per-cell wage. |
+| `CONTRACT_KIND=harvest_tax` | a tax on Clean Up harvesting, paid out by recent river cleaning. Not the Harvest environment — see [contracts.md](contracts.md). |
+
+What changes per environment is only what the bargaining state reads: the contracted
+act (cleaning / depleting harvests / theft), the commons (river stock / apple stock /
+own-colour collection) and the scale each is normalised by, all from
+`algorithms/MOCA/envs.py`. The behaviour series are named after the quantity —
+`joint/behaviour/cleaned_per_agent`, `joint/behaviour/depleting_eats_per_agent`,
+`joint/behaviour/stolen_per_agent` — rather than under a generic slot that would read
+the same everywhere while meaning something different in each.
+
 ## Why
 
 The paper's stage is one-shot: one fixed proposer, ν=2 sampled voters, and rejection

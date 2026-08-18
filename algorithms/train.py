@@ -28,6 +28,7 @@ ALGO_PREFIX = {
     "TRANSFER": "transfer",
     "VDN":      "vdn",
     "MOCA":     "moca",       # formal contracting (arXiv:2208.10469)
+    "JOINT":    "joint",      # centralised joint control (welfare ceiling)
 }
 
 

@@ -141,6 +141,12 @@
 #                  gameplay policy only ever sees contracts near what is currently
 #                  proposed). Exists to get the bargaining GAME right before layering
 #                  the two-phase construction on top of it.
+#   "combined"  -- single-stage contracting: a contract is negotiated afresh at the
+#                  start of EVERY episode and gameplay learns under whatever was
+#                  agreed, with nothing frozen and no P(Theta). The reference
+#                  implementation's `SeparateContractCombinedStage`, and the
+#                  contracting baseline MOCA's two-phase construction is meant to
+#                  beat. Runs on every environment; requires PHASE2_MODE=negotiate.
 "TRAINING_MODE": "two_phase"
 # Steps per bargaining round; must divide ENV_KWARGS.num_inner_steps. Sets the cost
 # of one rejection, which is the whole lever on bargaining power: at 100 steps of a
@@ -368,17 +374,18 @@
 # make_train prints a warning if the budget drops below 3.
 "CONTRACT_LR": 0.01
 
-# Environment defaults
+# Environment defaults. Only what EVERY environment accepts -- Hydra merges this
+# dict into the per-env config rather than replacing it, so an env-specific kwarg
+# here is a TypeError on every other environment. The reward scale in particular
+# (apple_reward / coin_reward) is named differently per env and lives in the per-env
+# config; contracts are calibrated against a UNIT reward, and every one of these
+# environments defaults its scale to num_agents instead, so leaving it unset makes
+# theta N times too weak. make_train warns when it is missing.
 "ENV_KWARGS":
   "num_inner_steps": 1000
   "shared_rewards": False
   "cnn": True
   "jit": True
-  # One apple = one reward to whoever ate it, matching the contracting literature.
-  # (Upstream SocialJax defaults this to num_agents so that individual- and
-  # shared-reward arms carry equal total reward mass; contracts are calibrated
-  # against a unit apple instead.)
-  "apple_reward": 1.0
 
 # Seed / evaluation
 "SEED": 30

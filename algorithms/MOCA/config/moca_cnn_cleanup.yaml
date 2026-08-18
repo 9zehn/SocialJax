@@ -3,6 +3,15 @@ defaults:
   - moca_base
   - _self_
   - reward: individual   # contracts assume an intact individual-reward dilemma
+  # Which contracting arm runs. Last in the list, so `arm=<name>` on the command
+  # line overrides everything above it -- one flag instead of four, and the arm is
+  # then a single recorded name rather than a combination to reconstruct.
+  #   arm=moca          MOCA, Algorithm 1 (the default; changes nothing)
+  #   arm=vanilla       single-stage contracting, no phase split
+  #   arm=renegotiate   alternating offers, renegotiated every segment
+  #   arm=episode_lock  alternating offers, first carried offer binds the episode
+  #   arm=median        the median mechanism (Clean Up only)
+  - arm: moca
 
 "ENV_NAME": "clean_up"
 

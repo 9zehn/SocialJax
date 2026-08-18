@@ -174,8 +174,15 @@ class CoinGame(MultiAgentEnv):
         s_interest = 0.5,
         s_interest_schedule=None,
         s_interest_change_every=30000000,
+        # Scale on the payoff matrix in the individual-reward arms. None keeps the
+        # ORIGINAL upstream SocialJax behaviour of num_agents, which exists so the
+        # individual and shared arms carry the same total reward mass. Set to 1.0 to
+        # play the payoff matrix as literally written -- +1 for a coin, -2 to the
+        # agent whose coin it was -- which is the economy any contract range is
+        # calibrated against. Named to match clean_up's `apple_reward`.
+        coin_reward=None,
         jit=True,
-        
+
         grid_size=(16,11),
         obs_size=11,
         cnn=True,
@@ -228,6 +235,8 @@ class CoinGame(MultiAgentEnv):
         else:
             self.s_interest_schedule = None
         self.s_interest_change_every = s_interest_change_every
+
+        self.coin_reward = float(num_agents if coin_reward is None else coin_reward)
 
         self.PLAYER_COLOURS = generate_agent_colors(num_agents)
         self.GRID_SIZE_ROW = grid_size[0]
@@ -954,7 +963,7 @@ class CoinGame(MultiAgentEnv):
                 rewards = jnp.zeros((2, 1))
                 rewards = rewards.at[0, 0].set(red_reward[0])
                 rewards = rewards.at[1, 0].set(green_reward[0])
-                original_rewards = rewards * self.num_agents
+                original_rewards = rewards * self.coin_reward
                 if self.smooth_rewards:
                     should_smooth = (state.inner_t % 1) == 0
                     new_smooth_rewards = 0.99 * 0.01* state.smooth_rewards + original_rewards
@@ -975,7 +984,7 @@ class CoinGame(MultiAgentEnv):
                 rewards = jnp.zeros((2, 1))
                 rewards = rewards.at[0, 0].set(red_reward[0])
                 rewards = rewards.at[1, 0].set(green_reward[0])
-                original_rewards = rewards * self.num_agents
+                original_rewards = rewards * self.coin_reward
                 rewards, theta = self.get_svo_rewards(original_rewards, self.svo_w, self.svo_ideal_angle_degrees, self.svo_target_agents)
                 info = {
                     "original_rewards": original_rewards.squeeze(),
@@ -986,7 +995,7 @@ class CoinGame(MultiAgentEnv):
                 rewards = jnp.zeros((2, 1))
                 rewards = rewards.at[0, 0].set(red_reward[0])
                 rewards = rewards.at[1, 0].set(green_reward[0])
-                original_rewards = rewards * self.num_agents
+                original_rewards = rewards * self.coin_reward
                 original_flat = original_rewards.squeeze()
 
                 # Calculate current s_interest based on timestep
@@ -1008,7 +1017,7 @@ class CoinGame(MultiAgentEnv):
                 rewards = jnp.zeros((2, 1))
                 rewards = rewards.at[0, 0].set(red_reward[0])
                 org_rewards = rewards.at[1, 0].set(green_reward[0])
-                rewards = org_rewards * self.num_agents
+                rewards = org_rewards * self.coin_reward
                 
                 rewards_sum = jnp.sum(org_rewards)
                 rewards_sum_all_agents = jnp.zeros((self.num_agents, 1))
@@ -1032,7 +1041,39 @@ class CoinGame(MultiAgentEnv):
 
             eat_own_coins = eat_own_coins.at[0, 0].set(red_reward[0])
             eat_own_coins = eat_own_coins.at[1, 0].set(green_reward[0])
-            info["eat_own_coins"] = eat_own_coins.squeeze() * self.num_agents
+            info["eat_own_coins"] = eat_own_coins.squeeze() * self.coin_reward
+
+            # Per-agent signals a formal contract can condition on. Agent 0 is red and
+            # agent 1 is green, so `red_green_matches` is agent 0 taking a coin of
+            # agent 1's colour and `green_red_matches` is the mirror image.
+            #
+            # Taking someone else's coin is the whole dilemma here: the taker gains a
+            # coin's worth and the owner loses twice that, so unrestrained collection
+            # is individually rational and collectively ruinous. These are the two
+            # sides of that act, split so a contract can price it and route the money
+            # to the agent who actually bore the cost:
+            #
+            #   stolen_by_agent   coins of ANOTHER agent's colour that agent i took
+            #                     -- what i would be billed for.
+            #   stolen_from_agent coins of i's OWN colour that somebody else took
+            #                     -- what i would be compensated for.
+            #   coins_taken       every coin i picked up, own colour included. The
+            #                     denominator: it separates "stopped stealing" from
+            #                     "stopped collecting", which a contract that
+            #                     over-prices theft would cause and which looks
+            #                     identical in the theft series alone.
+            #
+            # The two theft series sum to the same total by construction, which is
+            # what lets the transfer built from them be exactly zero-sum.
+            stolen_by = jnp.concatenate([red_green_matches, green_red_matches])
+            stolen_from = jnp.concatenate([green_red_matches, red_green_matches])
+            taken = jnp.concatenate([
+                red_red_matches | red_green_matches,
+                green_green_matches | green_red_matches,
+            ])
+            info["stolen_by_agent"] = jnp.float32(stolen_by)
+            info["stolen_from_agent"] = jnp.float32(stolen_from)
+            info["coins_taken"] = jnp.float32(taken)
 
             # if self.shared_rewards:
             #     rewards = jnp.zeros((2, 1))

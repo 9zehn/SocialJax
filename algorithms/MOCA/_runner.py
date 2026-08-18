@@ -32,11 +32,12 @@ def single_run(config, make_train, *, wandb_name):
     print(f"** Run config -> {sidecar} **")
 
     # "--algo MOCA" only selects this directory; it does not mean the run uses MOCA's
-    # two-phase algorithm. Under TRAINING_MODE=joint there is no phase split, no
-    # frozen subgame policy and no P(Theta), so tagging it MOCA would mislabel the
-    # one axis these experiments are comparing.
-    joint = config.get("TRAINING_MODE", "two_phase") == "joint"
-    tags = ["CONTRACTS", "FF", "JOINT" if joint else "MOCA"]
+    # two-phase algorithm. Under TRAINING_MODE=joint or =combined there is no phase
+    # split, no frozen subgame policy and no P(Theta), so tagging either MOCA would
+    # mislabel the one axis these experiments are comparing.
+    mode = config.get("TRAINING_MODE", "two_phase")
+    tags = ["CONTRACTS", "FF",
+            {"joint": "JOINT", "combined": "COMBINED"}.get(mode, "MOCA")]
     protocol = config.get("PHASE2_MODE")
     if protocol:
         tags.append(protocol.upper())
@@ -89,6 +90,40 @@ def single_run(config, make_train, *, wandb_name):
             print("  [warning] a contract was almost never in force. This is the "
                   "cold-start failure, not a bug: raise BARGAIN_ACCEPT_BIAS or "
                   "BARGAIN_ENT_COEF, or start from BARGAIN_QUORUM=majority.")
+        return out
+
+    if "metrics_combined" in out:
+        # TRAINING_MODE=combined: one loop, so the run's product is BOTH the gameplay
+        # policies and the negotiation policies. Saved under the same "_contract_"
+        # role suffix the two-phase negotiation stage uses, so the viewer and the
+        # evaluation tools read a combined run exactly as they read a MOCA one.
+        for i in range(num_agents):
+            save_params(out["negotiate_state"][i],
+                        f"./checkpoints/moca/{filename}_contract_{i}.pkl")
+        m = out["metrics_combined"]
+        theta = np.array(m["combined/contract_theta_proposed"])
+        eff = np.array(m["combined/contract_theta_effective"])
+        acc = np.array(m["combined/contract_accept_rate"])
+        null_frac = np.array(m["combined/contract_null_frac"])
+        gap = np.array(m[[k for k in m if k.endswith("_gap")][0]])
+        tail = max(len(theta) // 10, 1)
+        print("\n=== Single-stage contracting (no phase split, last 10%) ===")
+        print(f"  proposed theta      : {theta[-tail:].mean():.4f}")
+        print(f"  effective theta     : {eff[-tail:].mean():.4f}")
+        print(f"  accept rate         : {acc[-tail:].mean():.4f}")
+        print(f"  null-contract share : {null_frac[-tail:].mean():.4f}")
+        print(f"  contracted - null   : {gap[-tail:].mean():.4f} "
+              f"(behaviour actually conditioned on theta)")
+        if null_frac[-tail:].mean() < 0.02:
+            # The structural weakness of dropping MOCA's phase 1, and the reason the
+            # two-phase construction exists. Worth saying out loud rather than
+            # leaving to be noticed in a plot, because every acceptance decision in
+            # the run is implicitly against a disagreement point that was barely
+            # sampled -- so the agreed theta is not evidence about V_i(s, 0).
+            print("  [warning] gameplay almost never saw the null contract, so "
+                  "V_i(s, 0) is essentially unestimated. Expected for this arm "
+                  "(there is no P(Theta) forcing null exposure); it is what "
+                  "TRAINING_MODE=two_phase fixes, and is the comparison.")
         return out
 
     if "metrics_phase2" not in out:

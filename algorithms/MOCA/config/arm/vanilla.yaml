@@ -1,0 +1,8 @@
+# @package _global_
+# Single-stage ("vanilla") contracting: the reference implementation's
+# SeparateContractCombinedStage. A contract is negotiated afresh at the start of
+# EVERY episode and gameplay learns under whatever was agreed. Nothing is frozen and
+# there is no P(Theta), so this is contracting WITHOUT MOCA's two-phase construction
+# -- the baseline that construction is meant to beat.
+TRAINING_MODE: combined
+PHASE2_MODE: negotiate

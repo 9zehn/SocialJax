@@ -187,6 +187,28 @@ class Harvest_open(MultiAgentEnv):
         s_interest=0.5,
         s_interest_schedule=None,
         s_interest_change_every=30000000,
+        # Reward for harvesting one apple. None keeps the ORIGINAL upstream SocialJax
+        # behaviour of num_agents: under shared_rewards every agent receives the sum
+        # over all agents (1 apple -> everyone +1 -> total mass N), so scaling the
+        # individual-mode reward by N makes the total reward mass identical across
+        # the two arms. Set apple_reward=1.0 for a plain "one apple = one reward to
+        # whoever ate it" economy, which is what the formal-contracting literature
+        # assumes and what any contract range is calibrated against.
+        apple_reward=None,
+        # The "low-density region" of the formal-contracting Harvest contract
+        # (HarvestFeaturemodLocalContract): an agent eats an apple where fewer than
+        # `low_density_threshold` apples lie within `low_density_radius` of it.
+        #
+        # The radius is used EXACTLY as the reference does -- as a bound on SQUARED
+        # distance, `j**2 + k**2 <= low_density_radius`, not on distance itself. At
+        # the reference's value of 5 that is a 21-cell neighbourhood (a 5x5 block
+        # with the four corners removed), which is what "radius 5" means in the
+        # paper's code and hence what the published contract conditions on. Kept
+        # literal rather than "corrected" to 25 cells: the threshold of 4 apples is
+        # calibrated against this neighbourhood, and widening one without the other
+        # would silently redefine which harvesting is charged for.
+        low_density_radius=5,
+        low_density_threshold=4,
         grid_size=(16,22),
         jit=True,
         obs_size=11,
@@ -246,6 +268,19 @@ class Harvest_open(MultiAgentEnv):
         self.PADDING = self.OBS_SIZE - 1
         self.num_inner_steps = num_inner_steps
         self.num_outer_steps = num_outer_steps
+        self.apple_reward = float(num_agents if apple_reward is None else apple_reward)
+        self.low_density_radius = int(low_density_radius)
+        self.low_density_threshold = int(low_density_threshold)
+
+        # Offsets of the low-density neighbourhood, precomputed once. `R` is the
+        # largest offset that can satisfy j**2 + k**2 <= low_density_radius, so the
+        # window is (2R+1) x (2R+1) and the mask selects the cells inside it.
+        _R = int(onp.floor(onp.sqrt(self.low_density_radius)))
+        _js, _ks = onp.mgrid[-_R:_R + 1, -_R:_R + 1]
+        self.LOCAL_APPLE_R = _R
+        self.LOCAL_APPLE_MASK = jnp.asarray(
+            (_js ** 2 + _ks ** 2) <= self.low_density_radius, dtype=jnp.float32
+        )
 
         GRID = jnp.zeros(
             (self.GRID_SIZE_ROW + 2 * self.PADDING, self.GRID_SIZE_COL + 2 * self.PADDING),
@@ -1323,7 +1358,48 @@ class Harvest_open(MultiAgentEnv):
 
             apple_matches = jax.vmap(coin_matcher)(p=new_locs)
 
-            
+            # Local apple density at each agent's post-move cell, on the grid as it
+            # stands BEFORE consumption -- so the apple about to be eaten counts
+            # towards its own neighbourhood. That is the reference implementation's
+            # `count_apples_in_radius(5, self.agent_pos[key])`, which it evaluates
+            # inside the consumption loop before `current_apple_points.remove(...)`.
+            #
+            # The reference gates the contract on that count AND on the post-step
+            # `feature_obs[8]`, which is the same count after removal and after
+            # respawn. Removal can only lower it, so the pre-removal test is the
+            # binding one and the second is implied except when an apple respawns
+            # inside the radius on the very same step. Here regrowth has already run
+            # (it is the first thing this step does), so there is one grid to measure
+            # against and no such gap.
+            apple_grid = jnp.pad(
+                (state.grid == Items.apple).astype(jnp.float32),
+                self.LOCAL_APPLE_R,
+            )
+            win = 2 * self.LOCAL_APPLE_R + 1
+
+            def local_apples(p: jnp.ndarray) -> jnp.ndarray:
+                # p is already offset by R in padded coordinates, so slicing from p
+                # lands the window's top-left corner R cells up and left of the agent.
+                patch = jax.lax.dynamic_slice(
+                    apple_grid, (p[0], p[1]), (win, win)
+                )
+                return jnp.sum(patch * self.LOCAL_APPLE_MASK)
+
+            local_apple_count = jax.vmap(local_apples)(new_locs[:, :2])   # (N,)
+            ate_apple = apple_matches.squeeze(-1).astype(jnp.float32)     # (N,)
+            # The contract signal: ate an apple where the neighbourhood was already
+            # thin. An INDICATOR, not a count, exactly as the reference charges a
+            # flat theta per qualifying step rather than theta per apple -- the two
+            # coincide here anyway, since an agent moves onto at most one cell and so
+            # eats at most one apple per step.
+            low_density_eaten = jnp.where(
+                (ate_apple > 0.0)
+                & (local_apple_count < jnp.float32(self.low_density_threshold)),
+                1.0,
+                0.0,
+            )
+
+
             # rewards = jnp.zeros((self.num_agents, 1))
             # rewards = jnp.where(apple_matches, 1, rewards)
 
@@ -1417,7 +1493,7 @@ class Harvest_open(MultiAgentEnv):
                 }
             elif self.inequity_aversion:
                 rewards = jnp.zeros((self.num_agents, 1))
-                original_rewards = jnp.where(apple_matches, 1, rewards) * self.num_agents
+                original_rewards = jnp.where(apple_matches, 1, rewards) * self.apple_reward
                 if self.smooth_rewards:
                     should_smooth = (state.inner_t % 1) == 0
                     new_smooth_rewards = 0.99 * 0.01* state.smooth_rewards + original_rewards
@@ -1436,7 +1512,7 @@ class Harvest_open(MultiAgentEnv):
                 }
             elif self.svo:
                 rewards = jnp.zeros((self.num_agents, 1))
-                original_rewards = jnp.where(apple_matches, 1, rewards) * self.num_agents
+                original_rewards = jnp.where(apple_matches, 1, rewards) * self.apple_reward
                 rewards, theta = self.get_svo_rewards(original_rewards, self.svo_w, self.svo_ideal_angle_degrees, self.svo_target_agents)
                 info = {
                     "original_rewards": original_rewards.squeeze(),
@@ -1445,7 +1521,7 @@ class Harvest_open(MultiAgentEnv):
                 }
             elif self.interest:
                 rewards = jnp.zeros((self.num_agents, 1))
-                original_rewards = jnp.where(apple_matches, 1, rewards) * self.num_agents
+                original_rewards = jnp.where(apple_matches, 1, rewards) * self.apple_reward
 
                 # Calculate current s_interest based on timestep
                 current_s_interest = get_current_s_interest(timestep)
@@ -1465,13 +1541,46 @@ class Harvest_open(MultiAgentEnv):
                 }
             else:
                 rewards = jnp.zeros((self.num_agents, 1))
-                rewards = jnp.where(apple_matches, 1, rewards) * self.num_agents
-                info = {}
-            
+                rewards = jnp.where(apple_matches, 1, rewards) * self.apple_reward
+                # Was an empty dict, which left the individual-reward arm -- the only
+                # one a social dilemma is defined in -- as the single branch here
+                # publishing no reward signal at all. Matches clean_up's own `else`
+                # branch: original and shaped coincide because nothing reshapes them.
+                info = {
+                    "original_rewards": rewards.squeeze(),
+                    "shaped_rewards": rewards.squeeze(),
+                }
+
             AppleCount = jnp.sum(state.grid == Items.apple)
             info["AppleCount_info"] = jnp.zeros((self.num_agents, 1)).squeeze() + AppleCount
-            
-            
+
+            # Per-agent signals the formal-contracting Harvest contract conditions on
+            # (Christoffersen et al., HarvestFeaturemodLocalContract). Emitted in every
+            # reward branch, like clean_up's "cleaned_by_agent", because a contract
+            # needs an outcome attributable to an INDIVIDUAL rather than a grid-wide
+            # aggregate.
+            #
+            #   low_density_eaten   the contract's own predicate: 1.0 if this agent ate
+            #                       an apple in a thin patch this step, else 0.0. This
+            #                       is the reference's `eaten_close_apples > 0` AND
+            #                       `feature_obs[8] < 4`.
+            #   eaten_apples        every apple eaten, thin patch or not. The
+            #                       denominator that says what FRACTION of harvesting
+            #                       the contract actually prices.
+            #   local_apple_density the count itself (reference `feature_obs[8]`),
+            #                       so a run can be checked against the threshold
+            #                       rather than only against the indicator it produced.
+            info["low_density_eaten"] = jnp.float32(low_density_eaten).squeeze()
+            info["eaten_apples"] = jnp.float32(ate_apple).squeeze()
+            info["local_apple_density"] = jnp.float32(local_apple_count).squeeze()
+            # Grid-wide apple stock, per agent, so it survives the per-agent info
+            # slicing the training loops do. The Harvest analogue of clean_up's
+            # "waste_cleared": the commons stock a contract is meant to protect.
+            info["apple_stock"] = (
+                jnp.zeros((self.num_agents,), dtype=jnp.float32) + AppleCount
+            )
+
+
             state_nxt = State(
                 agent_locs=state.agent_locs,
                 agent_invs=state.agent_invs,

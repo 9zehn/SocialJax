@@ -1,0 +1,43 @@
+# Centralised joint control: the welfare ceiling the decentralised arms are read
+# against. One network sees every agent's observation, chooses every agent's
+# action, and is paid their summed reward.
+#
+# PPO settings are COPIED FROM algorithms/MOCA/config/moca_base.yaml and should be
+# kept in step with it. The point of this baseline is that the gap to it is
+# attributable to the control structure -- centralised joint action and a summed
+# objective -- and not to a better-tuned optimiser. If you retune one, retune both,
+# or the ceiling stops being a ceiling and becomes a confound.
+"LR": 0.0005
+"NUM_ENVS": 128
+"NUM_STEPS": 1000          # must equal ENV_KWARGS.num_inner_steps
+"TOTAL_TIMESTEPS": 1e8
+"UPDATE_EPOCHS": 2
+"NUM_MINIBATCHES": 500
+"GAMMA": 0.99
+"GAE_LAMBDA": 0.95
+"CLIP_EPS": 0.2
+"ENT_COEF": 0.01
+"VF_COEF": 0.5
+"MAX_GRAD_NORM": 0.5
+"ACTIVATION": "relu"
+"ANNEAL_LR": True
+"TUNE": False
+
+# Environment defaults. Only what every environment accepts -- the reward scale is
+# named differently per env (apple_reward / coin_reward) and lives in the per-env
+# config. shared_rewards MUST stay False: the controller sums the per-agent rewards
+# itself, and an env that already hands out the sum would scale welfare by N.
+"ENV_KWARGS":
+  "num_inner_steps": 1000
+  "shared_rewards": False
+  "cnn": True
+  "jit": True
+
+"SEED": 30
+"CHECKPOINT_EVERY": 20
+"PROGRESS_EVERY": 1
+
+"ENTITY": ""
+"PROJECT": "socialjax"
+"WANDB_MODE": "online"
+"WANDB_RUN_NAME": null

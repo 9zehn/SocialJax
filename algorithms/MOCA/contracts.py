@@ -12,8 +12,24 @@ welfare -- it only redistributes it. That zero-sum property is what makes the
 mechanism a pure redistribution channel rather than an exogenous subsidy, and it
 is asserted in the tests.
 
-CleanupContract mirrors the paper's Cleanup contract space: a single scalar
-theta = "payment per waste cell cleaned, paid for evenly by the other agents".
+Three spaces live here, one per environment. All are a single scalar theta over
+{0} u [low, high] with the same observation encoding; they differ ONLY in which
+observable outcome the transfer reads and where the money goes.
+
+    CleanupContract    theta per waste cell cleaned, funded evenly by the others.
+                       Reference: `CleanupContract`, theta in [0, 0.2].
+    HarvestContract    theta charged to an agent that eats an apple in a
+                       low-density patch, split evenly among the others.
+                       Reference: `HarvestFeaturemodLocalContract`, theta in [0, 10].
+    CoinGameContract   theta per coin taken of another agent's colour, paid to the
+                       agent whose colour it was. NOT in the reference -- see the
+                       class docstring for what it is built from instead.
+
+Note the direction of the first two. Cleanup SUBSIDISES an under-provided public
+good; Harvest TAXES an over-used common resource. Both are the authors', and the
+pair is the reason these environments are worth running together: they are the two
+halves of Ostrom's provision/appropriation problem, and a mechanism that fixes one
+need not fix the other.
 """
 from typing import Tuple
 
@@ -37,42 +53,42 @@ NULL_THETA = 0.0
 _NULL_TOL = 1e-6
 
 
-class CleanupContract:
-    """Scalar contract space for Clean Up: pay `theta` per waste cell cleaned.
+class ScalarContract:
+    """A contract space parameterised by one scalar theta over {0} u [low, high].
 
-    Reference implementation (contract/contract_list.py::CleanupContract) defines
-    this as "theta in [0, 0.2], which correspond to a payment per waste cell
-    cleaned, paid for evenly by the other agents", conditioned on the per-agent
-    `cleaned_squares` info field. Here the corresponding env signal is
-    info["cleaned_by_agent"] from clean_up.py.
+    Everything except the transfer itself lives here: the sampling distribution
+    P(Theta) phase 1 draws from, the discretised grid phase 2 proposes over, and the
+    feature vector the gameplay policy conditions on. All three environments share
+    them, which is what makes an arm run on Harvest or the Coin Game mean the same
+    thing it means on Clean Up.
 
-    The transfer for agent i on a step where agents cleaned c = (c_1..c_N) is
+    Subclasses supply two things:
 
-        receive_i = theta * c_i                       # paid for what you cleaned
-        pay_i     = theta * (sum_j c_j - c_i)/(N-1)   # you fund everyone else's
-        transfer_i = receive_i - pay_i
-
-    which is exactly zero-sum:
-        sum_i transfer_i = theta*C - theta*(N-1)*C/(N-1) = 0,  C = sum_j c_j.
-
-    Note the sign convention: a *cleaner* is a net receiver and a pure harvester
-    is a net payer, so the contract subsidises exactly the under-provided public
-    good (river cleaning) at the expense of those free-riding on it.
+        SIGNAL_KEYS       the env info fields the transfer reads, so a run fails
+                          loudly on an environment that does not emit them rather
+                          than silently contracting on nothing.
+        compute_transfer  theta and those signals -> a zero-sum vector of per-agent
+                          reward transfers.
 
     The contract space is {NULL_THETA} u [low, high]. `low` used to double as the
     null contract, which is only correct when low == 0: with low > 0 the "no
     contract" fallback would itself move reward, silently corrupting every
     disagreement value V_i(s, 0) the acceptance rules compare against. They are now
-    separate, so the range can exclude weak contracts -- theta below ~0.2 is too
-    small to change behaviour against a unit apple, and those samples only blur the
-    boundary between contracted and uncontracted play -- while the null contract
-    stays available and genuinely null.
+    separate, so the range can exclude weak contracts -- a theta too small to change
+    behaviour against a unit reward only blurs the boundary between contracted and
+    uncontracted play -- while the null contract stays available and genuinely null.
 
     Args:
         num_agents: N, the number of agents (>= 2; a transfer needs a counterparty).
         low: minimum NON-NULL contract value (>= 0).
         high: maximum contract value.
     """
+
+    #: The paper's range for this space, for configs and tests to state exactly.
+    DEFAULT_RANGE: Tuple[float, float] = (0.0, 0.2)
+    #: Env info fields `transfer_from_info` reads. Checked against the env's actual
+    #: info dict at run start.
+    SIGNAL_KEYS: Tuple[str, ...] = ()
 
     def __init__(self, num_agents: int, low: float = 0.0, high: float = 0.2):
         if num_agents < 2:
@@ -243,6 +259,54 @@ class CleanupContract:
 
     # --------------------------------------------------------------- transfers
 
+    def compute_transfer(self, theta: jnp.ndarray, *signals) -> jnp.ndarray:
+        raise NotImplementedError
+
+    def transfer_from_info(self, theta: jnp.ndarray, info: dict) -> jnp.ndarray:
+        """Transfers for one step, reading the signals straight out of the env info.
+
+        The training loops call this rather than `compute_transfer`, so the mapping
+        from environment to contract lives in ONE place -- the contract, which is by
+        definition the function from observable outcomes to transfers. A caller that
+        had to know which info key a given space reads would have to be updated for
+        every new space, and getting it wrong is a run that trains perfectly happily
+        while redistributing on the wrong quantity.
+        """
+        missing = [k for k in self.SIGNAL_KEYS if k not in info]
+        if missing:
+            raise KeyError(
+                f"{type(self).__name__} conditions on env info fields {missing}, "
+                f"which this environment does not emit. Available: {sorted(info)}"
+            )
+        return self.compute_transfer(theta, *(info[k] for k in self.SIGNAL_KEYS))
+
+
+class CleanupContract(ScalarContract):
+    """Clean Up: pay `theta` per waste cell cleaned, funded evenly by the others.
+
+    Reference implementation (contract/contract_list.py::CleanupContract) defines
+    this as "theta in [0, 0.2], which correspond to a payment per waste cell
+    cleaned, paid for evenly by the other agents", conditioned on the per-agent
+    `cleaned_squares` info field. Here the corresponding env signal is
+    info["cleaned_by_agent"] from clean_up.py.
+
+    The transfer for agent i on a step where agents cleaned c = (c_1..c_N) is
+
+        receive_i = theta * c_i                       # paid for what you cleaned
+        pay_i     = theta * (sum_j c_j - c_i)/(N-1)   # you fund everyone else's
+        transfer_i = receive_i - pay_i
+
+    which is exactly zero-sum:
+        sum_i transfer_i = theta*C - theta*(N-1)*C/(N-1) = 0,  C = sum_j c_j.
+
+    Note the sign convention: a *cleaner* is a net receiver and a pure harvester
+    is a net payer, so the contract subsidises exactly the under-provided public
+    good (river cleaning) at the expense of those free-riding on it.
+    """
+
+    DEFAULT_RANGE = (0.0, 0.2)
+    SIGNAL_KEYS = ("cleaned_by_agent",)
+
     def compute_transfer(self, theta: jnp.ndarray, cleaned: jnp.ndarray) -> jnp.ndarray:
         """Zero-sum per-agent reward transfers for one step.
 
@@ -263,8 +327,148 @@ class CleanupContract:
         return receive - pay
 
 
+class HarvestContract(ScalarContract):
+    """Harvest: an agent that eats an apple in a THIN PATCH pays `theta` to the rest.
+
+    The authors' space verbatim (contract/contract_list.py::
+    HarvestFeaturemodLocalContract): "Contracts are parameterized by theta in
+    [0, 10]. When an agent eats an apple in a low-density region, defined as an apple
+    having less than 4 neighboring apples within a radius of 5, they transfer theta to
+    the other agents, which is equally distributed to the other agents."
+
+    Their transfer is
+
+        transfers[i] = theta   if feature_obs[8] < 4 and eaten_close_apples > 0
+                       0       otherwise
+
+    with the surrounding machinery doing `rews[i] -= transfers[i]` and
+    `rews[j] += transfers[i]/(N-1)` for every other j (two_stage_train.py). So a
+    POSITIVE entry means agent i pays, which is why the sign here is the mirror of
+    Clean Up's: this space prices a harm rather than subsidising a benefit.
+
+        pay_i      = theta * d_i                        # d_i in {0, 1}
+        receive_i  = theta * (sum_j d_j - d_i)/(N-1)    # your share of the fines
+        transfer_i = receive_i - pay_i
+
+    Why the local-density condition rather than a flat tax on harvesting: apples
+    regrow at a rate that depends on how many apples remain nearby, and stop
+    regrowing altogether once a patch is stripped. Eating the last apples of a patch
+    is therefore the one act with a lasting external cost, and eating from a full
+    patch has almost none. A flat tax on all harvesting would price the two the same
+    and suppress the behaviour the commons is FOR; this prices only the depletion.
+    The env computes the predicate -- see harvest_open.py's `low_density_*` kwargs
+    for the neighbourhood, which is the reference's, quirks included.
+
+    An INDICATOR times theta, not a count: the reference charges the same theta
+    however many qualifying apples were eaten. The two coincide in both
+    implementations anyway, since an agent moves onto at most one cell per step.
+
+    The range is 50x Clean Up's because it is a different quantity against a
+    different base. Clean Up prices a cell of cleaning, of which a working cleaner
+    does several per step; this prices one apple-eating event, which a single agent
+    does at most once per step and only rarely in a thin patch. theta must be worth
+    more than the apple it deters -- at theta < 1 against a unit apple, eating the
+    last apple of a patch is still profitable and the contract cannot bind at all.
+    """
+
+    DEFAULT_RANGE = (0.0, 10.0)
+    SIGNAL_KEYS = ("low_density_eaten",)
+
+    def compute_transfer(self, theta: jnp.ndarray, low_density_eaten) -> jnp.ndarray:
+        """Zero-sum per-agent reward transfers for one step.
+
+        Args:
+            theta: the fine, broadcastable against `low_density_eaten`'s leading dims.
+            low_density_eaten: (..., N) 1.0 where the agent ate an apple in a
+                low-density patch this step (info["low_density_eaten"]).
+
+        Returns:
+            (..., N) float32 transfers summing to zero along the agent axis.
+        """
+        charged = (jnp.asarray(low_density_eaten, dtype=jnp.float32) > 0.0
+                   ).astype(jnp.float32)
+        theta = jnp.asarray(theta, dtype=jnp.float32)[..., None]
+        total = jnp.sum(charged, axis=-1, keepdims=True)
+        pay = theta * charged
+        receive = theta * (total - charged) / (self.num_agents - 1)
+        return receive - pay
+
+
+class CoinGameContract(ScalarContract):
+    """Coin Game: `theta` per coin taken of another agent's colour, paid to its owner.
+
+    THE AUTHORS DEFINE NO COIN GAME CONTRACT. Their release covers Cleanup, Harvest
+    and a self-driving domain only, so this space is built from their design rules
+    rather than transcribed:
+
+      * one scalar theta, a per-unit price on the observable outcome that carries the
+        externality (as in all three of theirs);
+      * conditioned on a per-agent info field the env already attributes to an
+        individual (`cleaned_squares`, `eaten_close_apples`, and here
+        `stolen_by_agent`);
+      * zero-sum, so the contract redistributes and cannot create welfare.
+
+    Where it follows `SelfdriveContractDistprop` rather than the two grid-world
+    spaces: the money goes to the agent actually harmed, not evenly to everyone else.
+    That contract pays each car "theta times its distance behind the ambulance",
+    i.e. in proportion to the harm each bore, and here the harm is exactly
+    attributable -- a taken coin has precisely one owner. At the 2 agents this
+    environment supports the two rules are the same transfer anyway; the difference
+    only appears if the env is ever widened, where paying the victim is the rule that
+    keeps meaning what it means.
+
+        pay_i      = theta * (coins i took that were not i's colour)
+        receive_i  = theta * (coins of i's colour that others took)
+        transfer_i = receive_i - pay_i
+
+    Zero-sum because every taken coin appears once on each side.
+
+    The range [0, 2] is set by the payoff matrix, which pays +1 for any coin and -2
+    to the owner of a stolen one. So:
+
+        theta = 0    no contract
+        theta = 1    stealing nets the taker nothing (+1 - 1); the point below which
+                     the contract cannot deter and above which it can
+        theta = 2    the owner is made whole (-2 + 2 = 0), and theft is a straight
+                     loss to the taker
+
+    Above 2 the contract would over-compensate and pay agents to be robbed, which is
+    an incentive to be careless with one's own coins rather than a fix for the
+    dilemma -- so the ceiling is a property of the game, not a tuning choice. Set it
+    against `coin_reward=1.0`; the env's default scales the whole payoff matrix by
+    num_agents and the range would then be off by that factor.
+    """
+
+    DEFAULT_RANGE = (0.0, 2.0)
+    SIGNAL_KEYS = ("stolen_by_agent", "stolen_from_agent")
+
+    def compute_transfer(self, theta: jnp.ndarray, stolen_by, stolen_from) -> jnp.ndarray:
+        """Zero-sum per-agent reward transfers for one step.
+
+        Args:
+            theta: the price of a stolen coin, broadcastable against the signals'
+                leading dims.
+            stolen_by: (..., N) coins of another agent's colour that agent i took.
+            stolen_from: (..., N) coins of agent i's colour that others took.
+
+        Returns:
+            (..., N) float32 transfers summing to zero along the agent axis.
+        """
+        stolen_by = jnp.asarray(stolen_by, dtype=jnp.float32)
+        stolen_from = jnp.asarray(stolen_from, dtype=jnp.float32)
+        theta = jnp.asarray(theta, dtype=jnp.float32)[..., None]
+        return theta * (stolen_from - stolen_by)
+
+
 class HarvestTaxContract(CleanupContract):
-    """The bargained scalar is a TAX RATE on harvesting, not a wage for cleaning.
+    """CLEAN UP's harvest tax. Not the Harvest environment -- see `HarvestContract`.
+
+    (The names are close and the mechanisms are not. This one is a tax on eating
+    apples in CLEAN UP, selected by CONTRACT_KIND=harvest_tax and paid out by recent
+    river cleaning. `HarvestContract` is the paper's contract space for the Harvest
+    environment, selected by CONTRACT_SPACE=harvest.)
+
+    The bargained scalar is a TAX RATE on harvesting, not a wage for cleaning.
 
     Same scalar space, same observation encoding, same null contract -- what changes
     is where the money comes from and how it is shared out. Each step:
@@ -430,18 +634,29 @@ def contract_obs_dim_of(params) -> int:
     return int(head_input - embedding)
 
 
-def contract_for_params(params, num_agents: int, low: float, high: float):
+def contract_for_params(params, num_agents: int, low: float, high: float,
+                        space: str = "cleanup"):
     """The contract space matching the encoding a checkpoint was actually trained with.
 
-    Use this instead of constructing CleanupContract directly anywhere a checkpoint
-    from disk is involved: pre- and post-fix runs need different contract observation
+    Use this instead of constructing a contract directly anywhere a checkpoint from
+    disk is involved: pre- and post-fix runs need different contract observation
     widths, and mixing them is a shape error several frames from the real cause.
+
+    `space` selects which environment's contract to build. The legacy 2-feature
+    fallback is Clean Up only -- it predates the other two spaces existing, so no
+    checkpoint outside Clean Up can be in that encoding.
     """
     dim = contract_obs_dim_of(params)
-    current = CleanupContract(num_agents, low=low, high=high)
+    current = make_contract(space, num_agents, low=low, high=high)
     if dim == current.obs_dim:
         return current
     if dim == 2:
+        if space != "cleanup":
+            raise SystemExit(
+                f"a {dim}-feature checkpoint is the pre-2026-08 Clean Up encoding, "
+                f"which no {space!r} run can have been trained in -- that space did "
+                f"not exist yet. Check --contract-space against the run's sidecar."
+            )
         if abs(low - current.null) > _NULL_TOL:
             raise SystemExit(
                 f"this checkpoint predates the is_null contract flag ({dim} contract "
@@ -459,17 +674,34 @@ def contract_for_params(params, num_agents: int, low: float, high: float):
 
 
 # What the bargained scalar MEANS. The space, the observation encoding and the null
-# contract are identical across kinds; only the transfer differs.
+# contract are identical across kinds; only the transfer differs. Clean Up only:
+# the other two environments have one contract space each, the authors' (or, for the
+# Coin Game, the one built to their rules).
 CONTRACT_KINDS = ("clean_wage", "harvest_tax")
+
+#: CONTRACT_SPACE -> the class implementing it. One per environment.
+CONTRACT_SPACES = {
+    "cleanup": CleanupContract,
+    "harvest": HarvestContract,
+    "coin_game": CoinGameContract,
+}
 
 
 def make_contract(name: str, num_agents: int, low: float, high: float,
                   kind: str = "clean_wage"):
     """Contract-space factory, so the space is selectable from config."""
-    if name != "cleanup":
-        raise ValueError(f"unknown contract space {name!r} (available: 'cleanup')")
+    if name not in CONTRACT_SPACES:
+        raise ValueError(
+            f"unknown contract space {name!r} "
+            f"(available: {', '.join(sorted(CONTRACT_SPACES))})")
+    if kind != "clean_wage" and name != "cleanup":
+        raise ValueError(
+            f"CONTRACT_KIND is a Clean Up setting -- it chooses between the paper's "
+            f"cleaning wage and this repo's harvest tax, both of which are Clean Up "
+            f"mechanisms. CONTRACT_SPACE={name!r} has one space. Got kind={kind!r}.")
     if kind not in CONTRACT_KINDS:
         raise ValueError(f"unknown CONTRACT_KIND {kind!r} "
                          f"(available: {', '.join(CONTRACT_KINDS)})")
-    cls = CleanupContract if kind == "clean_wage" else HarvestTaxContract
+    cls = (HarvestTaxContract if kind == "harvest_tax"
+           else CONTRACT_SPACES[name])
     return cls(num_agents, low=low, high=high)

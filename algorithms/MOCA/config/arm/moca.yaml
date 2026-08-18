@@ -1,0 +1,8 @@
+# @package _global_
+# MOCA, Algorithm 1: phase 1 learns to play under theta ~ P(Theta), then a
+# contracting stage chooses theta against a FROZEN phase-1 policy.
+#
+# The default arm. Every value here is already moca_base's, so selecting it
+# explicitly changes nothing -- it exists so `arm=` always names what ran.
+TRAINING_MODE: two_phase
+PHASE2_MODE: negotiate
