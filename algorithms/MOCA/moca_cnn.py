@@ -367,6 +367,24 @@ def joint_metric_map(spec) -> dict:
         # depleting harvests by suppressing ALL harvesting is a welfare loss dressed
         # up as a success, and only the ratio tells the two apart.
         out[f"{extra}_mean"] = f"behaviour/{extra}"
+    if len(spec.behaviour_metrics) > 1:
+        # ...and the ratio itself, because that is the quantity the argument is
+        # actually about and neither series carries it alone. On Harvest it is the
+        # share of harvesting that depletes a patch, on the Coin Game the share of
+        # coin collection that is theft. A contract that works drives this DOWN
+        # while the denominator holds; a contract that has merely frightened the
+        # agents off the commons drives both down together, which looks identical
+        # in the numerator series and obviously different here.
+        out[f"{spec.act_label}_share"] = f"behaviour/{spec.act_label}_share"
+    # Behaviour and welfare under a contract against under none. `<act>_gap` is the
+    # series that must open up -- a mechanism whose behaviour is the same either way
+    # has priced nothing, however healthy its agreement rate looks -- and
+    # welfare_null is the disagreement point every vote is implicitly cast against.
+    out[f"{spec.act_label}_null"] = f"behaviour/{spec.act_label}_null"
+    out[f"{spec.act_label}_contracted"] = f"behaviour/{spec.act_label}_contracted"
+    out[f"{spec.act_label}_gap"] = f"behaviour/{spec.act_label}_gap"
+    out["welfare_null"] = "outcome/welfare_null"
+    out["welfare_contracted"] = "outcome/welfare_contracted"
     return out
 
 
@@ -2084,6 +2102,14 @@ def make_train(config):
                     "feats": feats, "raw": raw, "logp_theta": jnp.stack(lp_t),
                     "vote": votes, "logp_vote": jnp.stack(lp_v), "value": values,
                     "seg_return": seg_return,
+                    # Per-segment aggregates for the null-vs-contracted split: the
+                    # contracted act summed over the segment and across agents, and
+                    # the segment's welfare. Kept per ROUND because that is the grain
+                    # at which theta varies under renegotiation -- an episode-level
+                    # split would average a contracted segment together with an
+                    # uncontracted one and report neither.
+                    "seg_act": cleaned.sum(axis=(0, 2)),
+                    "seg_welfare": seg_return.sum(axis=0),
                     # Harvest-tax revenue actually levied over the segment, for the
                     # metrics. Identically zero under clean_wage.
                     "tax_pot": tax_pot.sum(axis=0),
@@ -2213,6 +2239,14 @@ def make_train(config):
                     "logp_vote": jnp.zeros((num_agents, n_envs), jnp.float32),
                     "value": jnp.stack(v_prop),
                     "seg_return": seg_return,
+                    # Per-segment aggregates for the null-vs-contracted split: the
+                    # contracted act summed over the segment and across agents, and
+                    # the segment's welfare. Kept per ROUND because that is the grain
+                    # at which theta varies under renegotiation -- an episode-level
+                    # split would average a contracted segment together with an
+                    # uncontracted one and report neither.
+                    "seg_act": cleaned.sum(axis=(0, 2)),
+                    "seg_welfare": seg_return.sum(axis=0),
                     # Harvest-tax revenue actually levied over the segment, for the
                     # metrics. Identically zero under clean_wage.
                     "tax_pot": tax_pot.sum(axis=0),
@@ -2586,6 +2620,38 @@ def make_train(config):
                           - rounds["theta_all"].min(axis=1))           # (K, E)
             out["theta_ask_spread"] = (
                 ask_spread * rounds["active"]).sum() / n_active
+            # ---- did the contract change anything, and was it worth signing? ----
+            # Split by SEGMENT on whether a contract was in force. Under
+            # renegotiation both regimes occur throughout a single run, so the
+            # comparison phase 1 gets from P(Theta) is available here too -- live,
+            # rather than only from an offline theta sweep against saved weights.
+            #
+            # It is correlational, not controlled: which segments run uncontracted is
+            # decided by the negotiation itself, so a role that rejects when the
+            # commons is already spent will bias the null side. BARGAIN_PROBE_FRAC
+            # with BARGAIN_PROBE_NULL_FRAC forces null segments independently of the
+            # policies, and is what moves this toward a causal reading.
+            contracted = in_force.astype(jnp.float32)             # (K, E)
+            uncontracted = 1.0 - contracted
+            n_con = jnp.maximum(contracted.sum(), 1.0)
+            n_unc = jnp.maximum(uncontracted.sum(), 1.0)
+            for name, per_round in ((spec.act_label, rounds["seg_act"]),
+                                    ("welfare", rounds["seg_welfare"])):
+                out[f"{name}_null"] = (per_round * uncontracted).sum() / n_unc
+                out[f"{name}_contracted"] = (per_round * contracted).sum() / n_con
+            # Per SEGMENT, so it is not comparable to phase 1's per-episode figures;
+            # multiply by BARGAIN_ROUNDS for that. Both sides read 0 when a run never
+            # leaves one regime, which in_force_rate is what disambiguates.
+            out[f"{spec.act_label}_gap"] = (
+                out[f"{spec.act_label}_contracted"] - out[f"{spec.act_label}_null"])
+            if len(spec.behaviour_metrics) > 1:
+                # The contracted act as a share of the denominator the environment
+                # supplies -- depleting eats per apple eaten, stolen coins per coin
+                # taken. Separates "the contract stopped the harm" from "the contract
+                # stopped the activity", which the numerator alone cannot.
+                out[f"{spec.act_label}_share"] = (
+                    out[f"{spec.contracted_act}_mean"]
+                    / jnp.maximum(out[f"{spec.behaviour_metrics[1]}_mean"], 1e-8))
             # Gameplay policy entropy, averaged over agents. Nothing else in this set
             # detects a collapsing policy: welfare and cleaning stay plausible right
             # up until the policies go deterministic, and then everything drops to
