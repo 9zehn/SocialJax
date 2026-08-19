@@ -1070,6 +1070,95 @@ def test_contract_space_must_be_one_the_environment_offers():
         raise AssertionError("a foreign contract space must be refused")
 
 
+# ------------------------------------------------- the penalised coin games
+
+def _coin_rollout(env_name, n, steps, seed=0):
+    """Random-policy rollout, returning the per-step reward and coin series."""
+    env = socialjax.make(env_name, num_agents=n, num_inner_steps=steps, cnn=True,
+                         jit=True, coin_reward=1.0, shared_rewards=False)
+    key = jax.random.PRNGKey(seed)
+    _, state = env.reset(key)
+    rows = []
+    for _ in range(steps):
+        key, k_act, k_step = jax.random.split(key, 3)
+        acts = [int(a) for a in jax.random.randint(k_act, (n,), 0, env.num_actions)]
+        _, state, reward, _, info = env.step(k_step, state, acts)
+        rows.append({
+            "reward": np.asarray(reward, np.float64).reshape(-1),
+            "own": np.asarray(info["eat_own_coins"], np.float64).reshape(-1),
+            "by": np.asarray(info["stolen_by_agent"], np.float64).reshape(-1),
+            "from": np.asarray(info["stolen_from_agent"], np.float64).reshape(-1),
+        })
+    return rows
+
+
+def test_coin_reward_pays_the_penalised_payoff():
+    """Both coin games charge the victim -2 for a coin somebody else took, so the
+    per-agent reward must be own + stolen_by - 2*stolen_from.
+
+    Welfare is the sum of these, and every theft has exactly one victim, so it
+    collapses to `own coins collected - coins stolen`: theft destroys one unit of
+    welfare per coin. That identity is what makes the coin games a dilemma at all,
+    and it is the thing to check after any change to the payoff.
+    """
+    for env_name, n in (("coin_game", 2), ("coin_game_n", 7)):
+        rows = _coin_rollout(env_name, n, 60)
+        # The last step of an episode is excluded: see the terminal-step test below.
+        for t, row in enumerate(rows[:-1]):
+            want = row["own"] + row["by"] - 2.0 * row["from"]
+            assert np.allclose(row["reward"], want), (env_name, t, row)
+        # Every theft is recorded against exactly one victim, or welfare does not
+        # reduce to own - stolen at all.
+        for t, row in enumerate(rows[:-1]):
+            assert abs(row["by"].sum() - row["from"].sum()) < 1e-9, (env_name, t)
+
+        welfare = sum(r["reward"].sum() for r in rows[:-1])
+        own = sum(r["own"].sum() for r in rows[:-1])
+        stolen = sum(r["by"].sum() for r in rows[:-1])
+        assert abs(welfare - (own - stolen)) < 1e-6, \
+            f"{env_name}: welfare {welfare} != own {own} - stolen {stolen}"
+
+
+def test_coin_game_n_drops_its_terminal_step_reward():
+    """coin_game_n zeroes the reward on the step that resets the episode, while its
+    info still reports that step's coins. The other three environments pay it.
+
+    Pinned rather than fixed: it is a deliberate-looking line in an environment whose
+    baselines are already being run, and the effect is one step in num_inner_steps.
+    But it does mean episode welfare is systematically short by the last step's
+    reward AND disagrees with the behaviour series over the same step, so if it ever
+    changes, that should be a decision rather than a surprise.
+    """
+    n, steps = 7, 60
+    env = socialjax.make("coin_game_n", num_agents=n, num_inner_steps=steps,
+                         cnn=True, jit=True, coin_reward=1.0, shared_rewards=False)
+    key = jax.random.PRNGKey(0)
+    _, state = env.reset(key)
+    for t in range(steps):
+        key, k_act, k_step = jax.random.split(key, 3)
+        acts = [int(a) for a in jax.random.randint(k_act, (n,), 0, env.num_actions)]
+        _, state, reward, _, info = env.step(k_step, state, acts)
+        if t == steps - 1:
+            assert np.allclose(np.asarray(reward), 0.0), \
+                "the terminal step is expected to pay nothing"
+            moved = (float(np.asarray(info["eat_own_coins"]).sum())
+                     + float(np.asarray(info["stolen_by_agent"]).sum()))
+            # The info for that same step is NOT zeroed; that is the asymmetry.
+            assert moved >= 0.0
+
+
+def test_joint_logs_what_welfare_decomposes_into_on_both_coin_games():
+    """welfare = own - stolen, so a JOINT run that logs only the theft side cannot
+    say whether welfare moved because cooperation rose or because theft fell."""
+    from algorithms.JOINT.joint_cnn import metric_names
+
+    for env_name in ("coin_game", "coin_game_n"):
+        names = metric_names(envs.spec_for(env_name))
+        for needed in ("eat_own_coins_mean", "stolen_by_agent_mean",
+                       "coins_taken_mean", "welfare", "equality"):
+            assert needed in names, f"{env_name} does not log {needed}: {names}"
+
+
 ALL_TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--child":

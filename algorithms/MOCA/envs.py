@@ -131,7 +131,17 @@ ENV_SPECS: Dict[str, EnvSpec] = {
         # where the protocol matches the theory exactly rather than approximating it.
         num_agents=7,
         reward_scale_kwarg="coin_reward",
-        behaviour_metrics=("stolen_by_agent", "coins_taken"),
+        # eat_own_coins is a THIRD entry rather than the commons metric it is in the
+        # two-player game, because it is needed here for a different reason: with the
+        # -2 penalty, welfare reduces exactly to
+        #     welfare = own coins collected - coins stolen
+        # (every theft pays its taker +1 and costs its victim -2, and each theft has
+        # exactly one victim). Without own-coin collection logged, a welfare number
+        # cannot be decomposed into "more cooperation" versus "less theft", which are
+        # the two ways it can move and are not the same result. Entries after the
+        # first two are logged and nothing else -- the contracted act and the
+        # denominator the _share ratio uses are still [0] and [1].
+        behaviour_metrics=("stolen_by_agent", "coins_taken", "eat_own_coins"),
         # A real grid-wide stock, uniform across agents -- unlike `coin_game`, whose
         # eat_own_coins is genuinely per-agent and is therefore read as agent 0's
         # value alone by the bargaining rollout.
