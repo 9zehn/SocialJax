@@ -497,6 +497,11 @@ def _child_main(env_name, mode):
         cfg = _bargain_cfg(env_name, rest.replace(":density", ""))
         if density:
             cfg["CONTRACT_SPACE"] = "harvest_density"
+            # NUM_ENVS must differ from the contract's parameter count. At 2 envs and
+            # a 2-parameter contract every wrong-axis broadcast still succeeds, which
+            # is how a mis-shaped proposer mask shipped past this suite once.
+            cfg["NUM_ENVS"] = 3
+            cfg["TOTAL_TIMESTEPS"] = cfg["NUM_STEPS"] * 3 * 4
     else:
         cfg = _tiny_cfg(env_name, PHASE2_MODE=mode, SOLVER_SAMPLES=3)
     out = jax.jit(make_train(cfg))(jax.random.PRNGKey(0))
@@ -965,6 +970,74 @@ def test_density_arm_trains_and_reports_the_threshold():
     assert "density_k_offered" in joint_core_metrics(harvest, param_dim=2)
     assert "density_k_offered" not in joint_core_metrics(harvest, param_dim=1)
     assert len(joint_core_metrics(harvest, param_dim=2)) == 11
+
+
+def test_density_offer_selects_one_agents_whole_contract():
+    """The proposer's offer must be ONE agent's (theta, k), not a mixture.
+
+    This is the shape bug that shipped: the proposer mask is (N, E) and the asks are
+    (N, E, P), so the mask needs a TRAILING axis. Inserting it at position 1 gives
+    (N, 1, E), which broadcasts the env axis against the parameter axis -- and when
+    E == P that is not an error, it silently blends two agents' contracts. So N, E
+    and P are all different here, and the assertion is on the values rather than on
+    the shapes.
+    """
+    from algorithms.MOCA import bargain
+
+    n, n_envs, p = 5, 3, 2                       # all distinct, on purpose
+    # Agent i asks (10*i, i): every component identifies its author.
+    theta_all = jnp.stack([
+        jnp.stack([jnp.full((n_envs,), 10.0 * i), jnp.full((n_envs,), float(i))], -1)
+        for i in range(n)
+    ])                                            # (N, E, P)
+    assert theta_all.shape == (n, n_envs, p)
+    proposer = jnp.array([0, 3, 4], jnp.int32)    # a different proposer per env
+    mine = bargain.is_proposer_mask(proposer, n)  # (N, E)
+
+    offer = jnp.sum(jnp.where(mine[..., None], theta_all, 0.0), axis=0)
+    assert offer.shape == (n_envs, p), offer.shape
+    for e, who in enumerate([0, 3, 4]):
+        assert np.allclose(np.asarray(offer[e]), [10.0 * who, float(who)]), \
+            f"env {e} should carry agent {who}'s whole contract, got {offer[e]}"
+
+    # The shape that shipped, both ways it goes wrong. At E != P it is a broadcast
+    # error -- loud, and what the Colab run hit. At E == P it broadcasts happily and
+    # returns a contract nobody offered, which is the reason this is tested by value.
+    try:
+        jnp.sum(jnp.where(mine[:, None], theta_all, 0.0), axis=0)
+    except (ValueError, TypeError):
+        pass
+    else:
+        raise AssertionError("mine[:, None] must not broadcast at E != P")
+
+    square = jnp.stack([
+        jnp.stack([jnp.full((p,), 10.0 * i), jnp.full((p,), float(i))], -1)
+        for i in range(n)
+    ])                                            # (N, P, P): E == P
+    prop_sq = jnp.array([0, 3], jnp.int32)
+    mine_sq = bargain.is_proposer_mask(prop_sq, n)
+    good = jnp.sum(jnp.where(mine_sq[..., None], square, 0.0), axis=0)
+    silent = jnp.sum(jnp.where(mine_sq[:, None], square, 0.0), axis=0)
+    assert not np.allclose(np.asarray(good), np.asarray(silent)), \
+        "at E == P the buggy selection has to differ, or this test proves nothing"
+
+
+def test_density_binding_selects_whole_contracts():
+    """Same argument one level down: apply_binding chooses between a (E, P) offer and
+    a (E, P) fallback with an (E,) decision."""
+    from algorithms.MOCA import bargain
+
+    n_envs = 3
+    offer = jnp.array([[9.0, 4.0], [8.0, 5.0], [7.0, 6.0]])
+    standing = jnp.zeros_like(offer)
+    passed = jnp.array([True, False, True])
+    live, eff, _, _ = bargain.apply_binding(
+        "segment", passed, jnp.zeros((n_envs,), bool), offer,
+        jnp.zeros((n_envs,), bool), standing, 0.0)
+    assert eff.shape == (n_envs, 2), eff.shape
+    assert np.allclose(np.asarray(eff[0]), [9.0, 4.0])
+    assert np.allclose(np.asarray(eff[1]), [0.0, 0.0]), "a rejected round plays null"
+    assert np.allclose(np.asarray(eff[2]), [7.0, 6.0])
 
 
 def test_median_is_refused_for_a_multi_parameter_contract():

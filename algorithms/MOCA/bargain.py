@@ -214,7 +214,7 @@ def apply_binding(mode: str, passed, offer_null, theta_offer, agreed, standing,
         env axis against the parameter axis -- which is not an error when E happens
         to equal P, and is silently the wrong contract when it does.
         """
-        return cond[:, None] if jnp.ndim(theta_offer) > jnp.ndim(cond) else cond
+        return cond[..., None] if jnp.ndim(theta_offer) > jnp.ndim(cond) else cond
     if mode == "episode":
         in_force = live & ~agreed
         theta_eff = jnp.where(

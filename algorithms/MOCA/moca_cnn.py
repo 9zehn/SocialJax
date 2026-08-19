@@ -1069,13 +1069,16 @@ def make_train(config):
         return (n_envs,) if PDIM == 1 else (n_envs, PDIM)
 
     def _as_offer(cond):
-        """(E,) -> (E, 1) when offers carry a parameter axis, else untouched.
+        """Append a parameter axis to a decision, so it selects WHOLE contracts.
 
-        Without it a jnp.where against an (E, P) offer broadcasts the env axis
-        against the parameter axis -- not an error when E == P, and silently the
-        wrong contract when it is.
+        Used against both (E,) decisions -> (E, 1) and the (N, E) proposer mask ->
+        (N, E, 1), so the axis has to be appended rather than inserted at position 1:
+        `cond[:, None]` gives (N, 1, E) for the mask, which then broadcasts the env
+        axis against the parameter axis. That is not an error when E == P -- it is
+        silently a blend of two agents' contracts -- so it is checked by a test that
+        uses E != P (see test_density_offer_selects_one_agents_whole_contract).
         """
-        return cond if PDIM == 1 else cond[:, None]
+        return cond if PDIM == 1 else cond[..., None]
     # Plain Python copy of the grid, purely for building metric NAMES. Formatting a
     # device array with float() fails under tracing, and label text must never depend
     # on a traced value anyway. Read off the grid itself rather than recomputed from
@@ -2640,7 +2643,13 @@ def make_train(config):
                 # An agent proposes OR votes in a given round, never both, so the two
                 # heads are trained on disjoint masks. Rounds after agreement carry no
                 # decision and are excluded from all three terms.
-                loss = clipped(pi_theta.log_prob(rounds["raw"][:, i][..., None]),
+                # The stored ask, with the event axis the Gaussian expects. A scalar
+                # space records (K, E) and has to grow one; a multi-parameter space
+                # already records (K, E, P) and must not, or the distribution is
+                # handed a rank it never produced.
+                raw_i = rounds["raw"][:, i]
+                raw_i = raw_i[..., None] if PDIM == 1 else raw_i
+                loss = clipped(pi_theta.log_prob(raw_i),
                                rounds["logp_theta"][:, i], w_prop, a)
 
                 # The vote's advantage, and the mask it is averaged over. Under
