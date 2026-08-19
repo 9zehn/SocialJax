@@ -492,7 +492,11 @@ def _child_main(env_name, mode):
     if mode == "combined":
         cfg = _tiny_cfg(env_name, TRAINING_MODE="combined")
     elif mode.startswith("bargain:"):
-        cfg = _bargain_cfg(env_name, mode.split(":", 1)[1])
+        rest = mode.split(":", 1)[1]
+        density = rest.endswith(":density")
+        cfg = _bargain_cfg(env_name, rest.replace(":density", ""))
+        if density:
+            cfg["CONTRACT_SPACE"] = "harvest_density"
     else:
         cfg = _tiny_cfg(env_name, PHASE2_MODE=mode, SOLVER_SAMPLES=3)
     out = jax.jit(make_train(cfg))(jax.random.PRNGKey(0))
@@ -939,6 +943,58 @@ def test_density_proposal_head_widens_without_touching_the_scalar_one():
     assert p2["params"]["log_std"].shape == (2,)
     pi, _, _ = two.apply(p2, feats[0])
     assert pi.sample(seed=_jax.random.PRNGKey(1)).shape[-1] == 2
+
+
+def test_density_arm_trains_and_reports_the_threshold():
+    """The 2-D space has to run the joint bargaining arm end to end AND report what
+    it bargained -- a threshold that is learned but not logged is not an experiment.
+    """
+    res = _run_child("harvest_common_open", "bargain:segment:density")
+    series = res["series"]["metrics_joint"]
+    assert "joint/contract/k_offered" in series, sorted(series)
+    assert "joint/contract/theta_in_force" in series
+
+    # Under WANDB_METRIC_SET=core the pruned set carries the threshold only when
+    # there IS one, so a Clean Up view is not padded with a knob that environment
+    # does not have. (Under `full` it is present and identically zero, which is how
+    # tax/* and report/* already behave.)
+    from algorithms.MOCA import envs as _envs
+    from algorithms.MOCA.moca_cnn import joint_core_metrics
+
+    harvest = _envs.spec_for("harvest_common_open")
+    assert "density_k_offered" in joint_core_metrics(harvest, param_dim=2)
+    assert "density_k_offered" not in joint_core_metrics(harvest, param_dim=1)
+    assert len(joint_core_metrics(harvest, param_dim=2)) == 11
+
+
+def test_median_is_refused_for_a_multi_parameter_contract():
+    """The median mechanism binds the middle ask. There is no middle of a set of
+    vectors -- a per-component median is a contract nobody offered."""
+    from algorithms.MOCA.moca_cnn import make_train
+
+    cfg = _bargain_cfg("harvest_common_open", "segment")
+    cfg.update(CONTRACT_SPACE="harvest_density", BARGAIN_PROTOCOL="median")
+    try:
+        make_train(cfg)
+    except ValueError as e:
+        assert "median" in str(e) and "one-dimensional" in str(e), e
+    else:
+        raise AssertionError("median must be refused for a 2-D contract space")
+
+
+def test_contract_space_must_be_one_the_environment_offers():
+    """harvest_density belongs to Harvest and nowhere else: its signals are Harvest's
+    and its threshold indexes Harvest's regrowth rule."""
+    from algorithms.MOCA.moca_cnn import make_train
+
+    cfg = _tiny_cfg("clean_up")
+    cfg["CONTRACT_SPACE"] = "harvest_density"
+    try:
+        make_train(cfg)
+    except ValueError as e:
+        assert "does not belong" in str(e), e
+    else:
+        raise AssertionError("a foreign contract space must be refused")
 
 
 ALL_TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

@@ -20,7 +20,27 @@ defaults:
   - arm: moca
 
 "ENV_NAME": "harvest_common_open"
+
+# Which Harvest contract. "harvest" is the authors' -- theta per apple eaten in a
+# low-density patch, where "low density" is the environment's fixed
+# low_density_threshold. "harvest_density" bargains that threshold too: an offer is
+# (theta, k) and an agent pays theta when it ate somewhere its REGROWTH RING held
+# fewer than k apples.
+#
+# The two are different-shaped contracts (two numbers, four observation features),
+# so a checkpoint from one will not load into the other. Set on the command line:
+#   ... --env harvest arm=renegotiate CONTRACT_SPACE=harvest_density
 "CONTRACT_SPACE": "harvest"
+
+# The threshold's range, read only under CONTRACT_SPACE=harvest_density. The ring
+# holds 0..12 apples and the test is `ring < k`, so k<=0 is an inert contract and
+# k=13 is a flat tax on all harvesting -- both degenerate ends are inside the space
+# on purpose, since a mechanism that cannot express them cannot be said to have
+# rejected them. The regrowth cliff sits at 3: respawn probability is
+# 0 / 0.001 / 0.005 / 0.025 for 0 / 1 / 2 / >=3 neighbours, so it saturates there
+# and 0 never respawns at all.
+"DENSITY_LOW": 0.0
+"DENSITY_HIGH": 13.0
 
 # The paper's range exactly. Unlike Clean Up -- where the range was raised because
 # the negotiated contract pinned to the 0.2 ceiling, a boundary solution meaning the

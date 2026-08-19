@@ -204,14 +204,26 @@ def apply_binding(mode: str, passed, offer_null, theta_offer, agreed, standing,
         raise ValueError(f"BARGAIN_BINDING must be one of "
                          f"{', '.join(BINDING_MODES)}; got {mode!r}")
     live = passed & ~offer_null
+
+    def per_env(cond):
+        """A per-env decision, shaped to select against the offer.
+
+        The decisions are (E,) whatever the contract is, but the offer is (E,) for a
+        scalar space and (E, P) for one that bargains several numbers at once. A
+        trailing axis has to be added in the second case or jnp.where broadcasts the
+        env axis against the parameter axis -- which is not an error when E happens
+        to equal P, and is silently the wrong contract when it does.
+        """
+        return cond[:, None] if jnp.ndim(theta_offer) > jnp.ndim(cond) else cond
     if mode == "episode":
         in_force = live & ~agreed
         theta_eff = jnp.where(
-            agreed, standing, jnp.where(in_force, theta_offer, null_theta))
+            per_env(agreed), standing,
+            jnp.where(per_env(in_force), theta_offer, null_theta))
         return (in_force, theta_eff, agreed | in_force,
-                jnp.where(in_force, theta_offer, standing))
+                jnp.where(per_env(in_force), theta_offer, standing))
     fallback = jnp.float32(null_theta) if mode == "segment" else standing
-    theta_eff = jnp.where(live, theta_offer, fallback)
+    theta_eff = jnp.where(per_env(live), theta_offer, fallback)
     # `agreed` is passed through untouched: nothing is ever absorbing here, so every
     # round stays a decision point and `active` needs no mode-specific handling.
     return live, theta_eff, agreed, theta_eff
@@ -268,8 +280,15 @@ def accepted(vote_accept, proposer_idx, quorum: int, num_agents: int) -> Tuple:
 # -- was not in the policy class. Slot 5 is separate from slot 6 so the network can
 # distinguish "no offer yet" from "an offer of value 0".
 
-def feature_dim(num_agents: int) -> int:
-    return 12 + 2 * num_agents
+def feature_dim(num_agents: int, param_dim: int = 1) -> int:
+    """Width of the bargaining state.
+
+    Slots 3 and 6 -- the standing offer and the live one -- hold ONE number per
+    contract parameter, so a space that bargains a fine and a density threshold
+    together adds two columns. At param_dim=1 this is 12 + 2N exactly as before, so
+    every existing checkpoint's width is unchanged.
+    """
+    return 12 + 2 * num_agents + 2 * (param_dim - 1)
 
 
 def normalise_theta(theta, low: float, high: float):
@@ -281,7 +300,7 @@ def normalise_theta(theta, low: float, high: float):
     return 2.0 * (theta - low) / (high - low) - 1.0
 
 
-def feature_mask(level: str, num_agents: int) -> jnp.ndarray:
+def feature_mask(level: str, num_agents: int, param_dim: int = 1) -> jnp.ndarray:
     """(F,) 0/1 mask selecting which tier of the bargaining state is visible.
 
     The tiers exist because "handcrafted features" is a fair criticism to level at a
@@ -307,14 +326,24 @@ def feature_mask(level: str, num_agents: int) -> jnp.ndarray:
     if level not in FEATURE_LEVELS:
         raise ValueError(f"BARGAIN_FEATURES must be one of "
                          f"{', '.join(FEATURE_LEVELS)}; got {level!r}")
-    n_protocol = 8 + 2 * num_agents
-    mask = jnp.zeros((feature_dim(num_agents),), dtype=jnp.float32)
+    # The two offer slots grow with the contract, and both sit in the protocol
+    # tier, so the tier boundary moves with them.
+    n_protocol = 8 + 2 * num_agents + 2 * (param_dim - 1)
+    mask = jnp.zeros((feature_dim(num_agents, param_dim),), dtype=jnp.float32)
     mask = mask.at[:n_protocol].set(1.0)
     if level in ("private", "public"):
         mask = mask.at[n_protocol:n_protocol + 2].set(1.0)
     if level == "public":
         mask = mask.at[n_protocol + 2:].set(1.0)
     return mask
+
+
+def _offer_columns(offer) -> list:
+    """One feature column per contract parameter, from a (E,) or (E, P) offer."""
+    offer = jnp.asarray(offer, jnp.float32)
+    if offer.ndim == 1:
+        return [offer]
+    return [offer[:, p] for p in range(offer.shape[-1])]
 
 
 def bargaining_features(round_idx, num_rounds: int, proposer_idx, num_agents: int,
@@ -334,7 +363,12 @@ def bargaining_features(round_idx, num_rounds: int, proposer_idx, num_agents: in
     alongside a 0/1 turn flag would make the first layer's job needlessly hard.
 
     Args:
-        last_theta_norm: (E,) the standing (rejected) offer on [-1, 1], 0 if none.
+        last_theta_norm: (E,) or (E, P) the standing (rejected) offer on [-1, 1],
+            0 if none. (E, P) for a contract space that bargains P numbers at once,
+            in which case slots 3 and 6 each hold P columns and the state is
+            correspondingly wider -- see `feature_dim`. Responders have to see every
+            component of the offer they are voting on, or the parts they cannot see
+            are outside the policy class exactly as the whole offer was in version 1.
         had_offer: (E,) bool, whether any offer has been made yet.
         n_reject: (E,) how many rounds have failed so far.
         live_theta_norm: (E,) the offer currently on the table on [-1, 1]; 0 in the
@@ -351,7 +385,11 @@ def bargaining_features(round_idx, num_rounds: int, proposer_idx, num_agents: in
         river_stock: (E,) clear cells in the river, scaled.
         mask: (F,) from `feature_mask`.
     """
-    num_envs = last_theta_norm.shape[0]
+    # A scalar space keeps its bare (E,) offers; a multi-parameter one arrives as
+    # (E, P) and contributes P columns wherever one column used to go.
+    last_cols = _offer_columns(last_theta_norm)
+    live_cols = _offer_columns(live_theta_norm)
+    num_envs = last_cols[0].shape[0]
     rounds_left = jnp.full((num_envs,), (num_rounds - round_idx) / num_rounds,
                            dtype=jnp.float32)
     prop_onehot = jax.nn.one_hot(proposer_idx, num_agents, dtype=jnp.float32)  # (E, N)
@@ -365,10 +403,10 @@ def bargaining_features(round_idx, num_rounds: int, proposer_idx, num_agents: in
             rounds_left,
             mine[i],
             had_offer.astype(jnp.float32),
-            last_theta_norm,
+            *last_cols,
             n_reject.astype(jnp.float32) / num_rounds,
             jnp.asarray(offer_live, jnp.float32),
-            live_theta_norm,
+            *live_cols,
             accept_frac,
         ]
         cols = shared + [prop_onehot[:, a] for a in range(num_agents)]
@@ -659,7 +697,8 @@ def params_shape(params) -> Tuple[Optional[int], Optional[int]]:
 
 
 def check_params_compatible(params: Any, num_agents: int, recorded_version=None,
-                            hidden: Optional[int] = None, label: str = "") -> None:
+                            hidden: Optional[int] = None, label: str = "",
+                            param_dim: int = 1) -> None:
     """Refuse to replay a bargaining checkpoint this code cannot read.
 
     The failure being prevented is not a crash -- it is the version of this that
@@ -678,7 +717,7 @@ def check_params_compatible(params: Any, num_agents: int, recorded_version=None,
             f"run's .run.yaml sidecar records the commit), or retrain."
         )
     got, got_hidden = params_shape(params)
-    want = feature_dim(num_agents)
+    want = feature_dim(num_agents, param_dim)
     if got is not None and got != want:
         raise ValueError(
             f"{where}bargaining policy expects a {got}-dim feature vector, this code "

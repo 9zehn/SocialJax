@@ -285,6 +285,16 @@ JOINT_BARGAIN_METRICS = {
     # contract on thin-patch eating has nothing left to charge for. The two series
     # separating is the finding, so both are logged.
     "contract_in_force_rate_round0": "contract/in_force_rate_round0",
+    # CONTRACT_SPACE=harvest_density only, and identically zero elsewhere so one
+    # wandb view covers both. The threshold is the second half of the contract:
+    # theta says how much depletion costs, k says which harvesting counts as
+    # depletion at all. Both series, because they fail differently -- a high fine on
+    # an inert threshold (k -> 0) prices nothing, and a flat tax (k -> 13) prices
+    # every harvest including the ones that cost the commons nothing.
+    #   density_k_offered   what proposers ASK for, over active non-probe rounds.
+    #   density_k_in_force  what actually governed, over contracted segments.
+    "density_k_offered": "contract/k_offered",
+    "density_k_in_force": "contract/k_in_force",
     "theta_agreed": "contract/theta_agreed",
     "theta_offered": "contract/theta_offered",
     # The scalar actually in force, averaged over the segments that had a contract.
@@ -348,7 +358,7 @@ JOINT_BARGAIN_METRICS = {
 METRIC_SETS = ("full", "core")
 
 
-def joint_core_metrics(spec) -> Tuple[str, ...]:
+def joint_core_metrics(spec, param_dim: int = 1) -> Tuple[str, ...]:
     """The ten series a renegotiated bargaining run is actually read on.
 
     Chosen to answer five questions and no more, one or two series each:
@@ -377,6 +387,13 @@ def joint_core_metrics(spec) -> Tuple[str, ...]:
         "theta_in_force",
         "act_per_episode",
     ]
+    if param_dim > 1:
+        # The contract's second half. theta_in_force says how much depletion costs;
+        # this says which harvesting was counted as depletion at all, and the two
+        # are not substitutes -- a large fine on a threshold near 0 prices nothing.
+        # Only present when there is a threshold to report, so the scalar spaces do
+        # not carry a permanently flat chart.
+        core.append("density_k_offered")
     if len(spec.behaviour_metrics) > 1:
         # Separates "the contract stopped the harm" from "the contract stopped the
         # activity" -- the numerator alone cannot, and on a depletable commons the
@@ -390,7 +407,7 @@ def joint_core_metrics(spec) -> Tuple[str, ...]:
     return tuple(core)
 
 
-def joint_metric_map(spec, metric_set: str = "full") -> dict:
+def joint_metric_map(spec, metric_set: str = "full", param_dim: int = 1) -> dict:
     """JOINT_BARGAIN_METRICS with this environment's behaviour block spliced in.
 
     Everything a bargaining run is judged on -- speed of agreement, where theta
@@ -445,7 +462,7 @@ def joint_metric_map(spec, metric_set: str = "full") -> dict:
     out["welfare_null"] = "outcome/welfare_null"
     out["welfare_contracted"] = "outcome/welfare_contracted"
     if metric_set == "core":
-        keep = joint_core_metrics(spec)
+        keep = joint_core_metrics(spec, param_dim)
         missing = [k for k in keep if k not in out]
         if missing:
             raise KeyError(
@@ -571,7 +588,13 @@ def make_train(config):
     STAGE2_SOLVER_METRICS = stage2_solver_metrics(spec)
     STAGE2_NEGOTIATE_METRICS = stage2_negotiate_metrics(spec)
     COMBINED_METRICS = combined_metrics(spec)
-    JOINT_METRICS = joint_metric_map(spec, config["WANDB_METRIC_SET"])
+    # The contract itself is built further down, but its SHAPE is fixed by the space
+    # name, and that is all the metric map needs -- whether there is a threshold to
+    # report alongside the fine.
+    JOINT_METRICS = joint_metric_map(
+        spec, config["WANDB_METRIC_SET"],
+        contracts.CONTRACT_SPACES[
+            config.get("CONTRACT_SPACE") or spec.contract_space].PARAM_DIM)
     commons_scale = envs.commons_scale(spec, env)
 
     if config["PARAMETER_SHARING"]:
@@ -839,6 +862,18 @@ def make_train(config):
                 f"{config['BARGAIN_PROTOCOL']!r}. 'alternating' is the "
                 f"proposer-and-vote game; 'median' binds the median of "
                 f"everyone's simultaneous asks, with no vote.")
+        _space = config.get("CONTRACT_SPACE") or spec.contract_space
+        if (config["BARGAIN_PROTOCOL"] == "median"
+                and contracts.CONTRACT_SPACES[_space].PARAM_DIM > 1):
+            # The median mechanism binds the middle of N simultaneous asks. "The
+            # middle" of a set of vectors is not defined -- a per-component median is
+            # a contract nobody offered, which is exactly the object the mechanism's
+            # argument says the median is not.
+            raise ValueError(
+                f"BARGAIN_PROTOCOL=median needs a one-dimensional contract: it binds "
+                f"the median ask, and CONTRACT_SPACE={_space!r} offers "
+                f"{contracts.CONTRACT_SPACES[_space].PARAM_DIM} numbers at once. "
+                f"Use BARGAIN_PROTOCOL=alternating.")
         if config["BARGAIN_PROTOCOL"] == "median":
             forced = {"BARGAIN_BINDING": "segment",
                       "BARGAIN_VOTE_ADVANTAGE": "gae",
@@ -985,26 +1020,72 @@ def make_train(config):
     # the wrong one with an env is either a crash or -- worse, if the fields happen
     # to exist -- a run that redistributes on the wrong quantity and looks fine.
     contract_space = config.setdefault("CONTRACT_SPACE", spec.contract_space)
-    if contract_space != spec.contract_space:
+    allowed_spaces = envs.CONTRACT_SPACES_BY_ENV.get(
+        spec.env_name, (spec.contract_space,))
+    if contract_space not in allowed_spaces:
         raise ValueError(
             f"CONTRACT_SPACE={contract_space!r} does not belong to "
-            f"ENV_NAME={spec.env_name!r}, whose contract space is "
-            f"{spec.contract_space!r}. Each environment has exactly one.")
+            f"ENV_NAME={spec.env_name!r}, whose spaces are "
+            f"{', '.join(allowed_spaces)}.")
+    space_kwargs = {}
+    if contract_space == "harvest_density":
+        # The threshold's own range, separate from the fine's CONTRACT_LOW/HIGH.
+        # Defaults come from the contract class (0..13, i.e. inert through flat tax).
+        for cfg_key, arg in (("DENSITY_LOW", "density_low"),
+                             ("DENSITY_HIGH", "density_high")):
+            if config.get(cfg_key) is not None:
+                space_kwargs[arg] = float(config[cfg_key])
     contract = make_contract(
         contract_space,
         num_agents,
         low=config["CONTRACT_LOW"],
         high=config["CONTRACT_HIGH"],
         kind=contract_kind,
+        **space_kwargs,
     )
-    contract_grid = contract.grid(config["NUM_CONTRACT_BINS"])
+    # The discretised grid only exists for a one-dimensional space, and only
+    # PHASE2_MODE=reinforce reads it. Built lazily so a 2-D space is not refused at
+    # config time for an arm it is not running.
+    contract_grid = (contract.grid(config["NUM_CONTRACT_BINS"])
+                     if contract.PARAM_DIM == 1 else None)
+
+    # How many numbers ONE offer is. The bargaining loop is the same game either way;
+    # only the shape of the offer differs, so rather than branching all the way down,
+    # these four carry the difference:
+    #
+    #   PDIM            1 for every space the reference defines.
+    #   param_low/high  the bounds `unsquash`/`normalise_theta` map onto -- scalars at
+    #                   PDIM=1, so those calls are untouched, (P,) vectors above it.
+    #   _offer_shape    the shape of a per-env offer: (E,) or (E, P).
+    #   _as_offer       a per-env decision, reshaped to select against an offer.
+    #
+    # At PDIM=1 each is the identity on what the code did before, which is what keeps
+    # the scalar arms bit-for-bit unchanged (test_golden_arms).
+    PDIM = contract.PARAM_DIM
+    param_low = contract.low if PDIM == 1 else contract.param_low
+    param_high = contract.high if PDIM == 1 else contract.param_high
+
+    def _offer_shape(n_envs):
+        return (n_envs,) if PDIM == 1 else (n_envs, PDIM)
+
+    def _as_offer(cond):
+        """(E,) -> (E, 1) when offers carry a parameter axis, else untouched.
+
+        Without it a jnp.where against an (E, P) offer broadcasts the env axis
+        against the parameter axis -- not an error when E == P, and silently the
+        wrong contract when it is.
+        """
+        return cond if PDIM == 1 else cond[:, None]
     # Plain Python copy of the grid, purely for building metric NAMES. Formatting a
     # device array with float() fails under tracing, and label text must never depend
     # on a traced value anyway. Read off the grid itself rather than recomputed from
     # low/high: the grid is not a plain linspace when the range excludes weak
     # contracts (index 0 is then the null contract), and labels that disagree with it
     # would mislabel every proposal-probability series.
-    contract_grid_labels = [float(x) for x in np.asarray(contract_grid)]
+    # Empty for a multi-parameter space, which has no grid to label -- only
+    # PHASE2_MODE=reinforce reads either, and it is refused for such a space.
+    contract_grid_labels = ([] if contract_grid is None
+                            else [float(x) for x in np.asarray(contract_grid)])
 
     env = LogWrapper(env, replace_info=False)
 
@@ -1128,10 +1209,13 @@ def make_train(config):
                 activation=config["ACTIVATION"],
                 accept_bias=float(config.get("BARGAIN_ACCEPT_BIAS", 1.0)),
                 aux_heads=cf_vote,
+                param_dim=contract.PARAM_DIM,
             )
             for _ in range(num_agents)
         ]
-        init_b = jnp.zeros((1, bargain.feature_dim(num_agents)))
+        # Width follows the contract: the two offer slots hold one column per
+        # contract parameter, so a 2-D space widens the state the policy reads.
+        init_b = jnp.zeros((1, bargain.feature_dim(num_agents, PDIM)))
         bargain_tx = optax.chain(
             optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
             optax.adam(config.get("BARGAIN_LR") or 3e-4, eps=1e-5),
@@ -1920,7 +2004,8 @@ def make_train(config):
             """
             K, x = config["BARGAIN_ROUNDS"], config["BARGAIN_SEGMENT"]
             n_envs = config["NUM_ENVS"]
-            feat_mask = bargain.feature_mask(config["BARGAIN_FEATURES"], num_agents)
+            feat_mask = bargain.feature_mask(config["BARGAIN_FEATURES"], num_agents,
+                                             PDIM)
             # Scales so the bargaining state arrives at roughly unit range. Episode
             # return is bounded by one unit of primary reward per step; the
             # contracted act likewise, since every one of them is at most one event
@@ -1985,7 +2070,12 @@ def make_train(config):
                 reward = reward + transfers
                 info = dict(info)
                 info["contract_transfer"] = transfers
-                info["contract_theta"] = jnp.broadcast_to(theta[:, None], transfers.shape)
+                # The FINE, broadcast per agent. Everything downstream that reads
+                # this series treats it as a scalar theta, so a 2-D contract records
+                # its first component here and its threshold in contract/k_* instead.
+                theta_fine = theta if PDIM == 1 else theta[..., 0]
+                info["contract_theta"] = jnp.broadcast_to(theta_fine[:, None],
+                                                          transfers.shape)
 
                 done_list = [v for v in done.values()]
                 transition = []
@@ -2000,7 +2090,11 @@ def make_train(config):
                 # The act the contract prices, and the state of the commons. Both go
                 # into the bargaining state (an agent's own contribution so far; the
                 # public tier's aggregates) and into the behaviour metrics.
-                cleaned = info[spec.contracted_act]                 # (E, N)
+                # What the contract actually charged for this step. Identical to
+                # info[spec.contracted_act] for every scalar space; under a bargained
+                # threshold the priced set moves with the contract, so reading a
+                # fixed info field would make raising the threshold look inert.
+                cleaned = contract.act_from_info(theta, info)        # (E, N)
                 clear = info[spec.commons_metric][:, 0]             # (E,)
                 return ((env_state, obsv, theta, rng, tax_window),
                         (transition, cleaned, clear, tax_pot))
@@ -2045,22 +2139,32 @@ def make_train(config):
                         river / river_scale, feat_mask)              # (N, E, F)
 
                 # ---- pass 1: propose, with nothing yet on the table.
-                nothing = jnp.zeros((n_envs,), jnp.float32)
-                feats_prop = feats_at(nothing, nothing)
+                # The empty OFFER and the "is an offer live" flag are different
+                # shapes once a contract is more than one number -- the flag stays
+                # one column per env however many components the offer has.
+                no_offer = jnp.zeros(_offer_shape(n_envs), jnp.float32)
+                not_live = jnp.zeros((n_envs,), jnp.float32)
+                feats_prop = feats_at(no_offer, not_live)
                 raws, lp_t, v_prop = [], [], []
                 kt = jax.random.split(k_theta, num_agents)
                 for i in range(num_agents):
                     pi_theta, _, v = bargain_net[i].apply(
                         bargain_params[i], feats_prop[i])
-                    raw = pi_theta.sample(seed=kt[i])                # (E, 1)
-                    raws.append(raw[:, 0])
+                    raw = pi_theta.sample(seed=kt[i])                # (E, P)
+                    # A scalar space drops the trailing axis and keeps every shape
+                    # below exactly as it was; a multi-parameter one carries it.
+                    raws.append(raw[:, 0] if PDIM == 1 else raw)
                     lp_t.append(pi_theta.log_prob(raw))
                     v_prop.append(v)
-                raw = jnp.stack(raws)                                # (N, E)
+                raw = jnp.stack(raws)                                # (N, E[, P])
 
-                theta_all = negotiate.unsquash(raw, contract.low, contract.high)
+                theta_all = negotiate.unsquash(raw, param_low, param_high)
                 mine = bargain.is_proposer_mask(proposer, num_agents)
-                theta_offer = jnp.sum(jnp.where(mine, theta_all, 0.0), axis=0)   # (E,)
+                # The proposer's offer, picked out of the N asks. With a parameter
+                # axis the mask needs a trailing axis of its own, or the sum collapses
+                # the wrong one and every env gets a blend of two agents' contracts.
+                theta_offer = jnp.sum(
+                    jnp.where(_as_offer(mine), theta_all, 0.0), axis=0)   # (E[, P])
 
                 # Scripted probe offers. With probability BARGAIN_PROBE_FRAC the
                 # proposer's offer is replaced by a theta drawn uniformly over the
@@ -2078,9 +2182,12 @@ def make_train(config):
                 if probe_frac > 0.0:
                     u = jax.random.uniform(k_probe, (n_envs,))
                     is_probe = u < probe_frac
+                    # Uniform over the whole space, component by component: a probe
+                    # is meant to be an offer the learned proposers no longer make,
+                    # and holding one component fixed would only probe a slice.
                     probe_theta = jax.random.uniform(
-                        k_probe_theta, (n_envs,),
-                        minval=contract.low, maxval=contract.high)
+                        k_probe_theta, _offer_shape(n_envs),
+                        minval=param_low, maxval=param_high)
                     # BARGAIN_PROBE_NULL_FRAC of the probes offer the NULL contract
                     # itself (nested thresholds on one draw, so no extra key). A
                     # null offer never locks -- see `newly` below -- so these probes
@@ -2088,8 +2195,10 @@ def make_train(config):
                     # whatever the vote, and gameplay keeps meeting theta=0.
                     is_null_probe = u < probe_frac * probe_null_frac
                     probe_theta = jnp.where(
-                        is_null_probe, jnp.float32(contract.null), probe_theta)
-                    theta_offer = jnp.where(is_probe, probe_theta, theta_offer)
+                        _as_offer(is_null_probe), jnp.float32(contract.null),
+                        probe_theta)
+                    theta_offer = jnp.where(
+                        _as_offer(is_probe), probe_theta, theta_offer)
                 else:
                     is_probe = jnp.zeros((n_envs,), bool)
 
@@ -2097,7 +2206,7 @@ def make_train(config):
                 # to see it too: a theta-blind baseline cannot credit a rejection
                 # against the size of the offer that was refused.
                 feats_vote = feats_at(
-                    bargain.normalise_theta(theta_offer, contract.low, contract.high),
+                    bargain.normalise_theta(theta_offer, param_low, param_high),
                     jnp.ones((n_envs,), jnp.float32))
                 votes, lp_v, v_vote = [], [], []
                 kv = jax.random.split(k_vote, num_agents)
@@ -2214,8 +2323,7 @@ def make_train(config):
                          next_locked,
                          cum_return + seg_return,
                          cum_clean + jnp.transpose(cleaned.sum(axis=0)),
-                         bargain.normalise_theta(theta_offer, contract.low,
-                                                 contract.high),
+                         bargain.normalise_theta(theta_offer, param_low, param_high),
                          jnp.ones_like(had_offer),
                          n_reject + (~agreed & ~passed).astype(jnp.int32),
                          clear[-1].astype(jnp.float32),
@@ -2360,10 +2468,12 @@ def make_train(config):
 
             zeros_e = jnp.zeros((n_envs,), jnp.float32)
             init = (env_state, last_obs, rng,
-                    jnp.zeros((n_envs,), bool), jnp.full((n_envs,), contract.null),
+                    jnp.zeros((n_envs,), bool),
+                    jnp.full(_offer_shape(n_envs), contract.null, jnp.float32),
                     jnp.zeros((num_agents, n_envs), jnp.float32),
                     jnp.zeros((num_agents, n_envs), jnp.float32),
-                    zeros_e, jnp.zeros((n_envs,), bool),
+                    jnp.zeros(_offer_shape(n_envs), jnp.float32),
+                    jnp.zeros((n_envs,), bool),
                     jnp.zeros((n_envs,), jnp.int32), zeros_e,
                     jnp.zeros((num_agents, n_envs), jnp.float32), zeros_e,
                     jnp.zeros((num_agents, n_envs), jnp.float32),
@@ -2408,7 +2518,8 @@ def make_train(config):
             # What the gameplay critic bootstraps its final value against: the locked
             # contract under `episode`, the last segment's contract otherwise (which
             # is what `locked` carries there).
-            final_theta = (jnp.where(agreed, locked, jnp.float32(contract.null))
+            final_theta = (jnp.where(_as_offer(agreed), locked,
+                                     jnp.float32(contract.null))
                            if binding == "episode" else locked)
             return traj_batch, rounds, env_state, last_obs, final_theta, rng
 
@@ -2648,16 +2759,38 @@ def make_train(config):
                                      else rounds["newly"].mean())
             out["agreement_round"] = agree_round.mean()
             out["disagreement_steps"] = agree_round.mean() * config["BARGAIN_SEGMENT"]
-            in_force = rounds["theta_eff"] > contract.null
+            # The FINE decides whether a contract is in force; a threshold on its
+            # own moves nothing. With a 2-D space theta_eff is (K, E, P), so the
+            # comparison has to name component 0 rather than reduce over both.
+            theta_eff_f = (rounds["theta_eff"] if PDIM == 1
+                           else rounds["theta_eff"][..., 0])
+            theta_offer_f = (rounds["theta_offer"] if PDIM == 1
+                             else rounds["theta_offer"][..., 0])
+            in_force = theta_eff_f > contract.null
             out["contract_in_force_rate"] = in_force.mean()
             # Round 0 alone. Not derivable from the pooled rate, and on a commons
             # that can be spent inside one segment it is the one that decides whether
             # the mechanism ever had anything to price.
             out["contract_in_force_rate_round0"] = in_force[0].mean()
+            # The bargained threshold. Zero on every one-dimensional space, so the
+            # series exists in both cases and a run that silently fell back to the
+            # scalar contract reads as a flat zero rather than as a missing chart.
+            if PDIM > 1:
+                k_offer = rounds["theta_offer"][..., 1]
+                k_eff = rounds["theta_eff"][..., 1]
+                w_offer = rounds["active"] * (
+                    1.0 - rounds["is_probe"].astype(jnp.float32))
+                out["density_k_offered"] = ((k_offer * w_offer).sum()
+                                            / jnp.maximum(w_offer.sum(), 1.0))
+                out["density_k_in_force"] = ((k_eff * in_force).sum()
+                                             / jnp.maximum(in_force.sum(), 1.0))
+            else:
+                out["density_k_offered"] = jnp.float32(0.0)
+                out["density_k_in_force"] = jnp.float32(0.0)
             if binding == "episode":
                 # theta actually agreed, averaged over the envs that agreed at all.
                 agreed_theta = jnp.sum(
-                    jnp.where(rounds["newly"], rounds["theta_offer"], 0.0), axis=0)
+                    jnp.where(rounds["newly"], theta_offer_f, 0.0), axis=0)
                 out["theta_agreed"] = (jnp.sum(agreed_theta) /
                                        jnp.maximum(agreed_any.sum(), 1.0))
             else:
@@ -2665,9 +2798,9 @@ def make_train(config):
                 # per segment -- so this becomes the theta actually PLAYED UNDER,
                 # averaged over the segments that had a contract at all.
                 out["theta_agreed"] = (
-                    (rounds["theta_eff"] * in_force).sum()
+                    (theta_eff_f * in_force).sum()
                     / jnp.maximum(in_force.sum(), 1.0))
-            out["theta_in_force"] = ((rounds["theta_eff"] * in_force).sum()
+            out["theta_in_force"] = ((theta_eff_f * in_force).sum()
                                      / jnp.maximum(in_force.sum(), 1.0))
             # Harvest tax. Revenue is levied per step, so it is reported per step;
             # the realised wage divides it by the cells that earned it, which is the
@@ -2689,7 +2822,7 @@ def make_train(config):
             n_active = jnp.maximum(rounds["active"].sum(), 1.0)
             w_own_offer = rounds["active"] * (
                 1.0 - rounds["is_probe"].astype(jnp.float32))
-            out["theta_offered"] = ((rounds["theta_offer"] * w_own_offer).sum()
+            out["theta_offered"] = ((theta_offer_f * w_own_offer).sum()
                                     / jnp.maximum(w_own_offer.sum(), 1.0))
             out["accept_count"] = (
                 rounds["n_accept"] * rounds["active"]).sum() / n_active
@@ -2699,8 +2832,10 @@ def make_train(config):
             # cleaners asking high, harvesters low -- or whether everyone has
             # collapsed onto one number; under alternating offers it is the same
             # question about the asks only one of which is ever read.
-            ask_spread = (rounds["theta_all"].max(axis=1)
-                          - rounds["theta_all"].min(axis=1))           # (K, E)
+            theta_all_f = (rounds["theta_all"] if PDIM == 1
+                           else rounds["theta_all"][..., 0])
+            ask_spread = (theta_all_f.max(axis=1)
+                          - theta_all_f.min(axis=1))                   # (K, E)
             out["theta_ask_spread"] = (
                 ask_spread * rounds["active"]).sum() / n_active
             # ---- did the contract change anything, and was it worth signing? ----

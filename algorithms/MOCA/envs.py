@@ -150,6 +150,19 @@ ENV_SPECS: Dict[str, EnvSpec] = {
 #: ask binds) is a Clean Up experiment: its whole argument rests on ~4 harvesters
 #: among 7 agents putting the median near the welfare optimum, which is a property of
 #: that environment's role split and not of contracting.
+#: Contract spaces available per environment. The first is the default and the one
+#: `EnvSpec.contract_space` names; the rest are alternatives selectable with
+#: CONTRACT_SPACE. An environment has one space in the reference -- `harvest_density`
+#: is this project's, bargaining the density threshold that the published Harvest
+#: contract fixes at construction, and it is listed here rather than replacing
+#: `harvest` so the one-dimensional runs stay loadable and the comparison is a flag.
+CONTRACT_SPACES_BY_ENV = {
+    "clean_up": ("cleanup",),
+    "harvest_common_open": ("harvest", "harvest_density"),
+    "coin_game": ("coin_game",),
+    "coin_game_n": ("coin_game",),
+}
+
 BARGAIN_PROTOCOLS_BY_ENV = {
     "clean_up": ("alternating", "median"),
     "harvest_common_open": ("alternating",),
