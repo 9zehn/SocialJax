@@ -71,6 +71,15 @@ def checkpoint_filename(config: Dict[str, Any], latest: bool = False) -> str:
     if num_agents:
         suffix += f"_agents{num_agents}"
 
+    # Harvest's zap beam. Marked for BOTH settings rather than only the off-default
+    # one, the same rule BARGAIN_BINDING follows and for the same reason: with or
+    # without the beam are different games at the same seed, and an unmarked name
+    # would be ambiguous between "the default of the day it was written" (upstream
+    # had the beam) and "the default of the day it is read" (this repo does not).
+    # Absent from every other environment's ENV_KWARGS, so no other name changes.
+    if "enable_zap" in env_kwargs:
+        suffix += "_zap" if env_kwargs["enable_zap"] else "_nozap"
+
     # MOCA's phase-2 mode. The three modes are meant to be run against each other
     # at the same seed and reward -- the controlled comparison this function's
     # whole purpose is to keep from colliding -- and without this every one of

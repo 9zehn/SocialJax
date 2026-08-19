@@ -22,6 +22,12 @@ Examples:
     # the shell doesn't expand it; files are sorted and assigned to agents 0..N-1
     python viz/interactive_viewer.py --env clean_up \\
         --checkpoint 'checkpoints/individual/clean_up_seed0_reward_individual_*.pkl'
+
+    # Contracting run on any of the three environments -- --env is optional, since
+    # the run's .run.yaml sidecar records which one it was trained on. Renegotiated
+    # bargaining replays segment by segment, with the round log in the panel:
+    python viz/interactive_viewer.py \\
+        --checkpoint 'runs/.../harvest_common_open_seed42_reward_individual_agents7_bargain_seg100_segment_joint_[0-9].pkl'
 """
 import argparse
 import functools
@@ -41,24 +47,31 @@ from algorithms.utils.io_utils import load_params, load_run_config
 
 
 
-def rollout(env, params, num_steps, seed, contract=None, theta=None):
+def rollout(env, params, num_steps, seed, contract=None, theta=None, spec=None):
     """Step the env and collect raw states (fast, sequential — each step depends on the last).
 
     Rendering is deferred to render_states() so it can be parallelized separately.
 
-    Returns (states, extras). extras["cleaned"] is the per-step (N,) count of dirt
-    cells each agent cleared, and extras["transfers"] the per-step (N,) zero-sum
-    contract transfer (all zeros unless a MOCA `contract` and `theta` are supplied,
-    in which case the gameplay policy is the contract-conditioned network).
+    Returns (states, extras) with three per-step (N,) series:
+        act        the CONTRACTED ACT, i.e. the quantity the contract prices --
+                   cells cleaned on Clean Up, thin-patch apples eaten on Harvest.
+                   Which info field that is comes from `spec` (algorithms/MOCA/envs),
+                   so the viewer never has to know one environment's field names.
+        reward     the environment's own per-agent reward, BEFORE transfers.
+        transfers  the zero-sum contract transfer (all zeros unless a MOCA `contract`
+                   and `theta` are supplied, in which case the gameplay policy is the
+                   contract-conditioned network).
     """
     use_contract = contract is not None and theta is not None
+    act_key = spec.contracted_act if spec is not None else "cleaned_by_agent"
     rng = jax.random.PRNGKey(seed)
     rng, rng_reset = jax.random.split(rng)
     obs, state = env.reset(rng_reset)
 
     states = [state]
     transfers_per_step = [np.zeros(env.num_agents)]
-    cleaned_per_step = [np.zeros(env.num_agents, dtype=np.float32)]
+    act_per_step = [np.zeros(env.num_agents, dtype=np.float32)]
+    reward_per_step = [np.zeros(env.num_agents, dtype=np.float32)]
 
     network = None
     contract_vec = None
@@ -105,12 +118,18 @@ def rollout(env, params, num_steps, seed, contract=None, theta=None):
         obs, state, reward, done, info = env.step(rng_step, state, actions)
         states.append(state)
 
-        cleaned = np.atleast_1d(np.array(info["cleaned_by_agent"], dtype=np.float32)) \
-            if "cleaned_by_agent" in info else np.zeros(env.num_agents, dtype=np.float32)
-        cleaned_per_step.append(cleaned)
+        act = (np.atleast_1d(np.array(info[act_key], dtype=np.float32))
+               if act_key in info else np.zeros(env.num_agents, dtype=np.float32))
+        act_per_step.append(act)
+        reward_per_step.append(
+            np.atleast_1d(np.asarray(reward, dtype=np.float32)).reshape(-1))
 
         if use_contract:
-            tr = np.array(contract.compute_transfer(jnp.float32(theta), jnp.asarray(cleaned)))
+            # Read straight out of the info dict, so WHICH signal is redistributed is
+            # the contract's business and not the viewer's -- the same call the
+            # training loop makes, and the reason a Harvest contract charges for
+            # thin-patch eating here without the viewer knowing that it does.
+            tr = np.array(contract.transfer_from_info(jnp.float32(theta), info))
             transfers_per_step.append(tr)
         else:
             transfers_per_step.append(np.zeros(env.num_agents))
@@ -118,7 +137,8 @@ def rollout(env, params, num_steps, seed, contract=None, theta=None):
         if bool(done["__all__"]):
             break
 
-    return states, {"transfers": transfers_per_step, "cleaned": cleaned_per_step}
+    return states, {"transfers": transfers_per_step, "act": act_per_step,
+                    "reward": reward_per_step}
 
 
 
@@ -136,6 +156,9 @@ def infer_bargain_config(stem, checkpoint=None):
     the filename alone, as runs predating the sidecar must.
     """
     seg = re.search(r"_seg(\d+)", stem)
+    # Anchored on a following "_" or end-of-stem so "_segment" cannot be read out of
+    # "_seg100", which precedes it in every bargaining name.
+    binding = re.search(r"_(episode|segment|sticky)(?=_|$)", stem)
     quorum = re.search(r"_q(majority|\d+)", stem)
     proposer = ("contribution" if "_contribution" in stem
                 else "holdout" if "_holdout" in stem
@@ -159,12 +182,14 @@ def infer_bargain_config(stem, checkpoint=None):
         "hidden": 64,
         "accept_bias": 1.0,
         "feature_version": None,
-        # How long a carried offer binds. EVERY run without a sidecar predates this
-        # setting, so "episode" is the only correct fallback -- and it has to be a
-        # fallback rather than a guess from the stem, because replaying a
-        # renegotiated run as an absorbing one reports a first carried segment as an
-        # episode-long agreement and every downstream number follows it.
-        "binding": "episode",
+        # How long a carried offer binds. checkpoint_filename marks this for EVERY
+        # binding rather than only off-default ones, so a stem that carries the token
+        # settles it on its own and a stem that does not is a run predating the
+        # setting, for which "episode" is the only correct reading. Worth recovering
+        # rather than defaulting: replaying a renegotiated run as an absorbing one
+        # reports a first carried segment as an episode-long agreement, and every
+        # downstream number follows it while looking entirely normal.
+        "binding": (binding.group(1) if binding else "episode"),
         # What the bargained scalar MEANS: a wage per cell cleaned, or a tax rate on
         # harvest income. Same fallback logic, and a worse failure if it is wrong --
         # the two pay different agents from different bases, so a mismatch is a
@@ -194,9 +219,9 @@ def infer_bargain_config(stem, checkpoint=None):
     # as an episode-long agreement struck in its first contracted segment, and every
     # number that follows is internally consistent and wrong. So the tools say which
     # it was, the way contract_range does.
-    cfg["binding_source"] = ("sidecar" if side is not None
-                             and side.get("BARGAIN_BINDING") is not None
-                             else "fallback")
+    cfg["binding_source"] = (
+        "sidecar" if side is not None and side.get("BARGAIN_BINDING") is not None
+        else "stem" if binding else "fallback")
     cfg["tax_window"] = int(cfg["tax_window"])
     cfg["kind_source"] = ("sidecar" if side is not None
                           and side.get("CONTRACT_KIND") is not None else "fallback")
@@ -204,11 +229,18 @@ def infer_bargain_config(stem, checkpoint=None):
 
 
 def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
-                       contract, cfg, fixed_theta=None):
+                       contract, cfg, spec, fixed_theta=None):
     """Replay a Rubinstein bargaining run: negotiate, play a segment, repeat.
 
     Parallel to `rollout` rather than folded into it, so every pre-bargaining
     checkpoint keeps its exact replay path.
+
+    Environment-independent by way of `spec` (an algorithms/MOCA/envs.EnvSpec):
+    everything the bargaining state reads off the world -- the act the contract
+    prices, the state of the commons, and the scales that put both at unit range --
+    comes from there rather than from Clean Up's field names, because the bargaining
+    policy was TRAINED on those exact features and a substitute would be a different
+    input vector fed to the same weights.
 
     Returns (states, extras) with the same keys `rollout` produces, plus
     extras["rounds"]: one record per round in which a decision was actually made --
@@ -220,6 +252,7 @@ def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
     """
     from algorithms.MOCA import bargain as bg
     from algorithms.MOCA import contracts as bg_contracts
+    from algorithms.MOCA import envs as moca_envs
     from algorithms.MOCA import negotiate as neg
     from algorithms.MOCA.networks import BargainingActorCritic, ContractActorCritic
 
@@ -235,10 +268,15 @@ def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
     seg = int(cfg["segment"])
 
     # Scales must match training exactly or the policy reads a different state.
+    # These are moca_cnn.py's, term for term: an episode's worth of unit reward, an
+    # episode's worth of the contracted act (at most one per agent per step), and the
+    # commons at its maximum -- which is grid cells on Clean Up and apple spawn
+    # points on Harvest, hence read off the spec rather than off a grid size.
+    act_key, commons_key = spec.contracted_act, spec.commons_metric
     inner = int(getattr(env, "num_inner_steps", num_steps))
-    ret_scale = float(inner) * float(getattr(env, "apple_reward", 1.0))
-    clean_scale = float(inner)
-    river_scale = float(env.GRID_SIZE_ROW * env.GRID_SIZE_COL)
+    ret_scale = float(inner) * float(getattr(env, spec.reward_scale_kwarg, 1.0))
+    act_scale = float(inner)
+    commons_scale = float(moca_envs.commons_scale(spec, env))
 
     rng = jax.random.PRNGKey(seed)
     rng, k_reset, k_start = jax.random.split(rng, 3)
@@ -246,10 +284,11 @@ def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
     offset = (jax.random.randint(k_start, (1,), 0, n)
               if cfg["rotate_start"] == "random" else None)
 
-    states, transfers, cleaned_hist, rounds = [state], [np.zeros(n)], [np.zeros(n)], []
-    cum_ret, cum_clean = np.zeros(n, np.float32), np.zeros(n, np.float32)
+    states, transfers, act_hist, rounds = [state], [np.zeros(n)], [np.zeros(n)], []
+    rewards_hist = [np.zeros(n, np.float32)]
+    cum_ret, cum_act = np.zeros(n, np.float32), np.zeros(n, np.float32)
     agreed, locked = False, float(contract.null)
-    last_tn, had_offer, n_reject, river = 0.0, False, 0, 0.0
+    last_tn, had_offer, n_reject, commons = 0.0, False, 0, 0.0
     last_votes, last_n_accept = np.zeros(n, np.float32), 0.0
     last_rejecters = np.zeros(n, np.float32)
     step = 0
@@ -277,8 +316,8 @@ def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
                 r, num_rounds, n, jnp.array([last_tn], jnp.float32),
                 jnp.array([had_offer]),
                 jnp.asarray(cum_ret)[:, None] / ret_scale,
-                jnp.asarray(cum_clean)[:, None] / clean_scale,
-                jnp.array([river], jnp.float32) / river_scale, mask)
+                jnp.asarray(cum_act)[:, None] / act_scale,
+                jnp.array([commons], jnp.float32) / commons_scale, mask)
             kt = jax.random.split(k_theta, n)
             asks = []
             for i in range(n):
@@ -304,7 +343,7 @@ def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
             rng, k_prop, k_theta, k_vote = jax.random.split(rng, 4)
             proposer = int(bg.proposer_for_round(
                 r, n, 1, cfg["proposer"], key=k_prop,
-                contributions=jnp.asarray(cum_clean)[:, None], start_offset=offset,
+                contributions=jnp.asarray(cum_act)[:, None], start_offset=offset,
                 holdouts=jnp.asarray(last_rejecters)[:, None])[0])
 
             def feats_at(live_tn, live):
@@ -315,8 +354,8 @@ def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
                     jnp.array([live_tn], jnp.float32), jnp.array([live], jnp.float32),
                     jnp.asarray(last_votes)[:, None], jnp.array([last_n_accept]),
                     jnp.asarray(cum_ret)[:, None] / ret_scale,
-                    jnp.asarray(cum_clean)[:, None] / clean_scale,
-                    jnp.array([river], jnp.float32) / river_scale, mask)
+                    jnp.asarray(cum_act)[:, None] / act_scale,
+                    jnp.array([commons], jnp.float32) / commons_scale, mask)
 
             # Two passes, as in training: the offer is made, and only then voted on.
             # One pass would hand the vote head an empty offer slot it never saw
@@ -391,31 +430,35 @@ def rollout_bargaining(env, gameplay_params, bargain_params, num_steps, seed,
             states.append(state)
             step += 1
 
-            cl = np.atleast_1d(np.array(info["cleaned_by_agent"], np.float32))
+            act = np.atleast_1d(np.array(info[act_key], np.float32))
+            rew = np.atleast_1d(np.asarray(reward, np.float32)).reshape(-1)
             # The transfer the run was trained under. A harvest tax reads the
             # harvest and a trailing cleaning window instead of this step's cleaning
             # alone; the window is per episode and survives segment boundaries.
+            # Every other kind reads its own signals out of the info dict, so which
+            # act is priced stays the contract's business.
             if tax_kind:
-                tax_win = bg_contracts.push_tax_window(tax_win, jnp.asarray(cl))
+                tax_win = bg_contracts.push_tax_window(tax_win, jnp.asarray(act))
                 harvest = np.atleast_1d(
                     np.array(info["original_rewards"], np.float32))
                 tr = np.array(contract.tax_transfer(
                     jnp.float32(theta), jnp.asarray(harvest), tax_win))
             else:
-                tr = np.array(contract.compute_transfer(jnp.float32(theta),
-                                                        jnp.asarray(cl)))
-            cleaned_hist.append(cl)
+                tr = np.array(contract.transfer_from_info(jnp.float32(theta), info))
+            act_hist.append(act)
+            rewards_hist.append(rew)
             transfers.append(tr)
-            cum_clean = cum_clean + cl
-            cum_ret = cum_ret + np.asarray(reward, np.float32).reshape(-1) + tr
-            river = float(np.array(info["waste_cleared"]).reshape(-1)[0])
+            cum_act = cum_act + act
+            cum_ret = cum_ret + rew + tr
+            commons = float(np.array(info[commons_key]).reshape(-1)[0])
             if bool(done["__all__"]):
-                return states, {"transfers": transfers, "cleaned": cleaned_hist,
-                                "rounds": rounds}
+                return states, {"transfers": transfers, "act": act_hist,
+                                "reward": rewards_hist, "rounds": rounds}
         if step >= num_steps:
             break
 
-    return states, {"transfers": transfers, "cleaned": cleaned_hist, "rounds": rounds}
+    return states, {"transfers": transfers, "act": act_hist,
+                    "reward": rewards_hist, "rounds": rounds}
 
 
 def _agent_snapshot(state):
@@ -441,13 +484,22 @@ def _render_worker(state):
     return np.array(_WORKER_ENV.render(state))
 
 
-def recording_meta(env, contract_info=None):
-    """Everything render_recording() needs to rasterise without the env or JAX."""
-    from socialjax.environments.cleanup.clean_up import Items
+def recording_meta(env, env_name=None, contract_info=None):
+    """Everything render_recording() needs to rasterise without the env or JAX.
+
+    `n_items` comes off the env rather than from Clean Up's Items enum: every env
+    numbers its agents as `len(Items) + i`, and the palette has to reserve exactly
+    that many item codes. Harvest has 6 items to Clean Up's 10, so borrowing Clean
+    Up's count paints Harvest's agent cells in river/dirt colours.
+    """
+    from viz.recording import BACKGROUNDS, RECORDING_VERSION, _BACKGROUND
 
     return {
-        "version": 1,
-        "n_items": len(Items),
+        "version": RECORDING_VERSION,
+        "n_items": int(np.asarray(env._agents).reshape(-1)[0]),
+        "background": list(BACKGROUNDS.get(env_name, _BACKGROUND)),
+        "act_header": getattr(env, "act_header", "Clean"),
+        "theta_unit": getattr(env, "theta_unit", "cell"),
         "padding": int(env.PADDING),
         "player_colours": [list(map(int, c)) for c in env.PLAYER_COLOURS],
         "num_agents": int(env.num_agents),
@@ -487,6 +539,10 @@ class _ReplayEnv:
         self.pay_amount = meta["pay_amount"]
         self.pay_clean_window = meta["pay_clean_window"]
         self.apple_reward = meta["apple_reward"]
+        # The panel's environment vocabulary, so a replay is labelled the way the
+        # live rollout was rather than in Clean Up's words by default.
+        self.act_header = meta.get("act_header", "Clean")
+        self.theta_unit = meta.get("theta_unit", "cell")
 
 
 def render_states(env, env_name, env_kwargs, states, workers=None):
@@ -545,24 +601,26 @@ def _load_font(size):
 
 
 def _panel_supported(states, env):
-    """The panel needs per-agent balances/colors, which only clean_up exposes."""
-    return (
-        len(states) > 0
-        and hasattr(states[0], "agent_balance")
-        and getattr(env, "PLAYER_COLOURS", None) is not None
-    )
+    """The panel needs per-agent colours and at least one state to read."""
+    return len(states) > 0 and getattr(env, "PLAYER_COLOURS", None) is not None
 
 
-def collect_panel_data(states, env, transfers=None, cleaned=None):
+def collect_panel_data(states, env, transfers=None, act=None, rewards=None):
     """Per-step, per-agent stats for the info panel, aligned with `states`.
 
     Returns a list (one entry per state) of dicts:
-        balance:   (N,) cumulative net reward = each agent's spendable balance.
-        clean:     (N,) running count of dirt CELLS the agent has cleared. Taken from
-                   the env's per-step info["cleaned_by_agent"] when `cleaned` is
-                   supplied. The fallback (last_clean_t changing) can only count
-                   cleaning STEPS, and the beam covers 4 tiles, so it under-reports
-                   whenever an agent clears more than one cell in a single action.
+        balance:   (N,) cumulative net reward. Clean Up carries this in State
+                   (`agent_balance`, the spendable balance the pay mechanism moves);
+                   every other environment has no such field, so it is accumulated
+                   from the per-step `rewards` the rollout collected. Environment
+                   reward only in both cases -- contract transfers are the next
+                   column, and adding them here would double-count them.
+        act:       (N,) running count of the CONTRACTED ACT -- cells cleared on
+                   Clean Up, thin-patch apples eaten on Harvest. Taken from the
+                   env's own per-step info when `act` is supplied. The Clean Up-only
+                   fallback (last_clean_t changing) can only count cleaning STEPS,
+                   and the beam covers 4 tiles, so it under-reports whenever an agent
+                   clears more than one cell in a single action.
         share:     (N,) bool, share-mode toggle currently ON (tithe scheme only;
                    all-False otherwise).
         transfer:  (N,) CUMULATIVE contract transfer received (negative = net
@@ -573,28 +631,32 @@ def collect_panel_data(states, env, transfers=None, cleaned=None):
     pay mechanism's balance is.
     """
     n = env.num_agents
-    clean_counts = np.zeros(n, dtype=int)
+    act_counts = np.zeros(n, dtype=int)
     cum_transfer = np.zeros(n)
+    cum_reward = np.zeros(n, dtype=np.float32)
     prev_lct = None
     out = []
     for idx, s in enumerate(states):
-        if cleaned is not None:
-            if idx < len(cleaned):
-                clean_counts = clean_counts + np.asarray(cleaned[idx]).reshape(-1).astype(int)
+        if act is not None:
+            if idx < len(act):
+                act_counts = act_counts + np.asarray(act[idx]).reshape(-1).astype(int)
         else:
             lct = np.array(s.last_clean_t) if hasattr(s, "last_clean_t") else None
             if lct is not None and prev_lct is not None:
-                clean_counts = clean_counts + (lct != prev_lct).astype(int)
+                act_counts = act_counts + (lct != prev_lct).astype(int)
             prev_lct = lct
-        balance = np.array(s.agent_balance) if hasattr(s, "agent_balance") else np.zeros(n)
+        if rewards is not None and idx < len(rewards):
+            cum_reward = cum_reward + np.asarray(rewards[idx], np.float32).reshape(-1)
+        balance = (np.array(s.agent_balance) if hasattr(s, "agent_balance")
+                   else cum_reward)
         if hasattr(s, "share_expiry_t"):
             share = np.array(s.share_expiry_t) > int(s.inner_t)
         else:
             share = np.zeros(n, dtype=bool)
         if transfers is not None and idx < len(transfers):
             cum_transfer = cum_transfer + np.asarray(transfers[idx]).reshape(-1)
-        out.append({"balance": np.asarray(balance).reshape(-1),
-                    "clean": clean_counts.copy(),
+        out.append({"balance": np.asarray(balance).reshape(-1).copy(),
+                    "act": act_counts.copy(),
                     "share": np.asarray(share).reshape(-1),
                     "transfer": cum_transfer.copy()})
     return out
@@ -609,6 +671,30 @@ _PANEL_ON = (80, 220, 130)
 _PANEL_OFF = (222, 70, 74)
 
 
+# Short display wording per environment: what one unit of theta is priced PER (the
+# panel caption) and the column header for the act the contract prices. Both are
+# derivable from the EnvSpec -- see the fallback in `act_labels` -- so a new
+# environment renders sensibly without an entry here. The table exists only because
+# act_label ("thin_patch_eats") is wider than the column, which collides with the
+# Reward column at around eight characters.
+_ACT_DISPLAY = {
+    "clean_up": ("cell", "Clean"),
+    "harvest_common_open": ("thin-patch eat", "Thin eat"),
+    "coin_game": ("stolen coin", "Steal"),
+}
+
+
+def act_labels(spec):
+    """(unit theta is priced per, panel column header) for a contracting env."""
+    if spec is None:
+        return ("unit", "Act")
+    named = _ACT_DISPLAY.get(spec.env_name)
+    if named is not None:
+        return named
+    words = spec.act_label.replace("_", " ")
+    return (words, words.split()[0][:7].title())
+
+
 def _scheme_caption(env, contract_info=None):
     """One-line description of the active reward + redistribution mechanism, shown in
     the panel header. Names the reward mode explicitly because the env DEFAULTS to
@@ -621,8 +707,18 @@ def _scheme_caption(env, contract_info=None):
     if contract_info is not None:
         theta = contract_info["theta"]
         src = contract_info.get("source", "")
-        return f"{reward} · contract θ={theta:g}/cell{(' ' + src) if src else ''}"
-    mode = getattr(env, "pay_mode", "off")
+        # The unit is the environment's, not Clean Up's: the same number means a wage
+        # per cell cleaned on one env and a fine per thin-patch apple on another.
+        # Three significant figures, matching the bargaining log's rows -- under
+        # renegotiation this theta is a mean over segments, and printing it to five
+        # would be precision the number does not have. Where it came from is its own
+        # " · " part so the caption can wrap there when the units are long.
+        unit = getattr(env, "theta_unit", "cell")
+        origin = f" · {src.strip('()')}" if src else ""
+        return f"{reward} · contract θ={theta:.3g}/{unit}{origin}"
+    if not hasattr(env, "pay_mode"):
+        return reward          # no redistribution mechanism on this environment
+    mode = env.pay_mode
     if mode == "off":
         return f"{reward} · no payments"
     scheme = getattr(env, "pay_scheme", "?")
@@ -631,6 +727,28 @@ def _scheme_caption(env, contract_info=None):
         who = "→all cleaners" if getattr(env, "split_recipients", False) else "→latest cleaner"
         return f"{reward} · tithe {getattr(env, 'share_fraction', 0.5):g} {who}{tag}"
     return f"{reward} · instant pays {getattr(env, 'pay_amount', 1.0):g}{tag}"
+
+
+def _wrap_caption(draw, text, font, max_width):
+    """Split `text` on its " · " separators into lines that fit `max_width`.
+
+    The caption names the reward mode and the mechanism, and the mechanism's units
+    are the environment's -- "per thin-patch eat" is half again as wide as "per
+    cell". Truncating would drop the units, which is the part that says what the
+    number means, so it wraps instead.
+    """
+    parts = text.split(" · ")
+    lines, current = [], ""
+    for part in parts:
+        trial = f"{current} · {part}" if current else part
+        if current and draw.textlength(trial, font=font) > max_width:
+            lines.append(current)
+            current = part
+        else:
+            current = trial
+    if current:
+        lines.append(current)
+    return lines
 
 
 def _render_bargain_log(draw, x0, y0, x1, y1, rounds, colors, width, n):
@@ -733,9 +851,10 @@ def render_info_panel(height, datum, colors, env, step, width, contract_info=Non
 
     First column is each agent's color (a swatch + a color bar down the row edge)
     so every stat reads back to the matching agent in the grid.
-    Columns: color/label | Reward (balance) | Clean (count) | and then either
-    Share (ON/OFF) for the tithe toggle, or Transfer (cumulative net contract
-    transfer, + receiver / - funder) under a MOCA contract.
+    Columns: color/label | Reward (balance) | the contracted act's running count,
+    headed with that environment's name for it | and then either Share (ON/OFF) for
+    the tithe toggle, or Transfer (cumulative net contract transfer, + receiver /
+    - funder) under a MOCA contract.
     """
     from PIL import ImageDraw
 
@@ -757,11 +876,18 @@ def render_info_panel(height, datum, colors, env, step, width, contract_info=Non
     draw.text((pad, pad), "Agents", font=title_f, fill=_PANEL_FG)
     draw.text((width - pad, pad + 2), f"step {step}", font=head_f, fill=_PANEL_MUTED, anchor="ra")
     y = pad + int(title_f.size * 1.5)
-    draw.text((pad, y), _scheme_caption(env, contract_info), font=head_f, fill=_PANEL_MUTED)
+    caption = _wrap_caption(draw, _scheme_caption(env, contract_info), head_f,
+                            width - 2 * pad)
+    line_h = int(head_f.size * 1.35)
+    for i, line in enumerate(caption):
+        draw.text((pad, y + i * line_h), line, font=head_f, fill=_PANEL_MUTED)
+    y += (len(caption) - 1) * line_h
+    act_head = getattr(env, "act_header", "Clean")
     total_reward = float(np.sum(datum["balance"]))
-    total_clean = int(np.sum(datum["clean"]))
+    total_act = int(np.sum(datum["act"]))
     y += int(head_f.size * 1.5)
-    totals = f"total reward {total_reward:.1f}    total clean {total_clean}"
+    totals = (f"total reward {total_reward:.1f}    "
+              f"total {act_head.lower()} {total_act}")
     if show_contract:
         # Under a zero-sum contract the transfers must cancel; showing the moved
         # volume instead makes "is the contract doing anything" readable at a glance.
@@ -771,16 +897,16 @@ def render_info_panel(height, datum, colors, env, step, width, contract_info=Non
 
     # Column x anchors (right-aligned value columns). The rightmost column (Share's
     # dot + ON/OFF, or the signed Transfer figure) needs the widest slot; leave a
-    # clear gap between it and the Clean number so they never run together.
+    # clear gap between it and the act count so they never run together.
     x_last = width - pad                                             # rightmost
     has_last = show_share or show_contract
-    x_clean = (x_last - int(width * 0.26)) if has_last else (width - pad)
-    x_reward = x_clean - int(width * 0.20)
+    x_act = (x_last - int(width * 0.26)) if has_last else (width - pad)
+    x_reward = x_act - int(width * 0.20)
 
     # Column header row.
     y_head = y + int(head_f.size * 1.9)
     draw.text((x_reward, y_head), "Reward", font=head_f, fill=_PANEL_MUTED, anchor="ra")
-    draw.text((x_clean, y_head), "Clean", font=head_f, fill=_PANEL_MUTED, anchor="ra")
+    draw.text((x_act, y_head), act_head, font=head_f, fill=_PANEL_MUTED, anchor="ra")
     if show_share:
         draw.text((x_last, y_head), "Share", font=head_f, fill=_PANEL_MUTED, anchor="ra")
     elif show_contract:
@@ -816,10 +942,10 @@ def render_info_panel(height, datum, colors, env, step, width, contract_info=Non
         draw.text((sx + swatch + int(width * 0.03), cy), f"A{i}", font=cell_f,
                   fill=_PANEL_FG, anchor="lm")
 
-        # Reward + clean values.
+        # Reward + contracted-act values.
         draw.text((x_reward, cy), f"{float(datum['balance'][i]):.1f}", font=cell_f,
                   fill=_PANEL_FG, anchor="rm")
-        draw.text((x_clean, cy), f"{int(datum['clean'][i])}", font=cell_f,
+        draw.text((x_act, cy), f"{int(datum['act'][i])}", font=cell_f,
                   fill=_PANEL_FG, anchor="rm")
 
         # Share toggle indicator: filled green square = ON, filled red square = OFF,
@@ -834,9 +960,11 @@ def render_info_panel(height, datum, colors, env, step, width, contract_info=Non
             draw.text((bx - int(width * 0.015), cy), "ON" if on else "OFF",
                       font=head_f, fill=fill, anchor="rm")
 
-        # Cumulative contract transfer: green = net receiver (was subsidised for
-        # cleaning), red = net funder. Reading this column tells you at a glance
-        # whether the contract actually moved money toward the cleaners.
+        # Cumulative contract transfer: green = net receiver, red = net funder.
+        # Which way is "good" depends on the space -- Clean Up SUBSIDISES a benefit,
+        # so receivers are the cleaners; Harvest FINES a harm, so receivers are the
+        # agents who stayed out of thin patches. Either way this column is what says
+        # whether the contract actually moved anything.
         elif show_contract:
             t = float(datum["transfer"][i])
             if t > 1e-9:
@@ -1222,7 +1350,7 @@ def solve_solver_theta(params, contract, env, seed, num_samples, rule):
             "null": bool(np.asarray(info["solver_null_rate"]) > 0.5)}
 
 
-def _infer_env_kwargs_from_checkpoint(checkpoint_arg):
+def _infer_env_kwargs_from_checkpoint(checkpoint_arg, env_name="clean_up", spec=None):
     """Best-effort recovery of the env config a checkpoint was TRAINED with, by parsing
     the filename the training loop wrote (algorithms/utils/io_utils.checkpoint_filename).
 
@@ -1235,10 +1363,18 @@ def _infer_env_kwargs_from_checkpoint(checkpoint_arg):
     caveat: this reads the filename, not the weights, so a mislabeled file misleads it
     -- hence it's overridable by explicit --env-kwarg and printed for inspection.
 
+    `env_name` gates the kwargs that only one environment HAS. The pay mechanism is
+    Clean Up's alone, so emitting `pay_mode` for a Harvest run is not a wrong value
+    but an unknown keyword argument, and the env constructor raises. `spec` names the
+    reward-scale kwarg for the same reason -- it is `apple_reward` on two of the three
+    environments and `coin_reward` on the other.
+
     Returns a dict of env kwargs (possibly empty).
     """
     import glob
     import re
+
+    has_pay_mechanism = env_name == "clean_up"
 
     matches = sorted(glob.glob(checkpoint_arg))
     name = os.path.basename(matches[0] if matches else checkpoint_arg).lower()
@@ -1257,15 +1393,16 @@ def _infer_env_kwargs_from_checkpoint(checkpoint_arg):
         kw["shared_rewards"] = True
 
     # Pay mode: token present for on/noop, absent means off.
-    if "pay_noop" in name:
-        kw["pay_mode"] = "noop"
-    elif "pay_on" in name:
-        kw["pay_mode"] = "on"
-    else:
-        kw["pay_mode"] = "off"
+    if has_pay_mechanism:
+        if "pay_noop" in name:
+            kw["pay_mode"] = "noop"
+        elif "pay_on" in name:
+            kw["pay_mode"] = "on"
+        else:
+            kw["pay_mode"] = "off"
 
     # Scheme + its off-default knobs only matter when pay is active.
-    if kw["pay_mode"] in ("on", "noop"):
+    if kw.get("pay_mode") in ("on", "noop"):
         kw["pay_scheme"] = "tithe" if "_tithe" in name else "instant"
         if kw["pay_scheme"] == "tithe":
             m = re.search(r"_f([0-9]*\.?[0-9]+)", name)
@@ -1291,12 +1428,13 @@ def _infer_env_kwargs_from_checkpoint(checkpoint_arg):
     # them at the env's default num_agents-valued apple would silently rescale the
     # whole economy relative to the contract.
     if detect_moca(checkpoint_arg) is not None:
-        kw["apple_reward"] = 1.0
-        kw["pay_mode"] = "off"
+        kw[spec.reward_scale_kwarg if spec is not None else "apple_reward"] = 1.0
+        if has_pay_mechanism:
+            kw["pay_mode"] = "off"
     return kw
 
 
-def _report_env_config(env, checkpoint_arg):
+def _report_env_config(env, env_name, checkpoint_arg):
     """Print the reward/pay config the env was actually built with, and warn loudly if
     it contradicts what the checkpoint filename says it was trained with.
 
@@ -1310,14 +1448,21 @@ def _report_env_config(env, checkpoint_arg):
     pay_mode = getattr(env, "pay_mode", "off")
     pay_scheme = getattr(env, "pay_scheme", "?")
     split = getattr(env, "split_recipients", False)
-    extra = ""
-    if pay_mode != "off" and pay_scheme == "tithe":
-        extra = (f", recipients={'split-all' if split else 'latest'}, "
-                 f"clean_window={getattr(env, 'pay_clean_window', '?')}")
+    # The pay mechanism exists on Clean Up only, so on the other environments it is
+    # absent rather than off, and reporting "pay_mode=off" there would read as a
+    # setting somebody chose.
+    pay = ""
+    if hasattr(env, "pay_mode"):
+        pay = f"pay_mode={pay_mode}, pay_scheme={pay_scheme}"
+        if pay_mode != "off" and pay_scheme == "tithe":
+            pay += (f", recipients={'split-all' if split else 'latest'}, "
+                    f"clean_window={getattr(env, 'pay_clean_window', '?')}")
+        pay += ", "
+    scale = ("coin_reward" if env_name == "coin_game" else "apple_reward")
     print(
-        f"Env config: reward={'shared/common' if shared else 'individual'}, "
-        f"pay_mode={pay_mode}, pay_scheme={pay_scheme}{extra}, "
-        f"apple_reward={getattr(env, 'apple_reward', '?')}, num_agents={env.num_agents}"
+        f"Env config: {env_name}, "
+        f"reward={'shared/common' if shared else 'individual'}, {pay}"
+        f"{scale}={getattr(env, scale, '?')}, num_agents={env.num_agents}"
     )
     if not checkpoint_arg:
         return
@@ -1370,9 +1515,81 @@ def _warn_if_fixed_agent_count(env, env_name, requested_num_agents):
         )
 
 
+def check_action_space(params, env, env_name):
+    """Refuse a checkpoint whose action head does not match the env's action space.
+
+    The failure this replaces is a flax ScopeParamShapeError naming "/Dense_1" and a
+    pair of kernel shapes, several frames from the config that caused it. The usual
+    cause on Harvest is the zap beam: `enable_zap` now defaults to False, so a policy
+    trained upstream (8 actions, beam included) meets a 7-action environment.
+    """
+    one = params[0] if isinstance(params, list) else params
+    if one is None:
+        return
+    try:
+        # The actor head is the last Dense before the Categorical; its output width
+        # IS the action count the policy was trained on.
+        trained = int(one["params"]["Dense_1"]["kernel"].shape[-1])
+    except (KeyError, TypeError, IndexError):
+        return          # not a shape we can read; let flax report it as before
+    have = int(env.action_space().n)
+    if trained == have:
+        return
+    hint = ""
+    if env_name == "harvest_common_open" and trained == have + 1:
+        hint = ("\n  This is the zap beam: it is off by default now, so an upstream "
+                "checkpoint\n  has one action more than the environment offers. Replay "
+                "it with\n  `--env-kwarg enable_zap=True`.")
+    raise SystemExit(
+        f"[incompatible checkpoint] this policy was trained with {trained} actions, "
+        f"but {env_name!r} as configured offers {have}.{hint}")
+
+
+def resolve_env_name(arg_env, checkpoint):
+    """Which environment to build, reconciling --env with the run's own record.
+
+    A contracting checkpoint is only replayable on the environment it was trained on
+    -- the observation shapes differ, so a mismatch usually dies inside flax with a
+    kernel-shape error naming neither environment. The sidecar knows which one it
+    was, so it both supplies the default and turns the mismatch into a sentence.
+    """
+    recorded = (load_run_config(checkpoint) or {}).get("ENV_NAME") if checkpoint else None
+    if arg_env is None:
+        if recorded is None:
+            raise SystemExit(
+                "--env is required: this run has no .run.yaml sidecar to read the "
+                "environment from (pass e.g. --env harvest_common_open)")
+        print(f"Env from the run's sidecar: {recorded}")
+        return recorded
+    if recorded is not None and recorded != arg_env:
+        raise SystemExit(
+            f"--env {arg_env!r} but the run's .run.yaml sidecar says this checkpoint "
+            f"was trained on {recorded!r}. Replaying it on another environment is not "
+            f"the same policy; drop --env to use the recorded one.")
+    return arg_env
+
+
+def spec_for_env(env_name):
+    """The contracting EnvSpec for `env_name`, or None if contracting has no spec.
+
+    None is not an error here: the viewer also replays IPPO/pay-mechanism runs on
+    environments contracting was never implemented for. It only becomes an error once
+    a contract is involved, which is where the message can say what is missing.
+    """
+    from algorithms.MOCA import envs as moca_envs
+
+    try:
+        return moca_envs.spec_for(env_name)
+    except ValueError:
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--env", required=True, help="e.g. clean_up, coop_mining, coin_game, harvest_common_open")
+    parser.add_argument("--env", default=None,
+                        help="e.g. clean_up, harvest_common_open, coin_game, coop_mining. "
+                             "Optional when the checkpoint has a .run.yaml sidecar, which "
+                             "records the environment the run was trained on")
     parser.add_argument("--checkpoint", default=None,
                         help="path to a .pkl saved by save_params(), or a quoted glob matching one "
                              "per-agent .pkl each (PARAMETER_SHARING=False runs); omit for a random policy")
@@ -1462,11 +1679,14 @@ def main():
             raise SystemExit(f"--env-kwarg expects KEY=VALUE, got {kv!r}")
         user_env_kwargs[key] = _parse_env_kwarg_value(raw)
 
+    env_name = resolve_env_name(args.env, args.checkpoint)
+    spec = spec_for_env(env_name)
+
     # Recover the training config from the checkpoint name, then let explicit
     # --env-kwarg / --num_agents win over it (inference is a convenience, not a lock).
     inferred = {}
     if args.checkpoint and not args.no_autoconfig:
-        inferred = _infer_env_kwargs_from_checkpoint(args.checkpoint)
+        inferred = _infer_env_kwargs_from_checkpoint(args.checkpoint, env_name, spec)
         if inferred:
             overridden = sorted(k for k, v in user_env_kwargs.items()
                                 if k in inferred and v != inferred[k])
@@ -1477,13 +1697,19 @@ def main():
         env_kwargs["jit"] = False
     if args.num_agents is not None:
         env_kwargs["num_agents"] = args.num_agents
-    env = socialjax.make(args.env, **env_kwargs)
+    env = socialjax.make(env_name, **env_kwargs)
 
-    _warn_if_fixed_agent_count(env, args.env, args.num_agents)
+    # The panel's vocabulary for this environment, carried on the env because that is
+    # where every panel function already reads its configuration from (and what
+    # _ReplayEnv reconstructs from a recording).
+    env.theta_unit, env.act_header = act_labels(spec)
+
+    _warn_if_fixed_agent_count(env, env_name, args.num_agents)
 
     params = _load_checkpoint(args.checkpoint) if args.checkpoint else None
+    check_action_space(params, env, env_name)
 
-    _report_env_config(env, args.checkpoint)
+    _report_env_config(env, env_name, args.checkpoint)
 
     # MOCA: pick the contract to replay under. The learned proposal distribution is
     # the run's actual result, so its mode is the default -- what the agents ended up
@@ -1493,26 +1719,40 @@ def main():
     bargain_cfg, bargain_params, bargain_rounds = None, None, None
     moca = detect_moca(args.checkpoint) if args.checkpoint else None
     if moca is not None:
-        from algorithms.MOCA.contracts import CleanupContract, contract_for_params
+        from algorithms.MOCA.contracts import contract_for_params, make_contract
         from algorithms.utils import contract_range
+
+        if spec is None:
+            raise SystemExit(
+                f"this is a contracting checkpoint, but {env_name!r} has no contract "
+                f"space (algorithms/MOCA/envs.py lists the ones that do)")
 
         # The bounds decide what every theta below MEANS -- replaying at the wrong
         # ones rescales it through both the contract observation the policy reads
         # and the unsquash of the proposal it emits, so the viewer shows a
         # mechanism that was never trained. Prefer the run's own record.
+        #
+        # The last-resort fallback is the range that environment's config actually
+        # ships: moca_base raised Clean Up's above the paper's (0.2, 1.0 rather than
+        # 0, 0.2) after the negotiated theta pinned to the ceiling, while Harvest and
+        # the Coin Game still run the space their contract class declares.
         c_low, c_high, c_source = contract_range(
-            args.checkpoint, args.contract_low, args.contract_high)
+            args.checkpoint, args.contract_low, args.contract_high,
+            fallback=((0.2, 1.0) if env_name == "clean_up" else spec.contract_range))
 
         # Matched to the checkpoint's own encoding so pre-fix policies (2 contract
         # features, no is_null flag) stay replayable; without a checkpoint there are
         # no weights to read, so fall back to the current space.
         one = params[0] if isinstance(params, list) else params
-        contract = (contract_for_params(one, env.num_agents, c_low, c_high)
+        contract = (contract_for_params(one, env.num_agents, c_low, c_high,
+                                        space=spec.contract_space)
                     if one is not None
-                    else CleanupContract(env.num_agents, c_low, c_high))
+                    else make_contract(spec.contract_space, env.num_agents,
+                                       c_low, c_high))
         mode = moca["mode"]
         print(f"MOCA run detected (PHASE2_MODE={mode})")
-        print(f"  contract space: theta in [{c_low:g}, {c_high:g}] (from {c_source})"
+        print(f"  contract space: {spec.contract_space} -- theta in "
+              f"[{c_low:g}, {c_high:g}] per {env.theta_unit} (from {c_source})"
               + (" (continuous)" if mode != "reinforce" else ""))
         if c_source == "fallback":
             print("    [warning] the run has no .run.yaml sidecar, so this range is a "
@@ -1579,6 +1819,14 @@ def main():
                     hidden=bargain_cfg["hidden"], label=moca["stem"])
             except ValueError as e:
                 raise SystemExit(f"[incompatible checkpoint] {e}")
+            if bargain_cfg["contract_kind"] == "harvest_tax" and env_name != "clean_up":
+                # A tax on harvest income, shared out by CLEANING, has no counterpart
+                # where nobody cleans. check_arm refuses the combination at training
+                # time, so this can only be a mis-attributed sidecar -- and replaying
+                # it would levy a fiction in ordinary-looking units.
+                raise SystemExit(
+                    f"the sidecar records CONTRACT_KIND=harvest_tax, which is a Clean "
+                    f"Up mechanism, but this run is on {env_name!r}")
             if bargain_cfg["contract_kind"] == "harvest_tax":
                 # Same scalar space and the same observation encoding -- only the
                 # transfer differs, so the contract object is swapped rather than
@@ -1617,7 +1865,7 @@ def main():
         # Parallel replay path: the one-shot arms keep `rollout` untouched.
         states, extras = rollout_bargaining(
             env, params, bargain_params, args.steps, args.seed, contract,
-            bargain_cfg, fixed_theta=args.contract_theta)
+            bargain_cfg, spec, fixed_theta=args.contract_theta)
         bargain_rounds = extras["rounds"]
         settled = next((r for r in bargain_rounds if r["accepted"]), None)
         if args.contract_theta is not None:
@@ -1644,20 +1892,21 @@ def main():
             contract_info = {"theta": contract.null, "source": "(no agreement)"}
     else:
         states, extras = rollout(
-            env, params, args.steps, args.seed, contract=contract, theta=theta
+            env, params, args.steps, args.seed, contract=contract, theta=theta,
+            spec=spec,
         )
     print(f"Rolled out {len(states) - 1} steps ({'trained checkpoint' if params else 'random policy'}).")
 
     traces = [_agent_snapshot(s) for s in states]
     t0 = time.time()
     if args.slow_render:
-        frames = render_states(env, args.env, env_kwargs, states, workers=args.render_workers)
+        frames = render_states(env, env_name, env_kwargs, states, workers=args.render_workers)
     else:
         # Vectorised path: one palette lookup + block upscale per frame instead of a
         # Python loop over ~1900 padded tiles (each of which forced a device sync).
         from viz.recording import render_recording
 
-        meta = recording_meta(env, contract_info)
+        meta = recording_meta(env, env_name, contract_info)
         frames = render_recording(
             np.stack([np.array(s.grid) for s in states]),
             np.stack([np.array(s.agent_locs) for s in states]),
@@ -1671,7 +1920,7 @@ def main():
     panel_data = None
     if _panel_supported(states, env):
         panel_data = collect_panel_data(states, env, transfers=extras["transfers"],
-                                        cleaned=extras["cleaned"])
+                                        act=extras["act"], rewards=extras["reward"])
 
     # Record BEFORE the panel is composited: a recording stores world state, not
     # pixels, so it can be re-rendered later at any size or with a different panel.
@@ -1684,7 +1933,7 @@ def main():
             np.stack([np.array(s.grid) for s in states]),
             np.stack([np.array(s.agent_locs) for s in states]),
             panel_data,
-            recording_meta(env, contract_info),
+            recording_meta(env, env_name, contract_info),
         )
         size_kb = Path(args.record).stat().st_size / 1024
         print(f"Recorded {len(states)} steps to {args.record} ({size_kb:.0f} KB) "

@@ -34,12 +34,24 @@ traced rollout:
 | `CONTRACT_KIND=harvest_tax` | a tax on Clean Up harvesting, paid out by recent river cleaning. Not the Harvest environment — see [contracts.md](contracts.md). |
 
 What changes per environment is only what the bargaining state reads: the contracted
-act (cleaning / depleting harvests / theft), the commons (river stock / apple stock /
+act (cleaning / thin-patch eating / theft), the commons (river stock / apple stock /
 own-colour collection) and the scale each is normalised by, all from
 `algorithms/MOCA/envs.py`. The behaviour series are named after the quantity —
-`joint/behaviour/cleaned_per_agent`, `joint/behaviour/depleting_eats_per_agent`,
+`joint/behaviour/cleaned_per_agent`, `joint/behaviour/thin_patch_eats_per_agent`,
 `joint/behaviour/stolen_per_agent` — rather than under a generic slot that would read
 the same everywhere while meaning something different in each.
+
+Each act also has a `_per_episode` series, summed over agents and the whole episode.
+The `_per_agent` one is the raw info field averaged over agents *and* steps, so on
+Harvest it reads as ~0.001 and says almost nothing on its own.
+
+`WANDB_METRIC_SET` picks how much of this is logged: `full` (the default, ~30 series)
+or `core` — the ten a renegotiated run is actually read on, listed with their
+rationale in `joint_core_metrics`. Harvest is set to `core`. Among the ten is
+`contract/in_force_rate_round0`, the fraction of episodes whose **first** segment was
+contracted: on a commons that can be spent inside one segment, the pooled
+`in_force_rate` can look healthy while every contract arrived too late to price
+anything.
 
 ## Why
 

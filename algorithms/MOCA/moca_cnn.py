@@ -279,6 +279,12 @@ JOINT_BARGAIN_METRICS = {
     # Is the mechanism doing anything, and what did it settle on? in_force_rate
     # sitting near zero is the cold-start failure, not a bug -- see _runner.
     "contract_in_force_rate": "contract/in_force_rate",
+    # The FIRST segment specifically. On a depletable commons the pooled rate above
+    # can look healthy while every contract arrived too late to price anything: in
+    # Harvest the orchard can be stripped inside the first segment, after which a
+    # contract on thin-patch eating has nothing left to charge for. The two series
+    # separating is the finding, so both are logged.
+    "contract_in_force_rate_round0": "contract/in_force_rate_round0",
     "theta_agreed": "contract/theta_agreed",
     "theta_offered": "contract/theta_offered",
     # The scalar actually in force, averaged over the segments that had a contract.
@@ -336,7 +342,55 @@ JOINT_BARGAIN_METRICS = {
 }
 
 
-def joint_metric_map(spec) -> dict:
+#: Metric sets a joint bargaining run can log. `full` is every series below;
+#: `core` is the ten that answer the questions a renegotiation run is read for, and
+#: nothing else. Set per environment in the config -- see WANDB_METRIC_SET.
+METRIC_SETS = ("full", "core")
+
+
+def joint_core_metrics(spec) -> Tuple[str, ...]:
+    """The ten series a renegotiated bargaining run is actually read on.
+
+    Chosen to answer five questions and no more, one or two series each:
+
+        did welfare move, and for whom     welfare, equality
+        did the mechanism ever bind        in_force_rate, in_force_rate_round0
+        at what price                      theta_in_force
+        did BEHAVIOUR change               act_per_episode, <act>_share, <act>_gap
+        did the commons survive            <commons>
+        is the run alive                   policy_entropy
+
+    What this drops that is genuinely load-bearing, and is worth switching back to
+    WANDB_METRIC_SET=full to see: `agree/rate` and `agree/round` (speed of
+    agreement -- under `segment` binding in_force_rate carries nearly the same
+    information, under `episode` it does not), `contract/transfer_volume` (how much
+    reward the contract moved, as opposed to whether it bound), `outcome/welfare_null`
+    vs `welfare_contracted` (the welfare half of the split whose behaviour half is
+    kept here), and the `health/` and `cf/` diagnostics.
+
+    Deliberately NOT dropped for being near-zero: a series that reads zero because
+    the mechanism is not working is the series you need most.
+    """
+    core = [
+        "welfare", "equality",
+        "contract_in_force_rate", "contract_in_force_rate_round0",
+        "theta_in_force",
+        "act_per_episode",
+    ]
+    if len(spec.behaviour_metrics) > 1:
+        # Separates "the contract stopped the harm" from "the contract stopped the
+        # activity" -- the numerator alone cannot, and on a depletable commons the
+        # second is the likelier failure.
+        core.append(f"{spec.act_label}_share")
+    core += [
+        f"{spec.act_label}_gap",
+        f"{spec.commons_metric}_mean",
+        "policy_entropy",
+    ]
+    return tuple(core)
+
+
+def joint_metric_map(spec, metric_set: str = "full") -> dict:
     """JOINT_BARGAIN_METRICS with this environment's behaviour block spliced in.
 
     Everything a bargaining run is judged on -- speed of agreement, where theta
@@ -361,6 +415,11 @@ def joint_metric_map(spec) -> dict:
     # agents. That IS the role specialisation the bargaining result is about --
     # cleaners vs harvesters, thieves vs victims -- and pooled means hide it.
     out[f"{spec.contracted_act}_std"] = f"behaviour/{spec.act_label}_spread"
+    # The same act summed over the EPISODE and over agents. `_per_agent` above is the
+    # raw info field's mean over agents AND steps -- a per-agent-per-step rate, which
+    # on Harvest reads as ~0.001 and is nearly unreadable; this is the count you can
+    # hold against "how many apples were on the map to begin with".
+    out["act_per_episode"] = f"behaviour/{spec.act_label}_per_episode"
     out[f"{spec.commons_metric}_mean"] = f"behaviour/{spec.commons_metric}"
     for extra in spec.behaviour_metrics[1:]:
         # The denominator series, where the environment has one: a contract that cut
@@ -385,6 +444,14 @@ def joint_metric_map(spec) -> dict:
     out[f"{spec.act_label}_gap"] = f"behaviour/{spec.act_label}_gap"
     out["welfare_null"] = "outcome/welfare_null"
     out["welfare_contracted"] = "outcome/welfare_contracted"
+    if metric_set == "core":
+        keep = joint_core_metrics(spec)
+        missing = [k for k in keep if k not in out]
+        if missing:
+            raise KeyError(
+                f"core metric set names series this environment does not log: "
+                f"{missing}. Available: {sorted(out)}")
+        out = {k: out[k] for k in keep}
     return out
 
 
@@ -491,12 +558,20 @@ def make_train(config):
     # fails on the config rather than on a missing info key inside a traced rollout.
     spec = envs.spec_for(config["ENV_NAME"])
     envs.check_reward_scale(spec, config.get("ENV_KWARGS", {}))
+    # Which wandb series a joint bargaining run logs. Defaults to `full`, so every
+    # existing run and every existing wandb view is unchanged; the per-environment
+    # config is where `core` gets asked for.
+    config.setdefault("WANDB_METRIC_SET", "full")
+    if config["WANDB_METRIC_SET"] not in METRIC_SETS:
+        raise ValueError(
+            f"WANDB_METRIC_SET must be one of {', '.join(METRIC_SETS)}, got "
+            f"{config['WANDB_METRIC_SET']!r}")
     STAGE1_METRICS = stage1_metrics(spec)
     STAGE2_METRICS = stage2_metrics(spec)
     STAGE2_SOLVER_METRICS = stage2_solver_metrics(spec)
     STAGE2_NEGOTIATE_METRICS = stage2_negotiate_metrics(spec)
     COMBINED_METRICS = combined_metrics(spec)
-    JOINT_METRICS = joint_metric_map(spec)
+    JOINT_METRICS = joint_metric_map(spec, config["WANDB_METRIC_SET"])
     commons_scale = envs.commons_scale(spec, env)
 
     if config["PARAMETER_SHARING"]:
@@ -2575,6 +2650,10 @@ def make_train(config):
             out["disagreement_steps"] = agree_round.mean() * config["BARGAIN_SEGMENT"]
             in_force = rounds["theta_eff"] > contract.null
             out["contract_in_force_rate"] = in_force.mean()
+            # Round 0 alone. Not derivable from the pooled rate, and on a commons
+            # that can be spent inside one segment it is the one that decides whether
+            # the mechanism ever had anything to price.
+            out["contract_in_force_rate_round0"] = in_force[0].mean()
             if binding == "episode":
                 # theta actually agreed, averaged over the envs that agreed at all.
                 agreed_theta = jnp.sum(
@@ -2596,6 +2675,10 @@ def make_train(config):
             # under clean_wage, where no pot exists.
             steps = float(config["BARGAIN_ROUNDS"] * config["BARGAIN_SEGMENT"])
             out["tax_revenue"] = rounds["tax_pot"].sum() / (steps * config["NUM_ENVS"])
+            # The contracted act per episode: seg_act is already summed over the
+            # segment's steps and over agents, so summing the rounds gives one
+            # episode's total and the mean is over envs.
+            out["act_per_episode"] = rounds["seg_act"].sum(axis=0).mean()
             cells_per_step = stacked[spec.contracted_act].mean() * num_agents
             out["tax_wage"] = out["tax_revenue"] / jnp.maximum(cells_per_step, 1e-6)
             # Masked by `active`: agents still emit an offer in rounds after

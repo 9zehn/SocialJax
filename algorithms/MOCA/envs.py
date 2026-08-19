@@ -95,7 +95,12 @@ ENV_SPECS: Dict[str, EnvSpec] = {
         behaviour_metrics=("low_density_eaten", "eaten_apples"),
         commons_metric="apple_stock",
         progress_metric="shaped_rewards",
-        act_label="depleting_eats",
+        # "thin_patch_eats", not "depleting_eats": the series counts a specific,
+        # checkable event -- ate an apple that had fewer than `low_density_threshold`
+        # apples in the 21 cells around it -- and "depleting" named a consequence
+        # instead, which invited reading it as "apples removed from the commons"
+        # (that is `eaten_apples`).
+        act_label="thin_patch_eats",
     ),
     "coin_game": EnvSpec(
         env_name="coin_game",
@@ -117,6 +122,26 @@ ENV_SPECS: Dict[str, EnvSpec] = {
         progress_metric="original_rewards",
         act_label="stolen",
     ),
+    "coin_game_n": EnvSpec(
+        env_name="coin_game_n",
+        contract_space="coin_game",
+        # Seven, to sit alongside Clean Up and Harvest. The two-player `coin_game`
+        # stays registered and is NOT superseded: with one responder its bargaining
+        # arm is literal Rubinstein alternating offers, the only place in this project
+        # where the protocol matches the theory exactly rather than approximating it.
+        num_agents=7,
+        reward_scale_kwarg="coin_reward",
+        behaviour_metrics=("stolen_by_agent", "coins_taken"),
+        # A real grid-wide stock, uniform across agents -- unlike `coin_game`, whose
+        # eat_own_coins is genuinely per-agent and is therefore read as agent 0's
+        # value alone by the bargaining rollout.
+        commons_metric="coins_on_grid",
+        # Per-agent either way here (coin_game_n's shaped_rewards is not the summed
+        # broadcast the two-player env logs), but kept as original_rewards so the two
+        # coin environments report the same series.
+        progress_metric="original_rewards",
+        act_label="stolen",
+    ),
 }
 
 #: Bargaining protocols available per environment. `alternating` -- one proposer, a
@@ -129,6 +154,7 @@ BARGAIN_PROTOCOLS_BY_ENV = {
     "clean_up": ("alternating", "median"),
     "harvest_common_open": ("alternating",),
     "coin_game": ("alternating",),
+    "coin_game_n": ("alternating",),
 }
 
 
@@ -145,6 +171,10 @@ def commons_scale(spec: EnvSpec, env) -> float:
         return float(env.GRID_SIZE_ROW * env.GRID_SIZE_COL)
     if spec.env_name == "harvest_common_open":
         return float(len(env.SPAWNS_APPLE))
+    if spec.env_name == "coin_game_n":
+        # Coins on the grid IS a stock here, so it scales like the other two: every
+        # spawn cell holding a coin at once.
+        return float(len(env.SPAWNS_COIN))
     return 1.0
 
 

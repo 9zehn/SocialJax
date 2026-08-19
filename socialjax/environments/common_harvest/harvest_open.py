@@ -47,6 +47,13 @@ class EnvParams:
     freeze_penalty: int
 
 class Actions(IntEnum):
+    """Every action the environment CAN offer, in the order the policy indexes them.
+
+    `zap_forward` is deliberately last so that dropping it (enable_zap=False, the
+    default) shortens the action space to 0..6 without renumbering anything else --
+    a policy trained with the beam and one trained without still mean the same thing
+    by action 3. See Harvest_open.__init__ for why it is off by default.
+    """
     turn_left = 0
     turn_right = 1
     left = 2
@@ -209,6 +216,21 @@ class Harvest_open(MultiAgentEnv):
         # would silently redefine which harvesting is charged for.
         low_density_radius=5,
         low_density_threshold=4,
+        # The zap beam: an agent can freeze another for `freeze_penalty` steps.
+        # OFF by default, which departs from upstream SocialJax.
+        #
+        # Harvest's dilemma is depletion -- eating the last apples of a patch, which
+        # is what the formal contract prices. The beam adds a second, unpriced
+        # channel through which agents affect each other, and a policy can suppress
+        # a rival's harvesting with it instead of by contract. That makes the
+        # contract's measured effect a lower bound on nothing in particular: welfare
+        # can move because the mechanism worked or because the beam happened to
+        # redistribute access, and no logged series separates them.
+        #
+        # Set enable_zap=True to recover upstream behaviour. It changes the ACTION
+        # SPACE (8 vs 7), so a checkpoint trained one way will not load the other --
+        # which is deliberate: it is a different game, not a different setting.
+        enable_zap=False,
         grid_size=(16,22),
         jit=True,
         obs_size=11,
@@ -271,6 +293,10 @@ class Harvest_open(MultiAgentEnv):
         self.apple_reward = float(num_agents if apple_reward is None else apple_reward)
         self.low_density_radius = int(low_density_radius)
         self.low_density_threshold = int(low_density_threshold)
+        self.enable_zap = bool(enable_zap)
+        # The actions actually offered. Sliced rather than filtered so the remaining
+        # actions keep their indices -- see the Actions docstring.
+        self._num_actions = len(Actions) if self.enable_zap else len(Actions) - 1
 
         # Offsets of the low-density neighbourhood, precomputed once. `R` is the
         # largest offset that can satisfy j**2 + k**2 <= low_density_radius, so the
@@ -965,6 +991,12 @@ class Harvest_open(MultiAgentEnv):
                 and index 3 is the new freeze penalty matrix.
             '''
             # if interact
+            #
+            # With enable_zap=False no policy can emit the action, so this would be
+            # all-False anyway -- but a hand-written action list, a test fixture or a
+            # replay at the wrong action space could still smuggle a 7 in here, and
+            # it would fire the beam in a run whose whole point is that there is no
+            # beam. The flag closes that off at the source.
             zaps = jnp.isin(actions,
                 jnp.array(
                     [
@@ -972,7 +1004,7 @@ class Harvest_open(MultiAgentEnv):
                         # Actions.zap_ahead
                     ]
                 )
-            )
+            ) & self.enable_zap
 
             interact_idx = jnp.int16(Items.interact)
 
@@ -1718,14 +1750,14 @@ class Harvest_open(MultiAgentEnv):
 
     @property
     def num_actions(self) -> int:
-        """Number of actions possible in environment."""
-        return len(Actions)
+        """Number of actions possible in environment (7, or 8 with the zap beam)."""
+        return self._num_actions
 
     def action_space(
         self, agent_id: Union[int, None] = None
     ) -> spaces.Discrete:
         """Action space of the environment."""
-        return spaces.Discrete(len(Actions))
+        return spaces.Discrete(self._num_actions)
 
     def observation_space(self) -> spaces.Dict:
         """Observation space of the environment."""

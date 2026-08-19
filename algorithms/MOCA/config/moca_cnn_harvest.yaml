@@ -37,6 +37,12 @@ defaults:
 "CONTRACT_LOW": 0.0
 "CONTRACT_HIGH": 10.0
 
+# Log the ten series a renegotiated run is read on rather than all thirty. See
+# joint_core_metrics in moca_cnn.py for what they are and, more importantly, for
+# what this drops -- speed of agreement, transfer volume and the welfare half of
+# the null/contracted split. Set WANDB_METRIC_SET=full to get them back.
+"WANDB_METRIC_SET": "core"
+
 "ENV_KWARGS":
   "num_agents": 7
   "num_inner_steps": 1000
@@ -52,3 +58,10 @@ defaults:
   # harvest_open.py for why it is kept literal rather than "corrected".
   "low_density_radius": 5
   "low_density_threshold": 4
+  # No zap beam. Set explicitly rather than left to the env default so it lands in
+  # the checkpoint stem (_nozap) and the .run.yaml sidecar: with and without the
+  # beam are different games and must not share a path. See harvest_open.py for why
+  # it is off -- the beam is a second, unpriced channel for one agent to suppress
+  # another's harvesting, and no logged series separates its effect from the
+  # contract's.
+  "enable_zap": False

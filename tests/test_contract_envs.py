@@ -617,6 +617,131 @@ def test_contracts_move_reward_but_never_create_it_in_a_real_rollout():
         assert moved > 0, f"{env_name}: the contract never moved anything at theta=max"
 
 
+# ---------------------------------------------------------------- viewer
+
+def _fake_bargain_run(tmp, env_name, n=3, segment=20):
+    """A renegotiated bargaining checkpoint set for `env_name`, sidecar included.
+
+    Random weights: what is under test is the replay PLUMBING -- which info field is
+    read, which contract space is built, which scales the bargaining features use --
+    not what a trained policy would do with it.
+    """
+    import optax
+    from flax.training.train_state import TrainState
+
+    from algorithms.MOCA import bargain
+    from algorithms.MOCA.networks import BargainingActorCritic, ContractActorCritic
+    from algorithms.utils.io_utils import (checkpoint_filename, save_params,
+                                           save_run_config)
+
+    spec = envs.spec_for(env_name)
+    n = min(n, spec.num_agents)
+    low, high = spec.contract_range
+    config = {
+        "ENV_NAME": env_name, "SEED": 42, "REWARD": "individual",
+        "CONTRACT_SPACE": spec.contract_space,
+        "CONTRACT_LOW": low, "CONTRACT_HIGH": high,
+        "PHASE2_MODE": "bargain", "TRAINING_MODE": "joint",
+        "BARGAIN_SEGMENT": segment, "BARGAIN_BINDING": "segment",
+        "BARGAIN_PROTOCOL": "alternating", "BARGAIN_PROPOSER": "rotate",
+        "BARGAIN_QUORUM": "all", "BARGAIN_FEATURES": "private",
+        "BARGAIN_ROTATE_START": "random", "BARGAIN_HIDDEN": 64,
+        "BARGAIN_ACCEPT_BIAS": 1.0,
+        "ENV_KWARGS": {"num_agents": n, "num_inner_steps": 4 * segment, "cnn": True,
+                       "jit": True, spec.reward_scale_kwarg: 1.0,
+                       "shared_rewards": False},
+    }
+    stem = str(Path(tmp) / checkpoint_filename(config))
+
+    env = socialjax.make(env_name, **config["ENV_KWARGS"])
+    obs, _ = env.reset(jax.random.PRNGKey(0))
+    contract = make_contract(spec.contract_space, n, low, high)
+    play = ContractActorCritic(action_dim=env.action_space().n, activation="relu")
+    bnet = BargainingActorCritic(hidden=64, activation="relu", accept_bias=1.0)
+    feats = bargain.bargaining_features(
+        0, 4, jnp.array([0]), n, jnp.zeros((1,)), jnp.zeros((1,)),
+        jnp.zeros((1,), jnp.int32), jnp.zeros((1,)), jnp.zeros((1,)),
+        jnp.zeros((n, 1)), jnp.zeros((1,)), jnp.zeros((n, 1)), jnp.zeros((n, 1)),
+        jnp.zeros((1,)), bargain.feature_mask("private", n))
+    tx = optax.adam(1e-3)
+    for i in range(n):
+        p = play.init(jax.random.PRNGKey(i), jnp.zeros((1,) + obs[env.agents[0]].shape),
+                      jnp.zeros((1, contract.obs_dim)))
+        save_params(TrainState.create(apply_fn=play.apply, params=p, tx=tx),
+                    f"{stem}_{i}.pkl")
+        bp = bnet.init(jax.random.PRNGKey(100 + i), feats[i])
+        save_params(TrainState.create(apply_fn=bnet.apply, params=bp, tx=tx),
+                    f"{stem}_contract_{i}.pkl")
+    save_run_config(config, stem)
+    return f"{stem}_[0-9].pkl", env, config
+
+
+def test_viewer_replays_a_renegotiated_run_on_every_environment():
+    """The viewer's bargaining replay must not be Clean Up-only.
+
+    It reads the contracted act, the commons stock and the commons scale out of the
+    environment on every step, and those are `cleaned_by_agent` / `waste_cleared` /
+    a grid area on exactly one of the three. On the others, Clean Up's names are a
+    KeyError -- which is the good case; the one to fear is a replay that runs and
+    prices the wrong act.
+    """
+    import tempfile
+
+    from viz.interactive_viewer import (detect_moca, infer_bargain_config,
+                                        rollout_bargaining, spec_for_env)
+    from algorithms.utils.io_utils import load_params
+
+    for env_name in envs.ENV_SPECS:
+        with tempfile.TemporaryDirectory() as tmp:
+            pattern, env, config = _fake_bargain_run(tmp, env_name)
+            spec = spec_for_env(env_name)
+            n = config["ENV_KWARGS"]["num_agents"]
+            low, high = spec.contract_range
+            contract = make_contract(spec.contract_space, n, low, high)
+            moca = detect_moca(pattern)
+            assert moca is not None and moca["mode"] == "bargain", (env_name, moca)
+            cfg = infer_bargain_config(moca["stem"], checkpoint=pattern)
+            assert cfg["binding"] == "segment", f"{env_name}: {cfg['binding']}"
+            assert cfg["binding_source"] == "sidecar", env_name
+
+            play = [load_params(p) for p in sorted(
+                p for p in __import__("glob").glob(pattern))]
+            bp = [load_params(p) for p in moca["contract_paths"]]
+            steps = 3 * config["BARGAIN_SEGMENT"]
+            # theta at the ceiling, so the transfer cannot be zero by construction.
+            states, extras = rollout_bargaining(
+                env, play, bp, steps, 0, contract, cfg, spec, fixed_theta=high)
+
+            assert len(states) == steps + 1, (env_name, len(states))
+            for key in ("transfers", "act", "reward", "rounds"):
+                assert key in extras, (env_name, key)
+            tr = np.stack(extras["transfers"])
+            act = np.stack(extras["act"])
+            assert np.abs(tr.sum(axis=-1)).max() < 1e-3, \
+                f"{env_name}: transfers are not zero-sum"
+            # The act is the one the contract prices, so the money moved is theta
+            # times it -- the check that the replay redistributes on the right series
+            # rather than merely on some series.
+            assert np.isclose(np.maximum(tr, 0.0).sum(), high * act.sum(), rtol=1e-4), \
+                (env_name, np.maximum(tr, 0.0).sum(), high * act.sum())
+
+
+def test_viewer_panel_labels_name_the_environments_own_act():
+    """A panel that says "Clean" on Harvest is a wrong label on a real number: the
+    column is thin-patch eating, which is a harm the contract FINES rather than a
+    public good it subsidises."""
+    from viz.interactive_viewer import act_labels
+
+    seen = set()
+    for env_name, spec in envs.ENV_SPECS.items():
+        unit, header = act_labels(spec)
+        assert unit and header, env_name
+        assert len(header) <= 8, f"{env_name}: {header!r} collides with the Reward column"
+        seen.add((unit, header))
+    assert len(seen) == len(envs.ENV_SPECS), f"labels are not distinct: {seen}"
+    assert act_labels(None) == ("unit", "Act"), "envs without a spec still need a label"
+
+
 ALL_TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--child":

@@ -18,17 +18,34 @@ import json
 
 import numpy as np
 
-RECORDING_VERSION = 1
+# 2: the panel's per-step act count stopped being "cells cleaned" and became the
+# contracted act of whichever environment ran, so a v1 file's `panel_clean` array
+# would be read under a column header it does not belong to.
+RECORDING_VERSION = 2
 
 # Colours copied from Clean_up.render_tile so recordings look like the env's own
-# renderer. Keyed by the Items enum values in clean_up.py.
+# renderer. Keyed by the Items enum values in clean_up.py -- which the other two
+# environments' enums are a PREFIX of (empty/wall/interact/apple/spawn/inside_spawn),
+# so the same table serves them and their unused codes simply never appear.
+# The ground colour differs per env and travels in the recording's metadata.
 _BACKGROUND = (190, 170, 120)
+
+#: Ground colour per environment, as each one's own render_tile fills a blank tile.
+#: Codes absent from _ITEM_COLOURS (apple ground, spawn points, empty) take this, so
+#: it has to be the recording env's rather than Clean Up's or a Harvest frame comes
+#: out on Clean Up's sand.
+BACKGROUNDS = {
+    "clean_up": (190, 170, 120),
+    "harvest_common_open": (210, 190, 140),
+    "coin_game": (70, 55, 40),
+}
+
+#: Item codes that are drawn as something OTHER than bare ground. Codes shared by
+#: every env (wall, interact) plus Clean Up's river/dirt tiers, which simply never
+#: appear in a recording from an env whose enum stops at 5.
 _ITEM_COLOURS = {
     1: (127, 127, 127),    # wall
     2: (188, 189, 34),     # interact / zap beam
-    3: _BACKGROUND,        # apple -- drawn as a circle on the background, see below
-    4: _BACKGROUND,        # spawn point
-    5: _BACKGROUND,        # inside spawn point
     6: (40, 80, 214),      # river
     7: (40, 80, 214),      # potential dirt
     8: (40, 80, 80),       # dirt
@@ -53,7 +70,7 @@ def save_recording(path, grids, agent_locs, panel_data, meta):
         "meta": np.array(json.dumps(meta)),
     }
     if panel_data:
-        for key in ("balance", "clean", "transfer", "share"):
+        for key in ("balance", "act", "transfer", "share"):
             if key in panel_data[0]:
                 arrays[f"panel_{key}"] = np.stack(
                     [np.asarray(d[key]) for d in panel_data]
@@ -144,16 +161,19 @@ def render_recording(grids, agent_locs, meta, tile_size=32):
     padding = meta["padding"]
     colours = [tuple(c) for c in meta["player_colours"]]
     n_agents = len(colours)
+    background = tuple(meta.get("background", _BACKGROUND))
 
     # Palette: item codes, then one entry per agent id (agents are drawn as sprites on
-    # the background, so their palette entry is just the ground colour).
+    # the background, so their palette entry is just the ground colour). n_items is
+    # the recording env's OWN item count -- an env with fewer items numbers its agents
+    # lower, and using another env's count would paint agent cells as terrain.
     max_code = n_items + n_agents
     palette = np.zeros((max_code + 1, 3), dtype=np.uint8)
-    palette[:] = _BACKGROUND
+    palette[:] = background
     for code, col in _ITEM_COLOURS.items():
-        if code <= max_code:
+        if code < n_items:
             palette[code] = col
-    palette[0] = _BACKGROUND
+    palette[0] = background
 
     tri = np.stack([_triangle_mask(tile_size, d) for d in range(4)])
     circ = _circle_mask(tile_size)
