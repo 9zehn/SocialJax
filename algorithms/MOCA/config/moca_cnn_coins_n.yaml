@@ -1,0 +1,49 @@
+# MOCA / formal contracting on the N-player Coin Game (socialjax "coin_game_n").
+#
+# Contract space (contracts.CoinGameContract, unchanged): theta per coin taken of
+# another agent's colour, paid to the agent whose colour it was. The space needed no
+# change to run at seven agents -- its transfer theta * (stolen_from - stolen_by) is
+# zero-sum for any N, and it routes payment to the VICTIM rather than splitting it
+# evenly, which is the rule that keeps meaning what it means once there is more than
+# one possible victim.
+#
+# THE AUTHORS DEFINE NO COIN GAME CONTRACT. Report this space as constructed to their
+# design rules, not transcribed -- the same caveat as the two-player environment.
+defaults:
+  - moca_base
+  - _self_
+  - reward: individual   # contracts assume an intact individual-reward dilemma
+  #   arm=moca          MOCA, Algorithm 1 (the default; changes nothing)
+  #   arm=vanilla       single-stage contracting, no phase split
+  #   arm=renegotiate   alternating offers, renegotiated every segment
+  #   arm=episode_lock  alternating offers, first carried offer binds the episode
+  - arm: moca
+
+"ENV_NAME": "coin_game_n"
+"CONTRACT_SPACE": "coin_game"
+
+# Set by the payoff matrix, not tuned, and INDEPENDENT OF N: a coin is worth +1 to
+# whoever takes it and -2 to its owner however many agents there are, so theta = 1 is
+# still where stealing stops paying and theta = 2 where the owner is made whole.
+# Above 2 the contract over-compensates and pays agents to be robbed.
+"CONTRACT_LOW": 0.0
+"CONTRACT_HIGH": 2.0
+
+"ENV_KWARGS":
+  "num_agents": 7
+  "num_inner_steps": 1000
+  "cnn": True
+  "jit": True
+  # Play the payoff matrix as written (+1 / -2). The env defaults this to num_agents,
+  # which would scale every payoff by 7 and make the contract range 7x too weak.
+  "coin_reward": 1.0
+  # One pass per step over the 525 spawn cells, owner drawn uniformly. Chosen so
+  # per-agent income under full cooperation matches the two-player game rather than
+  # by tuning -- see the environment's docstring for the arithmetic.
+  "regrow_rate": 0.0012
+
+# nu and the quorum both take their normal values here: with seven agents there are
+# six non-proposers, so the reference's "sample 2 above 3 agents" rule applies and
+# unanimity is a real constraint. This is the axis on which coin_game_n differs from
+# coin_game as a BARGAINING environment -- the two-player game degenerates to a
+# single counterparty, which is exactly why both stay registered.

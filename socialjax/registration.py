@@ -5,6 +5,7 @@ from socialjax.environments import (
     Clean_up,
     CoopMining,
     CoinGame,
+    CoinGameN,
     Mushrooms,
     Gift,
     PD_Arena,
@@ -15,6 +16,7 @@ from socialjax.environments import (
 REGISTERED_ENVS = [
     # Social dilemma environments
     "coin_game",
+    "coin_game_n",
     "harvest_common_open",
     # "harvest_common_closed",
     "clean_up",
@@ -46,6 +48,8 @@ def make(env_id: str, **env_kwargs):
         env = PD_Arena(**env_kwargs)
     elif env_id == "coin_game":
         env = CoinGame(**env_kwargs)
+    elif env_id == "coin_game_n":
+        env = CoinGameN(**env_kwargs)
     elif env_id == "mushrooms":
         env = Mushrooms(**env_kwargs)
     elif env_id == "gift":

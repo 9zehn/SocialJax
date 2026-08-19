@@ -1,0 +1,17 @@
+# Centralised joint control on the N-player Coin Game -- the welfare ceiling.
+defaults:
+  - joint_base
+  - _self_
+
+"ENV_NAME": "coin_game_n"
+# Not a config group. The controller is paid the SUM of individual rewards, which is
+# the welfare objective; reward=common would pay each agent that sum already.
+"REWARD": "individual"
+
+"ENV_KWARGS":
+  "num_agents": 7
+  "num_inner_steps": 1000
+  "cnn": True
+  "jit": True
+  "coin_reward": 1.0
+  "regrow_rate": 0.0012
