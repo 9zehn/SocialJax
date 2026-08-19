@@ -793,11 +793,29 @@ def _render_bargain_log(draw, x0, y0, x1, y1, rounds, colors, width, n):
 
     y += int(head_f.size * 2.0)
     avail = y1 - y
-    row_h = min(int(cell_f.size * 1.8), max(1, int(avail / max(len(rounds), 1))))
+    # Floored at the text height. Dividing the space by the round count alone sends
+    # the row height to a couple of pixels at short segment lengths (seg25 over 1000
+    # steps is 40 rounds), which does not fit more rows -- it draws them on top of
+    # each other. Past the floor the log keeps the MOST RECENT rounds instead, since
+    # under renegotiation the live bargain is the one worth reading; the earlier ones
+    # are counted in a line above.
+    row_h = max(int(cell_f.size * 1.35),
+                min(int(cell_f.size * 1.8),
+                    max(1, int(avail / max(len(rounds), 1)))))
     dot = max(6, int(row_h * 0.42))
     # Vote dots sit in a fixed-width strip on the right so rows stay aligned.
     strip_w = (dot + 3) * n
     x_dots = x1 - strip_w - int(width * 0.09)
+
+    n_fit = max(1, int(avail // row_h))
+    if len(rounds) > n_fit:
+        # One row goes to the "N earlier" marker, so the rest can show.
+        dropped = len(rounds) - (n_fit - 1)
+        draw.text((x0, y), f"+{dropped} earlier round"
+                  + ("s" if dropped != 1 else ""),
+                  font=head_f, fill=_PANEL_MUTED)
+        y += row_h
+        rounds = rounds[dropped:]
 
     for k, rec in enumerate(rounds):
         ry = y + row_h * k
