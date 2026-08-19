@@ -308,6 +308,33 @@ class Harvest_open(MultiAgentEnv):
             (_js ** 2 + _ks ** 2) <= self.low_density_radius, dtype=jnp.float32
         )
 
+        # The neighbourhood REGROWTH actually reads, which is not the one above.
+        # `count_apple` in _step counts these 12 offsets -- the centre excluded, and
+        # without the (+-2,+-1)/(+-1,+-2) ring that j**2+k**2 <= 5 includes -- and
+        # the respawn probability is 0 / 0.001 / 0.005 / 0.025 for 0 / 1 / 2 / >=3 of
+        # them, i.e. monotone and saturating at 3, with 0 absorbing.
+        #
+        # So the quantity the contract prices (21 cells) and the quantity that drives
+        # growth (12 cells) are different numbers on the same map. This mask is the
+        # second one, emitted per agent as info["regrow_ring_density"] so a contract
+        # can condition on what the commons actually responds to.
+        #
+        # Transcribed from count_apple's offsets. It differs from count_apple only at
+        # the grid boundary: this treats off-grid as "no apple" (the padded window
+        # below), while count_apple's hand-written guards test the wrong axis for the
+        # (+1,-1) offset. That is a slip rather than a reference quirk, so it is not
+        # reproduced -- but it means the two can disagree by one on an edge cell.
+        _REGROW_OFFSETS = ((-1, 0), (1, 0), (0, -1), (0, 1),
+                           (-2, 0), (2, 0), (0, -2), (0, 2),
+                           (-1, -1), (-1, 1), (1, -1), (1, 1))
+        _ring = onp.zeros((2 * _R + 1, 2 * _R + 1), dtype=onp.float32)
+        for _dj, _dk in _REGROW_OFFSETS:
+            _ring[_dj + _R, _dk + _R] = 1.0
+        self.REGROW_RING_MASK = jnp.asarray(_ring)
+        #: Largest value info["regrow_ring_density"] can take, so a contract that
+        #: bargains a threshold against it has a stated range rather than a guess.
+        self.REGROW_RING_CELLS = len(_REGROW_OFFSETS)
+
         GRID = jnp.zeros(
             (self.GRID_SIZE_ROW + 2 * self.PADDING, self.GRID_SIZE_COL + 2 * self.PADDING),
             dtype=jnp.int16,
@@ -1417,7 +1444,19 @@ class Harvest_open(MultiAgentEnv):
                 )
                 return jnp.sum(patch * self.LOCAL_APPLE_MASK)
 
+            def regrow_ring(p: jnp.ndarray) -> jnp.ndarray:
+                patch = jax.lax.dynamic_slice(
+                    apple_grid, (p[0], p[1]), (win, win)
+                )
+                return jnp.sum(patch * self.REGROW_RING_MASK)
+
             local_apple_count = jax.vmap(local_apples)(new_locs[:, :2])   # (N,)
+            # Same window, the regrowth rule's mask. Measured on the same
+            # pre-consumption grid as local_apple_count; the eaten cell is not in its
+            # own ring, so eating does not change this number for the eater -- what it
+            # changes is the ring of each of the 12 cells AROUND it, every one of
+            # which loses a neighbour.
+            regrow_ring_count = jax.vmap(regrow_ring)(new_locs[:, :2])    # (N,)
             ate_apple = apple_matches.squeeze(-1).astype(jnp.float32)     # (N,)
             # The contract signal: ate an apple where the neighbourhood was already
             # thin. An INDICATOR, not a count, exactly as the reference charges a
@@ -1605,6 +1644,11 @@ class Harvest_open(MultiAgentEnv):
             info["low_density_eaten"] = jnp.float32(low_density_eaten).squeeze()
             info["eaten_apples"] = jnp.float32(ate_apple).squeeze()
             info["local_apple_density"] = jnp.float32(local_apple_count).squeeze()
+            #   regrow_ring_density  apples in the 12 cells the REGROWTH rule counts
+            #                        around this agent's cell, 0..12. Emitted every
+            #                        step for every agent, whether or not it ate, so
+            #                        a contract can pair it with eaten_apples.
+            info["regrow_ring_density"] = jnp.float32(regrow_ring_count).squeeze()
             # Grid-wide apple stock, per agent, so it survives the per-agent info
             # slicing the training loops do. The Harvest analogue of clean_up's
             # "waste_cleared": the commons stock a contract is meant to protect.

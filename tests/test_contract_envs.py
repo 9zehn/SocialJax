@@ -804,6 +804,143 @@ def test_evaluator_words_every_environments_act_and_its_direction():
         f"{set(ACT_WORDS) - set(envs.ENV_SPECS)}")
 
 
+# ------------------------------------------- harvest with a bargained threshold
+
+def test_regrow_ring_density_is_the_regrowth_rules_own_count():
+    """The contract that bargains a density threshold prices the neighbourhood
+    REGROWTH reads, which is not the 21-cell mask the published contract uses.
+
+    Getting this wrong is the whole experiment: if the threshold were compared
+    against a count the commons does not respond to, no value of it could protect
+    regrowth and a null result would say nothing about the mechanism.
+    """
+    env = socialjax.make("harvest_common_open", num_agents=3, num_inner_steps=20,
+                         cnn=True, jit=True, apple_reward=1.0)
+    R, ROW, COL = env.LOCAL_APPLE_R, env.GRID_SIZE_ROW, env.GRID_SIZE_COL
+    mask = np.array(env.REGROW_RING_MASK)
+    assert env.REGROW_RING_CELLS == 12, env.REGROW_RING_CELLS
+    assert mask.sum() == 12 and mask[R, R] == 0, "the centre is not in its own ring"
+
+    # Every offset count_apple sums, transcribed. The env's own guards test the
+    # wrong axis on one of them, so agreement is asserted off the boundary.
+    offsets = ((-1, 0), (1, 0), (0, -1), (0, 1), (-2, 0), (2, 0), (0, -2), (0, 2),
+               (-1, -1), (-1, 1), (1, -1), (1, 1))
+    rng = np.random.default_rng(0)
+    grid = (rng.random((ROW, COL)) < 0.35).astype(np.float32)
+    padded = np.pad(grid, R)
+    for r in range(2, ROW - 2):
+        for c in range(2, COL - 2):
+            via_mask = float((padded[r:r + 2 * R + 1, c:c + 2 * R + 1] * mask).sum())
+            direct = float(sum(grid[r + dr, c + dc] for dr, dc in offsets))
+            assert via_mask == direct, (r, c, via_mask, direct)
+
+    # ...and it actually reaches the info dict, per agent, every step.
+    key = jax.random.PRNGKey(0)
+    _, state = env.reset(key)
+    _, _, _, _, info = env.step_env(key, state, [0, 0, 0])
+    ring = np.array(info["regrow_ring_density"]).reshape(-1)
+    assert ring.shape == (3,), ring.shape
+    assert ((ring >= 0) & (ring <= 12)).all(), ring
+
+
+def test_density_contract_charges_only_below_the_bargained_threshold():
+    """k is what decides which harvests are depletion, so the whole range has to
+    mean something: inert at the bottom, a flat tax at the top, and the regrowth
+    cliff reachable in between."""
+    from algorithms.MOCA.contracts import HarvestDensityContract
+
+    n = 7
+    c = make_contract("harvest_density", n, 0.0, 10.0)
+    assert c.PARAM_DIM == 2 and c.obs_dim == 4
+    assert isinstance(c, HarvestDensityContract)
+    assert c.density_low == 0.0 and c.density_high == 13.0, "0..12 plus 'always'"
+
+    # Two eaters: one in a thin ring (2 apples), one in a thick one (8).
+    ate = np.zeros(n, np.float32); ate[0] = ate[1] = 1.0
+    ring = np.zeros(n, np.float32); ring[0], ring[1] = 2.0, 8.0
+    info = {"eaten_apples": jnp.asarray(ate),
+            "regrow_ring_density": jnp.asarray(ring)}
+    charged_at = {}
+    for k in (0.0, 3.0, 9.0, 13.0):
+        p = jnp.array([10.0, k])
+        t = np.asarray(c.transfer_from_info(p, info))
+        assert abs(t.sum()) < 1e-4, (k, t.sum())          # zero-sum at every k
+        charged_at[k] = sorted(np.flatnonzero(np.asarray(c.act_from_info(p, info))))
+        # A charged agent is a net PAYER: this space prices a harm.
+        for i in charged_at[k]:
+            assert t[i] < 0, (k, i, t[i])
+    assert charged_at[0.0] == [], "k=0 must be inert -- no ring count is below 0"
+    assert charged_at[3.0] == [0], "only the thin-ring eater at the regrowth cliff"
+    assert charged_at[9.0] == [0, 1]
+    assert charged_at[13.0] == [0, 1], "k=13 charges every harvest"
+
+    # The null contract moves nothing whatever k says, because k alone is not a
+    # contract -- and the acceptance rules all measure against that disagreement
+    # point.
+    for k in (0.0, 6.0, 13.0):
+        p = jnp.array([0.0, k])
+        assert bool(c.is_null(p)), k
+        assert np.abs(np.asarray(c.transfer_from_info(p, info))).max() == 0.0, k
+
+
+def test_density_contract_observation_separates_null_from_every_threshold():
+    """Same argument as the scalar spaces' is_null flag: the null contract must not
+    encode as a point on the theta ramp, and a threshold attached to a zero fine is
+    not a fact about the episode."""
+    c = make_contract("harvest_density", 7, 0.0, 10.0)
+    obs = {p: np.asarray(c.to_obs(jnp.array(list(p))))
+           for p in ((0.0, 0.0), (0.0, 13.0), (10.0, 0.0), (10.0, 13.0), (5.0, 6.5))}
+    assert obs[(0.0, 0.0)].shape == (4,)
+    # Every null contract encodes identically, whatever k rode along with it.
+    assert np.allclose(obs[(0.0, 0.0)], obs[(0.0, 13.0)])
+    assert obs[(0.0, 0.0)][2] == 1.0 and obs[(10.0, 0.0)][2] == -1.0
+    # No input encodes as the zero vector -- the degeneracy is_null exists to kill.
+    for p, v in obs.items():
+        assert np.abs(v).max() > 0, p
+    # Both components span [-1, 1] over their own range.
+    assert np.allclose(obs[(10.0, 0.0)][:2], [1.0, -1.0])
+    assert np.allclose(obs[(10.0, 13.0)][:2], [1.0, 1.0])
+
+
+def test_density_contract_refuses_the_arms_that_cannot_express_it():
+    """PHASE2_MODE=reinforce learns a categorical over a 1-D grid. Silently handing
+    it component 0 would train a mechanism nobody asked for."""
+    c = make_contract("harvest_density", 7, 0.0, 10.0)
+    try:
+        c.grid(11)
+    except NotImplementedError as e:
+        assert "2-D" in str(e) or "grid" in str(e)
+    else:
+        raise AssertionError("a 2-D contract must not produce a 1-D grid")
+
+
+def test_density_proposal_head_widens_without_touching_the_scalar_one():
+    """param_dim=1 has to stay bit-for-bit the network every existing bargaining
+    checkpoint was trained with, or the 2-D space costs the 1-D runs their weights."""
+    import jax as _jax
+    from algorithms.MOCA import bargain
+    from algorithms.MOCA.networks import BargainingActorCritic
+
+    n = 7
+    feats = bargain.bargaining_features(
+        0, 4, jnp.array([0]), n, jnp.zeros((1,)), jnp.zeros((1,)),
+        jnp.zeros((1,), jnp.int32), jnp.zeros((1,)), jnp.zeros((1,)),
+        jnp.zeros((n, 1)), jnp.zeros((1,)), jnp.zeros((n, 1)), jnp.zeros((n, 1)),
+        jnp.zeros((1,)), bargain.feature_mask("private", n))
+    old = BargainingActorCritic(hidden=64).init(_jax.random.PRNGKey(0), feats[0])
+    one = BargainingActorCritic(hidden=64, param_dim=1).init(
+        _jax.random.PRNGKey(0), feats[0])
+    assert _jax.tree.all(_jax.tree.map(
+        lambda a, b: bool(np.array_equal(a, b)), old, one)), \
+        "param_dim=1 changed the parameter tree"
+
+    two = BargainingActorCritic(hidden=64, param_dim=2)
+    p2 = two.init(_jax.random.PRNGKey(0), feats[0])
+    assert p2["params"]["log_std"].shape == (2,)
+    pi, _, _ = two.apply(p2, feats[0])
+    assert pi.sample(seed=_jax.random.PRNGKey(1)).shape[-1] == 2
+
+
 ALL_TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--child":

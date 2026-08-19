@@ -84,6 +84,12 @@ class ScalarContract:
         high: maximum contract value.
     """
 
+    #: How many numbers the contract IS. 1 for every space the reference defines --
+    #: the bargained object is a bare scalar and stays shaped (...,) throughout the
+    #: training loop. A space with PARAM_DIM > 1 carries its parameters on a trailing
+    #: axis instead, shaped (..., PARAM_DIM); `bargain` and the joint loop branch on
+    #: this in the handful of places where the shapes genuinely differ.
+    PARAM_DIM: int = 1
     #: The paper's range for this space, for configs and tests to state exactly.
     DEFAULT_RANGE: Tuple[float, float] = (0.0, 0.2)
     #: Env info fields `transfer_from_info` reads. Checked against the env's actual
@@ -280,6 +286,22 @@ class ScalarContract:
             )
         return self.compute_transfer(theta, *(info[k] for k in self.SIGNAL_KEYS))
 
+    def act_from_info(self, theta: jnp.ndarray, info: dict) -> jnp.ndarray:
+        """(..., N) the per-agent quantity the contract PRICES on this step.
+
+        For every space the reference defines this is just the first signal -- the
+        contract charges a fixed function of it, so "what was priced" and "what the
+        environment reported" are the same series. It becomes a real question only
+        when the contract itself has a parameter deciding which events count, which
+        is what `HarvestDensityContract` does with its threshold: there, `eaten_apples`
+        is every harvest and only some of them are charged.
+
+        Used for the behaviour metrics and for the agent's own running contribution
+        in the bargaining state, so both follow the contract actually in force rather
+        than a fixed proxy for it.
+        """
+        return jnp.asarray(info[self.SIGNAL_KEYS[0]], jnp.float32)
+
 
 class CleanupContract(ScalarContract):
     """Clean Up: pay `theta` per waste cell cleaned, funded evenly by the others.
@@ -388,6 +410,207 @@ class HarvestContract(ScalarContract):
         charged = (jnp.asarray(low_density_eaten, dtype=jnp.float32) > 0.0
                    ).astype(jnp.float32)
         theta = jnp.asarray(theta, dtype=jnp.float32)[..., None]
+        total = jnp.sum(charged, axis=-1, keepdims=True)
+        pay = theta * charged
+        receive = theta * (total - charged) / (self.num_agents - 1)
+        return receive - pay
+
+
+class HarvestDensityContract(HarvestContract):
+    """Harvest, with the DENSITY THRESHOLD bargained alongside the fine.
+
+    The one-dimensional `HarvestContract` charges theta whenever an agent eats an
+    apple in a "low-density region", where low-density is fixed by the environment at
+    construction (`low_density_threshold` apples within `low_density_radius`). That
+    threshold is the whole ecological content of the contract -- it decides WHICH
+    harvesting counts as depletion -- and the reference hands it down rather than
+    letting the agents choose it. Here they bargain over it.
+
+    A contract is the pair
+
+        (theta, k),   theta in {0} u [low, high],   k in [k_low, k_high]
+
+    and agent i pays theta on a step where it ate an apple whose REGROWTH RING held
+    fewer than k apples:
+
+        charged_i  = 1[ate_i]  and  1[ring_i < k]
+        pay_i      = theta * charged_i
+        receive_i  = theta * (sum_j charged_j - charged_i) / (N-1)
+
+    zero-sum exactly as the parent, and with the parent's sign: this prices a harm,
+    so the agent doing it is the net payer.
+
+    WHICH NEIGHBOURHOOD, AND WHY IT IS NOT THE PARENT'S
+    ---------------------------------------------------
+    `HarvestContract` conditions on `low_density_eaten`, computed against the
+    reference's 21-cell mask (j**2 + k**2 <= 5, the eaten apple included). The
+    environment's REGROWTH rule counts something else: a 12-cell ring, centre
+    excluded, without the (+-2,+-1)/(+-1,+-2) corners -- and respawn probability is
+    0 / 0.001 / 0.005 / 0.025 for 0 / 1 / 2 / >=3 of them. So the published contract
+    prices a number that is correlated with, but is not, the number the commons
+    responds to.
+
+    This space conditions on the second one (`info["regrow_ring_density"]`), because
+    the experiment is whether agents can find the threshold that protects regrowth,
+    and that is only well posed if the quantity they are pricing is the quantity that
+    drives it.
+
+    WHAT THE RANGE MEANS
+    --------------------
+    The ring holds 0..12 apples and the test is `ring < k`, so:
+
+        k <= 0   never charges -- the contract is inert whatever theta is
+        k = 3    charges exactly when eating would happen at or below the point
+                 where regrowth stops saturating (p drops 0.025 -> 0.005)
+        k = 13   charges every harvest -- a flat tax, with no ecological content
+
+    k_high defaults to 13 so that "flat tax" is inside the space: a mechanism that
+    cannot express the degenerate options cannot be said to have rejected them.
+    There is no interior optimum in the REGROWTH curve to find -- it is monotone and
+    saturating -- so the optimum in k comes from the other side: too low and patches
+    are stripped to the absorbing state (0 neighbours never respawns), too high and
+    harvesting itself is suppressed. That trade-off is what makes k worth bargaining.
+    """
+
+    PARAM_DIM = 2
+    #: Threshold range. Not DEFAULT_RANGE, which stays the FINE's range so that
+    #: `contract_range` and every sidecar keep meaning what they meant.
+    DEFAULT_DENSITY_RANGE = (0.0, 13.0)
+    SIGNAL_KEYS = ("eaten_apples", "regrow_ring_density")
+
+    def __init__(self, num_agents: int, low: float = 0.0, high: float = 10.0,
+                 density_low: float = None, density_high: float = None):
+        super().__init__(num_agents, low=low, high=high)
+        d_lo, d_hi = self.DEFAULT_DENSITY_RANGE
+        self.density_low = float(d_lo if density_low is None else density_low)
+        self.density_high = float(d_hi if density_high is None else density_high)
+        if not self.density_high > self.density_low:
+            raise ValueError(
+                f"need density_high > density_low, got {self.density_low}, "
+                f"{self.density_high}")
+        # Bounds as (2,) vectors, so `negotiate.unsquash` and `bargain.normalise_theta`
+        # -- both already elementwise -- map a 2-D proposal without a special case.
+        self.param_low = jnp.array([self.low, self.density_low], jnp.float32)
+        self.param_high = jnp.array([self.high, self.density_high], jnp.float32)
+        # [theta_norm, k_norm, is_null, stage]
+        self.obs_dim = 4
+
+    # ------------------------------------------------------------------ pieces
+
+    @staticmethod
+    def theta_of(params: jnp.ndarray) -> jnp.ndarray:
+        """The fine. Component 0 of a (..., 2) contract."""
+        return jnp.asarray(params, jnp.float32)[..., 0]
+
+    @staticmethod
+    def k_of(params: jnp.ndarray) -> jnp.ndarray:
+        """The density threshold. Component 1 of a (..., 2) contract."""
+        return jnp.asarray(params, jnp.float32)[..., 1]
+
+    def is_null(self, params: jnp.ndarray) -> jnp.ndarray:
+        """Null iff the FINE is null. k alone moves nothing, so a contract with
+        theta=0 and any k is the null contract and must be treated as one -- it is
+        the disagreement point every acceptance rule is measured against."""
+        return self.theta_of(params) <= self.null + _NULL_TOL
+
+    # ---------------------------------------------------------------- sampling
+
+    def sample(self, key: jnp.ndarray, shape: Tuple[int, ...] = (),
+               null_prob: float = 0.0):
+        """P(Theta) for phase 1, over both components. Returns (..., 2)."""
+        k_theta, k_dens = jax.random.split(key)
+        theta = super().sample(k_theta, shape=shape, null_prob=null_prob)
+        # Drawn independently of theta and over the whole range: the gameplay policy
+        # has to have seen every threshold it may later be asked to play under.
+        # Under the null contract this component is unobservable (see to_obs), so
+        # sampling it there costs nothing and keeps one code path.
+        dens = jax.random.uniform(k_dens, shape=shape, minval=self.density_low,
+                                  maxval=self.density_high)
+        return jnp.stack([theta, dens.astype(jnp.float32)], axis=-1)
+
+    def sample_batch(self, key: jnp.ndarray, num_envs: int, null_frac: float = 0.0):
+        """One phase-1 update: the parent's exact-null, stratified theta, paired with
+        a stratified threshold. Returns (num_envs, 2)."""
+        k_theta, k_dens, k_perm = jax.random.split(key, 3)
+        theta = super().sample_batch(k_theta, num_envs, null_frac=null_frac)
+        # Stratified for the same reason theta is: phase 2 takes an argmax over the
+        # space, so a gap in coverage becomes contract-selection error.
+        edges = jnp.linspace(self.density_low, self.density_high, num_envs + 1,
+                             dtype=jnp.float32)
+        u = jax.random.uniform(k_dens, (num_envs,))
+        dens = edges[:-1] + u * (edges[1:] - edges[:-1])
+        # Permuted independently, so the null block does not always draw the same
+        # thresholds as the contracted one.
+        dens = jax.random.permutation(k_perm, dens)
+        return jnp.stack([theta, dens.astype(jnp.float32)], axis=-1)
+
+    def grid(self, num_points: int) -> jnp.ndarray:
+        raise NotImplementedError(
+            "a 2-D contract has no 1-D grid: PHASE2_MODE=reinforce learns a "
+            "categorical over `grid`, which cannot represent (theta, k). Use "
+            "PHASE2_MODE=bargain, whose proposal head is continuous.")
+
+    # ------------------------------------------------------------- observation
+
+    def to_obs(self, params: jnp.ndarray, stage: float = SUBGAME) -> jnp.ndarray:
+        """[theta_norm, k_norm, is_null, stage] for the gameplay policy.
+
+        Both components are normalised onto [-1, 1] and both are pinned to 0 under
+        the null contract, for the reason the parent pins theta: the null contract is
+        a distinct regime rather than a point on a ramp, `is_null` is what carries it,
+        and a threshold attached to a fine of zero is not a fact about the episode.
+        """
+        params = jnp.asarray(params, dtype=jnp.float32)
+        theta, k = self.theta_of(params), self.k_of(params)
+        null = self.is_null(params)
+        is_null = jnp.where(null, jnp.float32(1.0), jnp.float32(-1.0))
+        theta_norm = 2.0 * (theta - self.low) / (self.high - self.low) - 1.0
+        k_norm = 2.0 * (k - self.density_low) / (
+            self.density_high - self.density_low) - 1.0
+        theta_norm = jnp.where(null, jnp.float32(0.0),
+                               jnp.clip(theta_norm, -1.0, 1.0))
+        k_norm = jnp.where(null, jnp.float32(0.0), jnp.clip(k_norm, -1.0, 1.0))
+        stage_arr = jnp.full_like(theta_norm, jnp.float32(stage))
+        return jnp.stack([theta_norm, k_norm, is_null, stage_arr], axis=-1)
+
+    # --------------------------------------------------------------- transfers
+
+    def act_from_info(self, params: jnp.ndarray, info: dict) -> jnp.ndarray:
+        """Harvests this contract actually charges for: ate AND ring below k.
+
+        Not `eaten_apples`, which is every harvest including the ones the threshold
+        exempts, and not the parent's `low_density_eaten`, which is the fixed 21-cell
+        predicate this space exists to replace. Under a bargained k the priced set
+        moves with the contract, so the behaviour series has to as well -- otherwise
+        raising k would look like it changed nothing.
+        """
+        params = jnp.asarray(params, jnp.float32)
+        k = self.k_of(params)[..., None]
+        ate = (jnp.asarray(info["eaten_apples"], jnp.float32) > 0.0).astype(jnp.float32)
+        thin = (jnp.asarray(info["regrow_ring_density"], jnp.float32) < k
+                ).astype(jnp.float32)
+        return ate * thin
+
+    def compute_transfer(self, params: jnp.ndarray, eaten_apples,
+                         regrow_ring_density) -> jnp.ndarray:
+        """Zero-sum per-agent transfers for one step.
+
+        Args:
+            params: (..., 2) contract [theta, k].
+            eaten_apples: (..., N) 1.0 where the agent ate an apple this step.
+            regrow_ring_density: (..., N) apples in the 12-cell regrowth ring of the
+                agent's cell, 0..12.
+
+        Returns:
+            (..., N) float32 transfers summing to zero along the agent axis.
+        """
+        params = jnp.asarray(params, dtype=jnp.float32)
+        theta = self.theta_of(params)[..., None]        # broadcast over agents
+        k = self.k_of(params)[..., None]
+        ate = (jnp.asarray(eaten_apples, jnp.float32) > 0.0).astype(jnp.float32)
+        thin = (jnp.asarray(regrow_ring_density, jnp.float32) < k
+                ).astype(jnp.float32)
+        charged = ate * thin
         total = jnp.sum(charged, axis=-1, keepdims=True)
         pay = theta * charged
         receive = theta * (total - charged) / (self.num_agents - 1)
@@ -683,13 +906,25 @@ CONTRACT_KINDS = ("clean_wage", "harvest_tax")
 CONTRACT_SPACES = {
     "cleanup": CleanupContract,
     "harvest": HarvestContract,
+    # Harvest with the density threshold bargained rather than fixed. A separate
+    # space rather than a mode of `harvest`: it is a different-shaped contract (two
+    # numbers, four observation features), so a policy trained on one cannot be
+    # loaded into the other, and keeping them apart is what lets the 1-D runs stay
+    # loadable and the comparison be a config flag.
+    "harvest_density": HarvestDensityContract,
     "coin_game": CoinGameContract,
 }
 
 
 def make_contract(name: str, num_agents: int, low: float, high: float,
-                  kind: str = "clean_wage"):
-    """Contract-space factory, so the space is selectable from config."""
+                  kind: str = "clean_wage", **space_kwargs):
+    """Contract-space factory, so the space is selectable from config.
+
+    `space_kwargs` are passed to the space's constructor and are how a space with
+    parameters beyond (low, high) is configured -- `harvest_density` takes
+    density_low / density_high. Passing one to a space that does not take it is a
+    TypeError rather than a silent no-op, which is the point.
+    """
     if name not in CONTRACT_SPACES:
         raise ValueError(
             f"unknown contract space {name!r} "
@@ -704,4 +939,4 @@ def make_contract(name: str, num_agents: int, low: float, high: float,
                          f"(available: {', '.join(CONTRACT_KINDS)})")
     cls = (HarvestTaxContract if kind == "harvest_tax"
            else CONTRACT_SPACES[name])
-    return cls(num_agents, low=low, high=high)
+    return cls(num_agents, low=low, high=high, **space_kwargs)

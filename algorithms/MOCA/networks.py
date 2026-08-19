@@ -227,6 +227,11 @@ class BargainingActorCritic(nn.Module):
     activation: str = "relu"
     accept_bias: float = 1.0
     aux_heads: bool = False
+    #: How many numbers ONE offer is, i.e. the contract space's PARAM_DIM. 1 for
+    #: every space the reference defines. At 1 the head is Dense(1) with a (1,)
+    #: log_std, which is exactly what it was before this attribute existed, so every
+    #: existing bargaining checkpoint loads bit-for-bit.
+    param_dim: int = 1
 
     @nn.compact
     def __call__(self, x, return_aux: bool = False):
@@ -238,12 +243,18 @@ class BargainingActorCritic(nn.Module):
                      bias_init=constant(0.0))(h)
         h = act(h)
 
-        # Proposal: a scalar contract in normalised space, unsquashed onto
-        # [low, high] by negotiate.unsquash exactly as the reference does. Kept
-        # Gaussian with a state-independent log-std, matching RLlib's DiagGaussian.
-        theta_mean = nn.Dense(1, kernel_init=orthogonal(0.01),
+        # Proposal: the contract in normalised space, unsquashed onto its bounds by
+        # negotiate.unsquash exactly as the reference does. Kept Gaussian with a
+        # state-independent log-std, matching RLlib's DiagGaussian.
+        #
+        # `param_dim` components rather than one, so a space that bargains more than
+        # a single number (harvest_density offers a fine AND a density threshold) is
+        # one distribution over the whole offer rather than several policies that
+        # would have to agree. The log_std is per component: the two coordinates are
+        # on different scales and there is no reason for them to explore alike.
+        theta_mean = nn.Dense(self.param_dim, kernel_init=orthogonal(0.01),
                               bias_init=constant(0.0))(h)
-        log_std = self.param("log_std", nn.initializers.zeros, (1,))
+        log_std = self.param("log_std", nn.initializers.zeros, (self.param_dim,))
         pi_theta = distrax.MultivariateNormalDiag(theta_mean, jnp.exp(log_std))
 
         # Vote: a real Bernoulli over [reject, accept].
