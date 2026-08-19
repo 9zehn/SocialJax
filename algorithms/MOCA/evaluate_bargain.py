@@ -5,7 +5,8 @@ can only show one episode at a time.
 
 The questions it answers, in the order the tables come out:
 
-  1. What did the episodes produce?      welfare, equality, cleaning, river
+  1. What did the episodes produce?      welfare, equality, the contracted act,
+                                         the commons
   2. Did the contract change behaviour?  the SAME policies, split by whether a
                                          contract was in force that segment. This is
                                          the comparison the mechanism lives or dies
@@ -26,10 +27,23 @@ The questions it answers, in the order the tables come out:
   7. Every episode                       one line each, so outliers are visible
                                          rather than averaged away
 
+Runs on every environment contracting is implemented for. The MECHANISM is
+environment-independent by construction, so every table above is too; what changes
+is the act the contract prices (cleaning / thin-patch eating / theft), the commons
+it protects, and therefore the role split -- see ACT_WORDS. One difference is not
+cosmetic and is flagged wherever it matters: Clean Up SUBSIDISES a contribution, so
+its high-act agents are the net RECEIVERS, while Harvest and the Coin Game FINE a
+harm, so theirs are the net PAYERS.
+
 Usage:
     python algorithms/MOCA/evaluate_bargain.py \
         --checkpoint 'runs/rubensteinV1/run1_step300/..._joint_latest_[0-9].pkl' \
         --episodes 20 --num-steps 1000
+
+    # --env is optional: the run's .run.yaml sidecar records which one it was
+    # trained on, and a mismatch is refused rather than replayed.
+    python algorithms/MOCA/evaluate_bargain.py \
+        --checkpoint 'runs/harvest/.../..._nozap_bargain_seg100_segment_joint_[0-9].pkl'
 """
 import argparse
 import sys
@@ -48,16 +62,72 @@ from algorithms.MOCA import bargain as bg
 from algorithms.MOCA import negotiate as neg
 from algorithms.MOCA import reporting
 from algorithms.MOCA import contracts as contracts_mod
-from algorithms.MOCA.contracts import CleanupContract
+from algorithms.MOCA import envs as moca_envs
 from algorithms.MOCA.networks import BargainingActorCritic, ContractActorCritic
 
 
-def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed, cp=None):
+#: How each environment's contracted act and commons are WORDED in these tables.
+#: Every entry is derivable from the EnvSpec -- see `act_words` for the fallback --
+#: so a new environment reports sensibly without an entry here; the table only
+#: supplies wording that fits the column widths and reads as English.
+#:
+#: `roles` is (high-act, low-act) and is the one that needs care. The split itself
+#: is environment-independent (above vs below the mean rate), but its MEANING is
+#: not: a Clean Up high-act agent is a contributor the contract pays, while a
+#: Harvest or Coin Game high-act agent is a harmer the contract charges. Same
+#: column, opposite sign, which is why the ratio line names the roles rather than
+#: saying "high" and "low".
+ACT_WORDS = {
+    "clean_up": {
+        "act": "cleaning", "rate": "clean/step", "unit": "cell cleaned",
+        "commons": "river clear", "roles": ("cleaner", "harvester"),
+        "roles_plural": ("cleaners", "harvesters"), "act_is_harm": False,
+    },
+    "harvest_common_open": {
+        "act": "thin-patch eating", "rate": "thin eats/step",
+        "unit": "thin-patch eat", "commons": "apples on map",
+        "roles": ("depleter", "sparing"),
+        # Spelled out rather than derived: "sparings" and "honests" are not words,
+        # and these labels head a column somebody has to read.
+        "roles_plural": ("depleters", "sparing agents"), "act_is_harm": True,
+    },
+    "coin_game": {
+        "act": "theft", "rate": "steals/step", "unit": "stolen coin",
+        "commons": "own coins", "roles": ("thief", "honest"),
+        "roles_plural": ("thieves", "honest agents"), "act_is_harm": True,
+    },
+    # Same act, same contract space, same wording -- the N-player coin game differs
+    # in its agent count and its commons series, not in what the contract prices.
+    "coin_game_n": {
+        "act": "theft", "rate": "steals/step", "unit": "stolen coin",
+        "commons": "coins on grid", "roles": ("thief", "honest"),
+        "roles_plural": ("thieves", "honest agents"), "act_is_harm": True,
+    },
+}
+
+
+def act_words(spec):
+    """Table wording for an environment, from its EnvSpec."""
+    named = ACT_WORDS.get(spec.env_name)
+    if named is not None:
+        return named
+    words = spec.act_label.replace("_", " ")
+    return {"act": words, "rate": f"{words}/step", "unit": words,
+            "commons": spec.commons_metric.replace("_", " "),
+            "roles": (f"high {words}", f"low {words}"),
+            "roles_plural": (f"high-{words} agents", f"low-{words} agents"),
+            "act_is_harm": True}
+
+
+def rollout(env, gp, bp, contract, cfg, spec, num_envs, num_steps, seed, cp=None):
     """`num_envs` full episodes in parallel. Returns per-round and per-segment records.
 
     Mirrors the training rollout exactly -- same feature scales, same proposer rule,
     same quorum -- because a policy evaluated on a differently-scaled state is not
-    the policy that was trained. When `cp` (claim policies) is given, the claims-
+    the policy that was trained. `spec` (algorithms/MOCA/envs.EnvSpec) is what makes
+    that true on every environment: the act the contract prices, the commons stock
+    and the scales both are normalised by are read off it rather than off Clean Up's
+    field names, which the bargaining policy would not recognise as its own state. When `cp` (claim policies) is given, the claims-
     and-audits layer replays too, with the run's audit probability and fine, since
     a reporting run evaluated with perfect enforcement is not the run that trained.
     """
@@ -74,11 +144,12 @@ def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed, cp=None):
     mask = bg.feature_mask(cfg["features"], n)
     quorum = bg.quorum_size(cfg["quorum"], n)
     tax_kind = cfg.get("contract_kind", "clean_wage") == "harvest_tax"
+    act_key, commons_key = spec.contracted_act, spec.commons_metric
     x, K = cfg["segment"], num_steps // cfg["segment"]
     inner = int(getattr(env, "num_inner_steps", num_steps))
-    ret_s = float(inner) * float(getattr(env, "apple_reward", 1.0))
+    ret_s = float(inner) * float(getattr(env, spec.reward_scale_kwarg, 1.0))
     cl_s = float(inner)
-    riv_s = float(env.GRID_SIZE_ROW * env.GRID_SIZE_COL)
+    riv_s = float(moca_envs.commons_scale(spec, env))
 
     key = jax.random.PRNGKey(seed)
     key, k_reset, k_start = jax.random.split(key, 3)
@@ -99,14 +170,16 @@ def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed, cp=None):
         # run's own CONTRACT_KIND -- replaying a tax run as a cleaning wage pays the
         # wrong agents from the wrong base and reports it as ordinary welfare.
         if tax_kind:
-            tax_win = contracts_mod.push_tax_window(tax_win, info["cleaned_by_agent"])
+            tax_win = contracts_mod.push_tax_window(tax_win, info[act_key])
             tr = contract.tax_transfer(theta, info["original_rewards"], tax_win)
         else:
-            tr = contract.compute_transfer(theta, info["cleaned_by_agent"])
+            # Straight from the info dict, so WHICH act is priced stays the
+            # contract's business -- the same call the training loop makes.
+            tr = contract.transfer_from_info(theta, info)
         return ((st2, ob2, theta, rng, tax_win),
-                (jnp.transpose(info["cleaned_by_agent"]),
+                (jnp.transpose(info[act_key]),
                  jnp.transpose(rew), jnp.transpose(tr),
-                 info["waste_cleared"][:, 0]))
+                 info[commons_key][:, 0]))
 
     def round_(carry, r):
         (st, ob, rng, agreed, locked, cum_r, cum_c, last_tn, had, nrej, riv,
@@ -223,8 +296,8 @@ def rollout(env, gp, bp, contract, cfg, num_envs, num_steps, seed, cp=None):
 
         rec = {"proposer": prop, "offer": offer, "votes": votes, "accepted": passed,
                "newly": newly, "active": ~agreed, "n_accept": n_acc,
-               "p_accept": p_acc, "theta_eff": theta_eff, "cleaned": seg_cl,
-               "base": seg_base, "transfer": seg_tr, "river": riv_t.mean(0),
+               "p_accept": p_acc, "theta_eff": theta_eff, "act": seg_cl,
+               "base": seg_base, "transfer": seg_tr, "commons": riv_t.mean(0),
                "asks": theta_all,
                "overclaim": overclaim, "audited": audited, "report_tr": settle}
         carry = (st, ob, rng, next_agreed, next_locked,
@@ -403,15 +476,16 @@ def gini_equality(v, axis=0):
     return 1.0 - d / (2.0 * v.shape[axis] * np.abs(v).sum(axis) + 1e-8)
 
 
-def report(rec, K, cfg, contract, n, num_steps):
+def report(rec, K, cfg, contract, spec, n, num_steps):
     x = cfg["segment"]
+    w_ = act_words(spec)
     # Episode return includes the claim settlements when the run has them --
     # rec["report_tr"] is identically zero otherwise.
     ret = (rec["base"] + rec["transfer"] + rec["report_tr"]).sum(0)    # (N, E)
     welfare = ret.sum(0)                                        # (E,)
     equality = gini_equality(ret, axis=0)
     contracted = rec["theta_eff"] > contract.null + 1e-9        # (K, E)
-    cl_per_step = rec["cleaned"].sum(1) / x                     # (K, E) all agents
+    cl_per_step = rec["act"].sum(1) / x                         # (K, E) all agents
     agreed_any = rec["newly"].any(0)                            # (E,)
     binding = cfg.get("binding", "episode")
     # Under `episode` at most one round can carry, so "the round it agreed" and
@@ -458,15 +532,24 @@ def report(rec, K, cfg, contract, n, num_steps):
               + (", a failed round keeps the incumbent" if binding == "sticky"
                  else ", a failed round plays uncontracted"))
     print(f"contract space: {{{contract.null:g}}} u "
-          f"[{contract.low:g}, {contract.high:g}]")
+          f"[{contract.low:g}, {contract.high:g}] per {w_['unit']}")
+    # Which direction the contract pushes. Not decoration: the same Transfer column
+    # means "was paid for contributing" on one environment and "was fined for
+    # depleting" on another, and every role line below reads the opposite way.
+    print(f"contract prices: {w_['act']} -- "
+          + ("a HARM the contract fines, so its heaviest users are net payers"
+             if w_["act_is_harm"] else
+             "a CONTRIBUTION the contract subsidises, so its heaviest users are "
+             "net receivers"))
     print(f"{ret.shape[1]} episodes x {num_steps} steps")
 
     blk("outcomes (mean +- sd over episodes)")
     for name, v in (("welfare", welfare), ("equality", equality),
-                    ("cleaning /step", cl_per_step.mean(0)),
-                    ("river clear", rec["river"].mean(0)),
+                    (f"{w_['act']} /step", cl_per_step.mean(0)),
+                    (w_["commons"], rec["commons"].mean(0)),
                     ("transfer volume", np.maximum(rec["transfer"], 0).sum((0, 1)))):
-        print(f"  {name:<18}{v.mean():10.3f} +- {v.std():.3f}")
+        # "thin-patch eating /step" is 23 wide; a fixed 18 would run into the number.
+        print(f"  {name:<24}{v.mean():10.3f} +- {v.std():.3f}")
 
     blk("contract vs no contract  (same policies, split by segment)")
     # Read with care. Uncontracted segments are always the EARLY ones -- bargaining
@@ -475,15 +558,21 @@ def report(rec, K, cfg, contract, n, num_steps):
     # the no-contract row. clean/step is the safer comparison: cleaning is capped by
     # the dirt spawn rate rather than by accumulated stock.
     print("  (no-contract segments are always the episode's first ones, so "
-          "welfare/step is confounded with time; compare clean/step)")
-    print(f"  {'':<16}{'segments':>10}{'clean/step':>12}{'welfare/step':>14}{'river':>9}")
+          f"welfare/step is confounded with time; compare {w_['rate']})")
+    print(f"  {'':<16}{'segments':>10}{w_['rate']:>16}{'welfare/step':>14}"
+          f"{w_['commons']:>16}")
     for label, m in (("no contract", ~contracted), ("under contract", contracted)):
         if not m.any():
-            print(f"  {label:<16}{0:>10}{'--':>12}{'--':>14}{'--':>9}")
+            print(f"  {label:<16}{0:>10}{'--':>16}{'--':>14}{'--':>16}")
             continue
         w = (rec["base"] + rec["transfer"]).sum(1)[m] / x        # welfare per step
-        print(f"  {label:<16}{int(m.sum()):>10}{cl_per_step[m].mean():>12.3f}"
-              f"{w.mean():>14.3f}{rec['river'][m].mean():>9.1f}")
+        print(f"  {label:<16}{int(m.sum()):>10}{cl_per_step[m].mean():>16.3f}"
+              f"{w.mean():>14.3f}{rec['commons'][m].mean():>16.1f}")
+    # Which way "good" points. On a subsidy the contracted row should show MORE of
+    # the act; on a fine, LESS. Stating it stops the table being read as a scoreboard
+    # in the wrong direction on two of the three environments.
+    print(f"  (a working contract moves {w_['rate']} "
+          + ("DOWN" if w_["act_is_harm"] else "UP") + " under contract)")
 
     if binding == "episode":
         blk("negotiation")
@@ -523,7 +612,7 @@ def report(rec, K, cfg, contract, n, num_steps):
         print(f"  {'agent':<7}{'overclaim':>11}{'true clean/win':>15}{'caught rate':>13}")
         for i in range(n):
             oc_i = (oc[:, i] * w).sum() / n_claims
-            cl_i = (rec["cleaned"][:, i] * w).sum() / n_claims
+            cl_i = (rec["act"][:, i] * w).sum() / n_claims
             lied = (oc[:, i] > 0.5) & (w > 0)
             caught = (lied & rec["audited"][:, i]).sum() / max(lied.sum(), 1)
             print(f"  A{i:<6}{oc_i:>11.3f}{cl_i:>15.2f}{caught:>13.3f}")
@@ -553,67 +642,73 @@ def report(rec, K, cfg, contract, n, num_steps):
         voting_vs_offer(rec, contract, n, blk)
 
     blk("per agent")
-    cl_agent = rec["cleaned"].sum(0).mean(1) / num_steps         # (N,) cells/step
+    cl_agent = rec["act"].sum(0).mean(1) / num_steps             # (N,) acts/step
+    # The role split: above vs below the mean rate of the contracted act. The split
+    # is the same computation everywhere; what it MEANS is not, which is why the
+    # labels come from the environment. On Clean Up the high-act role is the one the
+    # contract pays; on Harvest and the Coin Game it is the one the contract charges.
+    hi_role, lo_role = w_["roles"]
+    hi_plural, lo_plural = w_["roles_plural"]
     is_cleaner = cl_agent > cl_agent.mean()
     is_median = cfg.get("protocol") == "median"
     if is_median:
         # Nobody proposes and nobody votes; what an agent DOES is ask, so the
         # columns become its asking behaviour and how often its ask was the one
         # that bound.
-        print(f"  {'agent':<7}{'clean/step':>11}{'return':>9}{'role':>10}"
+        print(f"  {'agent':<7}{w_['rate']:>14}{'return':>9}{'role':>11}"
               f"{'mean ask':>10}{'held median':>13}")
         for i in range(n):
             a = rec["asks"][:, i, :][rec["active"]]
             held = (np.abs(rec["asks"][:, i, :] - rec["offer"]) < 1e-6) & rec["active"]
-            print(f"  A{i:<6}{cl_agent[i]:>11.3f}{ret[i].mean():>9.1f}"
-                  f"{'cleaner' if is_cleaner[i] else 'harvester':>10}"
+            print(f"  A{i:<6}{cl_agent[i]:>14.3f}{ret[i].mean():>9.1f}"
+                  f"{(hi_role if is_cleaner[i] else lo_role):>11}"
                   f"{a.mean():>10.4f}"
                   f"{held.sum() / max(rec['active'].sum(), 1):>13.3f}")
     else:
-        print(f"  {'agent':<7}{'clean/step':>11}{'return':>9}{'role':>10}"
+        print(f"  {'agent':<7}{w_['rate']:>14}{'return':>9}{'role':>11}"
               f"{'proposed':>10}{'mean theta':>12}{'carried':>9}{'votes yes':>11}")
         for i in range(n):
             mine = rec["proposer"] == i                          # (K, E)
             prop_act = mine & rec["active"]
             voted = rec["active"] & ~mine
             yes = (rec["votes"][:, i] == 1) & voted
-            print(f"  A{i:<6}{cl_agent[i]:>11.3f}{ret[i].mean():>9.1f}"
-                  f"{'cleaner' if is_cleaner[i] else 'harvester':>10}"
+            print(f"  A{i:<6}{cl_agent[i]:>14.3f}{ret[i].mean():>9.1f}"
+                  f"{(hi_role if is_cleaner[i] else lo_role):>11}"
                   f"{int(prop_act.sum()):>10}"
                   f"{(rec['offer'][prop_act].mean() if prop_act.any() else np.nan):>12.4f}"
                   f"{int((rec['newly'] & mine).sum()):>9}"
                   f"{(yes.sum() / max(voted.sum(), 1)):>11.3f}")
     if is_cleaner.any() and (~is_cleaner).any():
         c, h = ret[is_cleaner].mean(), ret[~is_cleaner].mean()
-        print(f"\n  cleaner:harvester return ratio  {c / h:.3f}   "
-              f"(cleaners {c:.1f}, harvesters {h:.1f})")
+        print(f"\n  {hi_role}:{lo_role} return ratio  {c / h:.3f}   "
+              f"({hi_plural} {c:.1f}, {lo_plural} {h:.1f})")
         if is_median:
             # THE check on this mechanism: single-peaked preferences should pull
             # the roles' asks apart, with the median tracking whichever role holds
             # the middle. Cleaners and harvesters asking the same number means the
             # ideal points never separated and the run needs more training (or the
             # asks have collapsed -- compare the sd in the asks table).
-            for label, m in (("cleaners", is_cleaner), ("harvesters", ~is_cleaner)):
+            for label, m in ((hi_plural, is_cleaner), (lo_plural, ~is_cleaner)):
                 role_asks = rec["asks"][:, m, :]                 # (K, |role|, E)
                 sel = role_asks[np.broadcast_to(
                     rec["active"][:, None, :], role_asks.shape)]
                 if sel.size:
-                    print(f"  mean ask by {label:<11}{sel.mean():.4f}")
+                    print(f"  mean ask by {label:<16}{sel.mean():.4f}")
         else:
             # The direct test of whether rotating proposal rights does any work:
             # if a cleaner's turn produces a systematically higher offer than a
             # harvester's, then who holds the move is shifting the split.
-            for label, m in (("cleaners", is_cleaner), ("harvesters", ~is_cleaner)):
+            for label, m in ((hi_plural, is_cleaner), (lo_plural, ~is_cleaner)):
                 sel = np.isin(rec["proposer"], np.where(m)[0]) & rec["active"]
                 if sel.any():
                     print(f"  mean theta offered by "
-                          f"{label:<11}{rec['offer'][sel].mean():.4f}"
+                          f"{label:<16}{rec['offer'][sel].mean():.4f}"
                           f"   (carried {int((rec['newly'] & sel).sum())})")
 
     blk("per episode")
     if binding == "episode":
         print(f"  {'ep':>3}{'agree':>7}{'theta':>8}{'by':>5}{'welfare':>10}"
-              f"{'equality':>10}{'clean/step':>12}")
+              f"{'equality':>10}{w_['rate']:>15}")
         for e in range(ret.shape[1]):
             if agreed_any[e]:
                 r = int(agree_round[e])
@@ -622,20 +717,20 @@ def report(rec, K, cfg, contract, n, num_steps):
             else:
                 who, ag, th = "-", "none", "-"
             print(f"  {e:>3}{ag:>7}{th:>8}{who:>5}{welfare[e]:>10.1f}"
-                  f"{equality[e]:>10.3f}{cl_per_step[:, e].mean():>12.3f}")
+                  f"{equality[e]:>10.3f}{cl_per_step[:, e].mean():>15.3f}")
     else:
         # "agreed at R3 by A5" has no meaning when every segment is its own bargain,
         # so the columns become the episode's contracting HISTORY: how many of its
         # segments were governed, at what mean theta, and how many distinct deals it
         # took to get there.
         print(f"  {'ep':>3}{'segs':>7}{'theta':>8}{'deals':>7}{'welfare':>10}"
-              f"{'equality':>10}{'clean/step':>12}")
+              f"{'equality':>10}{w_['rate']:>15}")
         for e in range(ret.shape[1]):
             n_seg = int(contracted[:, e].sum())
             th = f"{theta_ag[e]:.3f}" if n_seg else "-"
             print(f"  {e:>3}{f'{n_seg}/{K}':>7}{th:>8}"
                   f"{int(rec['newly'][:, e].sum()):>7}{welfare[e]:>10.1f}"
-                  f"{equality[e]:>10.3f}{cl_per_step[:, e].mean():>12.3f}")
+                  f"{equality[e]:>10.3f}{cl_per_step[:, e].mean():>15.3f}")
 
 
 def main():
@@ -681,11 +776,19 @@ def main():
                         "_claim_ checkpoints. Read from the .run.yaml sidecar when "
                         "it has one; these flags override it. A mismatch replays a "
                         "different enforcement regime than the one trained.")
+    p.add_argument("--env", default=None,
+                   help="clean_up, harvest_common_open or coin_game. Optional when "
+                        "the run has a .run.yaml sidecar, which records the "
+                        "environment it was trained on; a disagreement is refused "
+                        "rather than replayed, since the observation shapes differ "
+                        "and the policy is not the same policy elsewhere.")
     p.add_argument("--env-kwarg", action="append", default=[], metavar="KEY=VALUE")
     args = p.parse_args()
 
     from viz.interactive_viewer import (_gameplay_checkpoints, _parse_env_kwarg_value,
-                                        detect_moca, infer_bargain_config)
+                                        check_action_space, detect_moca,
+                                        infer_bargain_config, resolve_env_name,
+                                        spec_for_env)
 
     moca = detect_moca(args.checkpoint)
     if moca is None or moca["mode"] != "bargain":
@@ -699,6 +802,13 @@ def main():
     if len(bp) != n:
         raise SystemExit(f"{n} gameplay but {len(bp)} bargaining policies")
 
+    env_name = resolve_env_name(args.env, args.checkpoint)
+    spec = spec_for_env(env_name)
+    if spec is None:
+        raise SystemExit(
+            f"{env_name!r} has no contract space, so there is no bargaining run to "
+            f"evaluate (algorithms/MOCA/envs.py lists the environments that do)")
+
     cfg = infer_bargain_config(moca["stem"], checkpoint=args.checkpoint)
     try:
         bg.check_params_compatible(bp[0], n, cfg.get("feature_version"),
@@ -709,6 +819,14 @@ def main():
         cfg["segment"] = args.bargain_segment
     if args.binding:
         cfg["binding"], cfg["binding_source"] = args.binding, "flag"
+    if cfg.get("contract_kind", "clean_wage") != "clean_wage" and env_name != "clean_up":
+        # The harvest tax is a Clean Up mechanism: a levy on harvest income paid out
+        # by CLEANING. check_arm refuses the combination at training time, so this
+        # can only be a mis-attributed sidecar or a stray flag, and replaying it
+        # would report a fiction in ordinary-looking units.
+        raise SystemExit(
+            f"CONTRACT_KIND={cfg['contract_kind']!r} is a Clean Up mechanism, but "
+            f"this run is on {env_name!r}, which has one contract space.")
     if args.contract_kind:
         # Overriding a RECORDED kind is never a correction, it is a mistake: the
         # sidecar is what the run was actually trained under, and replaying a tax
@@ -733,18 +851,37 @@ def main():
         raise SystemExit(f"--num-steps {args.num_steps} must be a multiple of the "
                          f"segment length {cfg['segment']}")
 
+    # The reward scale is `apple_reward` on two of the three environments and
+    # `coin_reward` on the other, and leaving it unset defaults it to num_agents --
+    # which does not error and makes every theta N times too weak. Named by the spec
+    # so it cannot be set on the wrong knob.
     env_kwargs = {"num_agents": n, "shared_rewards": False, "cnn": True, "jit": True,
-                  "apple_reward": 1.0, "num_inner_steps": args.num_steps}
+                  spec.reward_scale_kwarg: 1.0, "num_inner_steps": args.num_steps}
+    # Env settings the run recorded that change the GAME rather than the analysis.
+    # enable_zap is the one that exists so far: it sets the action space, so getting
+    # it wrong is an unloadable checkpoint rather than a wrong number -- but only
+    # because check_action_space below turns it into one.
+    run_cfg_env = (load_run_config(args.checkpoint) or {}).get("ENV_KWARGS") or {}
+    for key in ("enable_zap",):
+        if key in run_cfg_env:
+            env_kwargs[key] = run_cfg_env[key]
     for kv in args.env_kwarg:
         k, _, raw = kv.partition("=")
         env_kwargs[k] = _parse_env_kwarg_value(raw)
-    env = LogWrapper(socialjax.make("clean_up", **env_kwargs), replace_info=False)
-    lo, hi, source = contract_range(args.checkpoint, args.contract_low,
-                                    args.contract_high)
-    contract = contracts_mod.make_contract("cleanup", n, lo, hi,
+    base_env = socialjax.make(env_name, **env_kwargs)
+    check_action_space(gp, base_env, env_name)
+    env = LogWrapper(base_env, replace_info=False)
+    # Clean Up's shipped range is not the paper's (moca_base raised it after theta
+    # pinned to the ceiling); the other two run the space their contract declares.
+    lo, hi, source = contract_range(
+        args.checkpoint, args.contract_low, args.contract_high,
+        fallback=((0.2, 1.0) if env_name == "clean_up" else spec.contract_range))
+    contract = contracts_mod.make_contract(spec.contract_space, n, lo, hi,
                                            kind=cfg["contract_kind"])
 
     print(f"run: {moca['stem']}")
+    print(f"env: {env_name}  ({n} agents, {base_env.action_space().n} actions"
+          + (", no zap beam" if env_kwargs.get("enable_zap") is False else "") + ")")
     print(f"contract: theta in [{lo:g}, {hi:g}] (from {source})")
     if source == "fallback":
         print("  [warning] no .run.yaml sidecar and no --contract-low/--contract-high: "
@@ -756,6 +893,11 @@ def main():
     # run under perfect enforcement would report a mechanism it never trained.
     claim_paths = [q.replace("_contract_", "_claim_") for q in moca["contract_paths"]]
     cp = None
+    if all(Path(q).exists() for q in claim_paths) and env_name != "clean_up":
+        raise SystemExit(
+            f"this run has _claim_ checkpoints, which are Clean Up's claims-and-"
+            f"audits layer (an overclaim is an overclaim OF CLEANING), but it is on "
+            f"{env_name!r}. Refusing rather than ignoring them.")
     if all(Path(q).exists() for q in claim_paths):
         run_cfg = load_run_config(args.checkpoint) or {}
         report_params = {}
@@ -775,9 +917,9 @@ def main():
               f"{cfg['report_fine_mult']:g}, overclaim cap "
               f"{cfg['report_max_overclaim']:g}")
 
-    rec, K = rollout(env, gp, bp, contract, cfg, args.episodes, args.num_steps,
+    rec, K = rollout(env, gp, bp, contract, cfg, spec, args.episodes, args.num_steps,
                      args.seed, cp=cp)
-    report(rec, K, cfg, contract, n, args.num_steps)
+    report(rec, K, cfg, contract, spec, n, args.num_steps)
 
 
 if __name__ == "__main__":

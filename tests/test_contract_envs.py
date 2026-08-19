@@ -577,10 +577,10 @@ def test_both_bindings_get_different_checkpoint_names():
     assert seg != epi
     assert seg.endswith("_joint") and "_segment" in seg
     assert "_episode" in epi
-    # ... and the three environments never collide with each other either.
+    # ... and no two registered environments collide with each other either.
     names = {checkpoint_filename({**base, "ENV_NAME": e, "BARGAIN_BINDING": "segment"})
              for e in envs.ENV_SPECS}
-    assert len(names) == 3
+    assert len(names) == len(envs.ENV_SPECS)
 
 
 def test_contracts_move_reward_but_never_create_it_in_a_real_rollout():
@@ -732,14 +732,76 @@ def test_viewer_panel_labels_name_the_environments_own_act():
     public good it subsidises."""
     from viz.interactive_viewer import act_labels
 
-    seen = set()
+    # Distinct per ACT rather than per environment: two environments that price the
+    # same act (the 2- and N-player coin games) SHOULD read identically, and only a
+    # label shared across different acts would be the confusion worth failing on.
+    by_act = {}
     for env_name, spec in envs.ENV_SPECS.items():
         unit, header = act_labels(spec)
         assert unit and header, env_name
         assert len(header) <= 8, f"{env_name}: {header!r} collides with the Reward column"
-        seen.add((unit, header))
-    assert len(seen) == len(envs.ENV_SPECS), f"labels are not distinct: {seen}"
+        by_act.setdefault(spec.act_label, set()).add((unit, header))
+    for act, labels in by_act.items():
+        assert len(labels) == 1, f"{act!r} is labelled inconsistently: {labels}"
+    flat = [next(iter(v)) for v in by_act.values()]
+    assert len(set(flat)) == len(flat), f"different acts share a label: {flat}"
     assert act_labels(None) == ("unit", "Act"), "envs without a spec still need a label"
+
+
+def test_evaluator_words_every_environments_act_and_its_direction():
+    """evaluate_bargain's tables are read as a scoreboard, so the wording has to say
+    which way is good -- and it is opposite on Clean Up to the other two.
+
+    Clean Up SUBSIDISES cleaning, so a working contract moves the act UP and the
+    heavy actors are net receivers. Harvest and the Coin Game FINE a harm, so it
+    moves DOWN and the heavy actors are net payers. Labelling a Harvest run in Clean
+    Up's words would invert the reading of a table that otherwise looks fine.
+    """
+    from algorithms.MOCA.evaluate_bargain import ACT_WORDS, act_words
+
+    by_act = {}
+    for env_name, spec in envs.ENV_SPECS.items():
+        w = act_words(spec)
+        for key in ("act", "rate", "unit", "commons", "roles", "roles_plural",
+                    "act_is_harm"):
+            assert key in w, f"{env_name}: act_words is missing {key!r}"
+        # The direction is not asserted against a hardcoded table -- it is DERIVED
+        # from the contract's own transfer, so the wording is checked against the
+        # mechanism rather than against a second copy of the same belief.
+        contract = make_contract(spec.contract_space, spec.num_agents,
+                                 *spec.contract_range)
+        # Agent 0 performs the act once; whether that leaves it up or down on the
+        # transfer is the whole question. Built through the info dict rather than
+        # compute_transfer so a space reading two signals (the Coin Game reads the
+        # thief AND the victim) is fed a coherent step: agent 0 took from agent 1.
+        acted = np.zeros(spec.num_agents, np.float32)
+        acted[0] = 1.0
+        info = {spec.contracted_act: jnp.asarray(acted)}
+        for key in contract.SIGNAL_KEYS[1:]:
+            victim = np.zeros(spec.num_agents, np.float32)
+            victim[1] = 1.0
+            info[key] = jnp.asarray(victim)
+        t = np.asarray(contract.transfer_from_info(
+            jnp.float32(spec.contract_range[1]), info))
+        assert (t[0] < 0) == w["act_is_harm"], (
+            f"{env_name}: act_is_harm={w['act_is_harm']} but the sole actor's "
+            f"transfer is {t[0]:+.3f}")
+        assert len(w["roles"]) == 2 and len(w["roles_plural"]) == 2, env_name
+        by_act.setdefault(spec.act_label, set()).add(w["roles"])
+    # Same act -> same role names; different acts -> different ones.
+    for act, roles in by_act.items():
+        assert len(roles) == 1, f"{act!r} has inconsistent role labels: {roles}"
+    flat = [next(iter(v)) for v in by_act.values()]
+    assert len(set(flat)) == len(flat), f"different acts share role labels: {flat}"
+
+    # An environment with no entry in the table still gets usable wording -- the
+    # table is for phrasing, not for correctness, so adding an env must not be
+    # gated on remembering to update it.
+    fallback = act_words(envs.ENV_SPECS["clean_up"]._replace(env_name="nowhere"))
+    assert fallback["act"] and len(fallback["roles"]) == 2
+    assert set(ACT_WORDS) <= set(envs.ENV_SPECS), (
+        f"ACT_WORDS names environments that no longer exist: "
+        f"{set(ACT_WORDS) - set(envs.ENV_SPECS)}")
 
 
 ALL_TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

@@ -681,6 +681,7 @@ _ACT_DISPLAY = {
     "clean_up": ("cell", "Clean"),
     "harvest_common_open": ("thin-patch eat", "Thin eat"),
     "coin_game": ("stolen coin", "Steal"),
+    "coin_game_n": ("stolen coin", "Steal"),
 }
 
 
