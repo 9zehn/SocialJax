@@ -87,17 +87,48 @@ FEATURE_VERSION = 2
 
 # ------------------------------------------------------------------ protocol
 
+#: Named quorums, as a count of the N-1 NON-PROPOSERS that must accept. Each is a
+#: function of the agent count rather than a fixed number, so the same setting means
+#: the same rule on a 7-agent and a 2-agent environment -- which a bare integer does
+#: not. `all_but_one` and `all_but_two` exist to walk unanimity down one veto at a
+#: time: unanimity gives every responder a veto, majority lets the proposer buy a
+#: minimal winning coalition, and the interesting question is where between those two
+#: the minority stops being protected.
+NAMED_QUORUMS = {
+    "all": lambda r: r,
+    "all_but_one": lambda r: r - 1,
+    "all_but_two": lambda r: r - 2,
+    "majority": lambda r: r // 2 + 1,
+}
+
+
 def quorum_size(spec, num_agents: int) -> int:
-    """How many of the N-1 non-proposers must accept for a contract to bind."""
+    """How many of the N-1 non-proposers must accept for a contract to bind.
+
+    Accepts a name from NAMED_QUORUMS or a literal count. Names are preferred for
+    anything swept across environments, because a literal 5 is unanimity-minus-one on
+    Clean Up and impossible on the two-player Coin Game, and nothing in the run
+    record would say which was meant.
+    """
     responders = num_agents - 1
-    if spec == "all":
-        return responders
-    if spec == "majority":
-        return responders // 2 + 1
-    q = int(spec)
+    if spec in NAMED_QUORUMS:
+        q = NAMED_QUORUMS[spec](responders)
+        if q < 1:
+            raise ValueError(
+                f"BARGAIN_QUORUM={spec!r} needs {q} of {responders} non-proposers "
+                f"with {num_agents} agents, which is not a decision rule -- a "
+                f"contract would bind with nobody agreeing. It needs at least "
+                f"{2 + (spec == 'all_but_two')} agents.")
+        return q
+    try:
+        q = int(spec)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"BARGAIN_QUORUM must be one of {', '.join(NAMED_QUORUMS)}, or an int in "
+            f"[1, {responders}] for {num_agents} agents; got {spec!r}") from None
     if not 1 <= q <= responders:
         raise ValueError(
-            f"BARGAIN_QUORUM must be 'all', 'majority', or an int in "
+            f"BARGAIN_QUORUM must be one of {', '.join(NAMED_QUORUMS)}, or an int in "
             f"[1, {responders}] for {num_agents} agents; got {spec!r}"
         )
     return q

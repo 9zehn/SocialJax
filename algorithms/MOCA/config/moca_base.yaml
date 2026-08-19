@@ -216,10 +216,25 @@
 #   "fixed"   -- agent 0 always opens. The ablation that measures how large that
 #               first-mover advantage is.
 "BARGAIN_ROTATE_START": "random"
-# How many of the N-1 non-proposers must accept. "all" (unanimity) is the default
-# and is what stops a proposer buying a minimal winning coalition and excluding the
-# cleaners -- who are the minority the contract exists to compensate. Affordable only
-# because rejection now costs one segment instead of the episode.
+# How many of the N-1 non-proposers must accept. The named rules are counts DERIVED
+# from the agent count, so one setting means the same rule on a 7-agent and a 2-agent
+# environment:
+#   "all"          every non-proposer -- unanimity, and the default. Every responder
+#                  holds a veto, which is what stops a proposer buying a minimal
+#                  winning coalition and excluding the cleaners, who are the minority
+#                  the contract exists to compensate. Affordable only because
+#                  rejection now costs one segment instead of the episode.
+#   "all_but_one"  unanimity with one veto removed, "all_but_two" with two. These walk
+#                  the rule down from unanimity toward majority one veto at a time,
+#                  which is the range where the minority's protection is actually lost
+#                  and so the interesting place to sweep. At 7 agents they are 5 and 4
+#                  of 6 -- note that "all_but_two" and "majority" COINCIDE there.
+#   "majority"     (N-1)//2 + 1. Baron-Ferejohn: the proposer buys the cheapest
+#                  winning coalition and excludes everyone else.
+# A bare integer is still accepted and is the responder count directly. It is not
+# portable across agent counts, though -- 5 is unanimity-minus-one on Clean Up and
+# impossible on the two-player Coin Game -- so prefer a name for anything swept, and
+# the checkpoint stem then records which rule was meant rather than a bare number.
 "BARGAIN_QUORUM": "all"
 # Which tier of the bargaining state the policy sees (see bargain.feature_mask).
 #   "protocol" round / whose turn / standing offer -- the extensive-form game alone
