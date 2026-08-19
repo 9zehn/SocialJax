@@ -1094,17 +1094,30 @@ def make_train(config):
 
     def linear_schedule(count):
         # Denominator must be the number of updates that actually TOUCH the gameplay
-        # policy. Two-phase: phase 1 only, since phase 2 freezes it. Joint: the whole
-        # run. Using the phase-1 count under joint sent the rate through zero at 90%
-        # and NEGATIVE for the rest -- gradient ascent on a loss containing
-        # -ENT_COEF * entropy, which drives the policy deterministic and pins entropy
-        # at exactly 0. jnp.maximum makes that unreachable however the counts are
-        # configured; a negative learning rate is never the intent.
-        total = (config["NUM_UPDATES"] if config.get("TRAINING_MODE") == "joint"
-                 else config["NUM_UPDATES_PHASE1"])
+        # policy: phase 1 alone under two_phase, because phase 2 freezes the policy,
+        # and the WHOLE RUN under every arm that has no phase split.
+        #
+        # Selected on the arm that IS phase-split rather than by naming the ones that
+        # are not. The previous form named `joint` and let everything else fall through
+        # to the phase-1 count -- which is 0 under `combined`, since make_train sets it
+        # so precisely because that arm has no phase 1. The rate came out 0/0 = nan,
+        # Adam wrote NaN into every gameplay weight on the very first step, and the run
+        # then logged entirely plausible contract series (the negotiation policies use
+        # a constant rate and stayed finite) while gameplay was dead and welfare sat at
+        # exactly 0. Listing the exceptions is what let a new arm inherit the hole.
+        #
+        # Both guards are deliberate. max(total, 1) makes a zero denominator
+        # unreachable however the counts are configured. jnp.maximum(frac, 0.0) keeps
+        # the rate from going NEGATIVE, which would be gradient ascent on a loss
+        # containing -ENT_COEF * entropy and would pin entropy at exactly 0 -- the
+        # failure this function was last corrected for, under `joint`.
+        total = (config["NUM_UPDATES_PHASE1"]
+                 if config.get("TRAINING_MODE") == "two_phase"
+                 else config["NUM_UPDATES"])
         frac = (
             1.0
-            - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / total
+            - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"]))
+            / max(int(total), 1)
         )
         return config["LR"] * jnp.maximum(frac, 0.0)
 
